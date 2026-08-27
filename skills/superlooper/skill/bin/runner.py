@@ -127,88 +127,64 @@ LAUNCH_TIMEOUT = 120           # the launcher verifies delivery within ~30s; be 
 # exist" (issue #28) — a per-repo config fault, kept out of the systemic-anchor streak so the park
 # memo can name the branch instead of the launch machinery. Must match lib/launch.BASE_MISSING.
 LAUNCH_BASE_MISSING_RC = 3
-# How far back the journal ABSORB will adopt history as live evidence (issue #457). The streak
-# itself never expires — it is cleared by a verified delivery, exactly like its two siblings — but
-# the absorb reads a byte-bounded TAIL of the journal, which on a cold start (or after a rotate)
-# can reach much further back than the runner has been up. A refusal from days ago says nothing
-# about whether the machine can start a session now, and a fresh process must not hold today's
-# queue on it. Six hours is generous next to the shapes this must catch (the watchdog's three
-# flights land inside ten minutes) and far short of letting last night's outage hold this morning.
-AUTH_DEATH_STREAK_WINDOW_SECONDS = 6 * 3600
-# How far BACK of its own watermark the absorb re-reads each tick (issue #457). This runner stamps
-# its journal records with the clock the TICK started on, while the other spawners stamp real wall
-# time — so a record written late in a long tick carries an EARLY timestamp and a strict watermark
-# would skip it. Skipping a refusal costs a sample; skipping a verified DELIVERY leaves a hold
-# standing over a machine that recovered, so the overlap is sized to the longest a launch may take.
-# Replaying a suffix in file order is idempotent (a re-added id is the same id, a repeated clear is
-# the same clear), which is what makes the overlap free.
-ABSORB_REPLAY_SECONDS = LAUNCH_TIMEOUT
-# The acts the OUT-OF-PROCESS spawners journal their launch outcomes under (issue #457). The
-# watchdog's check and `superlooper debug` each run in their own process against the SAME launcher,
-# so the journal — which all three already write — is the only place the runner can hear that a
-# launch was attempted at all. The runner's own launches are recorded in-process at
-# _charge_launch_failure instead; absorbing them from here too would only duplicate them.
+# THE MACHINE-WIDE LAUNCH-ATTEMPT STREAK (issue #457), derived from the journal.
 #
-# WHEN A FOURTH SPAWNER APPEARS, ITS ACT BELONGS HERE. The triage flight (#448) ships disabled and
-# journals no launch act yet; `actions._is_session_id` already admits its `t<N>` ids, so wiring it
-# is one row here and nothing else.
-# Each verb spells its own outcomes, so this is a table and not a branch — and WHEN A FOURTH
-# SPAWNER APPEARS ITS ROW BELONGS HERE. The triage flight (#448) ships disabled and journals no
-# launch act yet; `actions._is_session_id` already admits its `t<N>` ids, so wiring it is one row.
-# A verb whose success this runner cannot recognise leaves a hold standing over a machine that has
-# demonstrably started a session (`resume` was exactly that miss), which is why the table is the
-# first place to look when one is added.
-OUT_OF_PROCESS_OUTCOMES = {
+# 2026-08-26: the meter went unreadable, the engine failed open, and then every launch on the
+# machine refused for hours — three watchdog repair flights, an owner-tapped Debug, and the
+# in-flight lanes' dead sessions — while `claude auth status` answered `unknown`. No hold, no
+# alert, no pause. #320's two streaks could see none of it: they count launches THIS process ran
+# (that day it ran almost none) and key on ONE evidence reason reaching a cap (these wore several).
+#
+# So this streak is derived, once per tick, from the JOURNAL — the record every spawner already
+# writes, in the order things actually finished. Derived rather than accumulated in memory, and
+# that is the load-bearing choice: an in-memory streak has to be reconciled with the journal for
+# the launches this process did not run, and every incremental reconciliation this issue tried
+# (a byte offset, then a timestamp watermark, then a lagged one) had a boundary at which a
+# VERIFIED DELIVERY fell outside the window while the refusals it answered fell inside — which
+# re-holds a machine that just launched a session and pages the owner over it. A pure function of
+# a bounded window has no such boundary, costs ~2 ms against a multi-megabyte journal, and
+# reconstructs itself exactly across a restart.
+#
+# WHICH RECORDS. Two sides, and the difference matters (see actions.py's two-sided rule):
+#   * THIS RUNNER's own launch outcomes — `launch`, `resolve_conflict`, and `recover` at the
+#     `exited` tier (the only tier that relaunches; `recover` reads "ok" for a delivered NUDGE too,
+#     and an i336 lane whose auth died in-process answers nudges all day while starting nothing).
+#   * A FOREIGN spawner's — the watchdog's unattended sl-debugger, `superlooper debug`,
+#     `superlooper resume`. Each runs in its OWN process against the same launcher and spells its
+#     own outcomes, so this is a table and not a branch: WHEN A FOURTH SPAWNER APPEARS ITS ROW
+#     BELONGS HERE. The triage flight (#448) ships disabled and journals no launch act yet;
+#     `actions._is_session_id` already admits its `t<N>` ids.
+#
+# `resume` is FOREIGN even though its id is a lane's `i<N>`: it is shelled from an operator's own
+# shell or the dashboard, so its refusal reads THAT environment, not the runner's. The side is
+# decided by who spawned the flight, never by the shape of the id.
+RUNNER_LAUNCH_ACTS = ("launch", "resolve_conflict")
+RUNNER_RELAUNCH_ACT = "recover"
+RUNNER_RELAUNCH_TIERS = ("exited",)
+RUNNER_DELIVERY_OK = "ok"
+FOREIGN_LAUNCH_OUTCOMES = {
     "watchdog": ("launched", "launch_failed"),
     "debug_launch": ("launched", "launch_failed"),
     "resume": ("resumed", "resume_failed"),
 }
-# The outcomes those acts use. "launched" is a VERIFIED delivery — the launcher proved a session
-# started — so it clears the streak for the same reason the runner's own verified delivery does:
-# one session that really started proves the machine can start sessions, whoever started it.
-# The runner's OWN verified launch, as the journal records it. The absorb has to recognise this to
-# get the CHRONOLOGY right across a restart: the streak is "consecutive failures with no success
-# BETWEEN them", and a fresh process re-reads a bounded tail that may still contain out-of-process
-# refusals which one of this runner's own launches has since answered. Live, `_delivery_cleared`
-# has already cleared them and this is a no-op; after a restart it is the only thing that knows.
-#
-# Deliberately NARROW — `act: launch, outcome: ok` and nothing else. A `recover` record reads "ok"
-# for a successful NUDGE as well as for a relaunch, and a nudge proves nothing about starting a
-# session: an i336 lane whose auth died IN-PROCESS answers nudges all day. Clearing on that would
-# disarm this detector during exactly the outage it is for. The cost of the narrowness is a rare
-# missed clear on a restart (a recover-tier relaunch), which the 6h window and the recovery probe
-# both bound.
-# This runner's OWN verified deliveries, as the journal records them. The absorb has to recognise
-# these to get the CHRONOLOGY right across a restart: the streak is "consecutive failures with no
-# success BETWEEN them", and a fresh process re-reads a bounded tail that may still contain
-# refusals which one of this runner's own launches has since answered. Live, `_delivery_cleared`
-# has already cleared them and this is a no-op; after a restart it is the only thing that knows.
-#
-# All three launch paths are here, and the recovery relaunch is the load-bearing one: the
-# machine-wide hold deliberately does NOT suppress it (see actions.py's note in the exited-recovery
-# ladder), which makes it the only flight an all-in-flight machine has left — so a reborn runner
-# that could not recognise its success would hold a machine that had visibly recovered.
-#
-# `recover` is keyed on the TIER as well as the outcome: it reads "ok" for a delivered NUDGE too,
-# and a nudge proves nothing about starting a session — an i336 lane whose auth died in-process
-# answers nudges all day. Only the `exited` tier relaunches.
-RUNNER_DELIVERY_OK = "ok"
-RUNNER_LAUNCH_ACTS = ("launch", "resolve_conflict")
-RUNNER_RELAUNCH_ACT = "recover"
-RUNNER_RELAUNCH_TIERS = ("exited",)
-# WHICH refusals are evidence about the MACHINE (issue #457). Not every failed launch is: a
-# worktree that would not create, a brief that could not be written, a missing base branch name
-# THIS issue's own state, and two of those in a row are two broken lanes, not a broken machine —
-# paging the owner "your Claude login has expired" over a stale git index.lock is the exact
-# mis-blame #299/#320 exist to end. Nor is a dead cmux pane or an unfired shim: those are the
-# DELIVERY CHANNEL, they have detectors and remedies of their own, and the watchdog mints a FRESH
-# d<N> per retry — so an ordinary anchor outage produces distinct session ids by design.
+# How far back the derivation looks. A refusal older than this says nothing about whether the
+# machine can start a session NOW, and `journal.tail` reads a byte-bounded slice that can reach
+# much further back. Six hours is generous next to the shapes it must catch (the watchdog's three
+# flights land inside ten minutes) and far short of letting last night's outage hold this morning.
+AUTH_DEATH_STREAK_WINDOW_SECONDS = 6 * 3600
+# WHICH refusals are evidence about the MACHINE. Not every failed launch is: a worktree that would
+# not create, a brief that could not be written, a missing base branch name THIS issue's own state,
+# and two of those in a row are two broken lanes — paging the owner "your Claude login has expired"
+# over a stale git index.lock is the mis-blame #299/#320 exist to end. Nor is a dead cmux pane or an
+# unfired shim: those are the DELIVERY CHANNEL, with detectors and remedies of their own, and the
+# watchdog mints a FRESH d<N> per retry so an ordinary anchor outage produces distinct session ids
+# by design.
 #
 # What is left is the credential/environment family: the launcher refused because the identity or
 # the environment a session would run under is wrong. Each is per-issue on one sample (#320 keeps
 # them so), and #320 escalates them only when the SAME one repeats across two distinct ISSUE lanes.
 # The 2026-08-26 shape is what falls between: several of them at once, across sessions the queue
-# never owned, no one of them ever reaching a cap of its own. THAT is the streak below.
+# never owned, no one of them ever reaching a cap of its own.
 AUTH_DEATH_STREAK_REASONS = frozenset({
     "gh_auth_dead",                  # rc=4 — the SESSION's own gh could not say who it is
     "gh_auth_dead_runner",           # rc=5 — the RUNNER's own gh could not either
@@ -843,36 +819,6 @@ class Runner:
         # probe waits a full interval after the trip and each failed canary re-spaces the next. Reset
         # to 0 on any verified delivery. In-memory like the streak — a restart re-arms from scratch.
         self._launch_fail_at = 0
-        # (#457) The DISTINCT SESSION ids whose launch failed with no verified delivery since — the
-        # machine-wide Claude-auth-death streak, one rung wider than both streaks above.
-        #
-        # Wider in two ways, and both were the 2026-08-26 gap. It counts SESSIONS, not issues: the
-        # only flights attempted for hours that day were the watchdog's d<N> repair launches and the
-        # owner's Debug tap. And it is reason-AGNOSTIC: those refusals wore several different
-        # reasons and not one of them ever reached a cap of its own, so every per-reason streak
-        # above stayed empty while nothing on the machine could start a session.
-        #
-        # {session id: evidence reason}, insertion-ordered. The REASON rides along so the hold can
-        # be NAMED: when every sample in the streak points at one fault the alert table knows, the
-        # owner is told that fault and its real remedy; only a genuinely MIXED streak falls back to
-        # the machine-wide name. A hold that mis-names its cause is worse than a park that names it
-        # correctly (#320's boundary, in the owner's words).
-        #
-        # Cleared by a verified delivery and by NOTHING ELSE — no per-entry expiry, exactly like the
-        # two streaks above. An entry that aged out mid-outage would drop the streak below the cap
-        # while every launch was still refusing, which reads as RECOVERY: the alert retracts, decide
-        # journals "launch delivery verified again" over a machine that verified nothing, the queue
-        # resumes, the lanes fail again and the owner is paged a second time. The window below
-        # bounds only how far back the JOURNAL ABSORB will adopt history, which is a different
-        # question (what a fresh process may believe) with a different answer.
-        self._launch_attempt_fails = {}
-        # The `ts` watermark the out-of-process absorb has already consumed up to. A RECORD-level
-        # watermark, never a byte offset: `rotate()` rewrites the hot journal without its archived
-        # prefix (this runner rotates on its first tick and every few hours after), so a byte offset
-        # would silently index the wrong position — cutting a record in half or skipping the rest of
-        # the file. 0 = cold start; the absorb then adopts the bounded tail's recent past, which is
-        # what lets a runner restarted MID-outage see the refusals that happened while it was down.
-        self._journal_watermark = 0
         # Reclaim-hold dedup (issue #190): {iid: reason} for park-family lanes whose worktree the
         # reclaim guard REFUSED to prune because it held unsaved work. The reaper sweeps every lane
         # every tick, so a lane stuck with unsaved work would journal its refusal ~4x/min without
@@ -2363,11 +2309,10 @@ class Runner:
         disk["launch_env_fail_ids"] = {r: sorted(ids)
                                        for r, ids in self._launch_env_fail_ids.items() if ids}
         disk["launch_fail_at"] = self._launch_fail_at    # the #115 canary retry clock (decide reads it)
-        # ...and the machine-wide ATTEMPT streak (#457), after folding in the launches this process
-        # did not run. Absorbed HERE, one line before it is published, so the tick that first hears
-        # about an out-of-process refusal is the tick that can act on it.
-        self._absorb_out_of_process_launches(now)
-        disk["launch_attempt_fail_ids"] = self._launch_attempt_streak(now)
+        # ...and the machine-wide ATTEMPT streak (#457), derived fresh from the journal so it counts
+        # the launches this process did not run — the watchdog's repair flights, an owner's Debug
+        # tap or resume — exactly as it counts its own.
+        disk["launch_attempt_streak"] = self._launch_attempt_streak(now)
         anchor = self._probe_launch_anchor()             # None = this home has no anchor, or no demand
         if anchor is not None:
             disk["launch_anchor"] = anchor
@@ -3242,123 +3187,95 @@ class Runner:
         self._launch_fail_ids.clear()
         self._launch_env_fail_ids.clear()
         self._launch_fail_at = 0
-        # ...and the machine-wide ATTEMPT streak (#457) on the same evidence: a session that really
-        # started is the answer to "can this machine start a session at all", which is the only
-        # question that streak asks — and the ONLY thing that ever clears it.
-        self._launch_attempt_fails = {}
 
-    def _record_launch_attempt_failure(self, sid, reason):
-        """One flight refused for a CREDENTIAL/ENVIRONMENT reason: add it to the machine-wide
-        attempt streak (issue #457).
+    def _launch_attempt_streak(self, now):
+        """The machine-wide launch-attempt streak (issue #457), derived from the journal.
 
-        Only that family enters (AUTH_DEATH_STREAK_REASONS — see its note). A per-issue fault is
-        about the ISSUE and a channel fault is about the delivery channel; neither is evidence that
-        the machine cannot start a session, and both already have detectors and remedies of their
-        own. Re-recording a session id MOVES it rather than duplicating it, so a lane retried into
-        its own cap is one sample and not two (the streak counts DISTINCT sessions, as #320's does).
-        Returns True when the sample was taken."""
-        if not isinstance(sid, str) or not sid or reason not in AUTH_DEATH_STREAK_REASONS:
-            return False
-        self._launch_attempt_fails.pop(sid, None)
-        self._launch_attempt_fails[sid] = reason
-        return True
+        Returns ``{"lanes": [...], "flights": [...]}`` — the distinct session ids whose launch
+        refused for a CREDENTIAL/ENVIRONMENT reason with no verified delivery since, split by WHO
+        SPAWNED the flight: `lanes` are this runner's own, `flights` are a foreign spawner's (the
+        watchdog's repair session, an owner's Debug tap, a `resume`). decide needs both sides —
+        see its two-sided rule — and the split cannot be read off the id, because `resume` carries
+        a lane's `i<N>` while running in an operator's own shell.
 
-    def _launch_attempt_streak(self, now=None):
-        """The streak as decide reads it: the sorted distinct session ids (issue #457).
+        PURE over a bounded window of the journal (see the constants above for why it is derived
+        rather than accumulated): walk the tail in FILE order, which is the order things actually
+        finished — one O_APPEND write per record, from every writer — clearing on any verified
+        delivery and adding on any classified refusal. The `ts` field is used only to bound the
+        window, never to order: this runner stamps its records with the clock the TICK started on,
+        so a delivery that really came last can carry an earlier stamp than a refusal another
+        process wrote meanwhile.
 
-        The evidence REASONS stay on this side. decide does not need them — this class wears one
-        name — and a pure boundary that accepts a reason it cannot vet is a reason it will one day
-        act on: the filter that decides what counts as a sample belongs where the classifier runs.
-
-        `now` is accepted and unused: the streak has no clock of its own (see the field's note), and
-        the parameter keeps the publish site reading like the two beside it so a future reader does
-        not go looking for an expiry that was deliberately removed."""
-        return sorted(self._launch_attempt_fails)
-
-    def _absorb_out_of_process_launches(self, now):
-        """Fold the launches this process did NOT run into the same attempt streak its own feed.
-
-        The 2026-08-26 blind spot (issue #457). The watchdog's unattended sl-debugger and the
-        owner's `superlooper debug` tap both drive the SAME launcher from their OWN process, so on a
-        machine that cannot start a session at all they are where it shows first — and the runner,
-        whose lanes may all be in flight with nothing fresh to launch, never heard about any of it.
-        That day three watchdog flights and an owner-tapped one refused over several hours while the
-        systemic layer, watching only its own launches, stayed silent.
-
-        The journal is the record all three spawners already write, so this needs no new plumbing
-        and survives a restart. Every record is CLASSIFIED through the same `lib/evidence` the
-        runner's own launches go through — the spawners journal the launcher's rc (and, for the
-        owner's tap, its stderr), and the exit-code contract is one contract for all three — so an
-        out-of-process refusal is admitted to the streak on exactly the same terms as a lane's.
-
-        Bounded and self-guarded: a stateless tail read (constant cost, rotation-proof), a `ts`
-        watermark so nothing is counted twice, a window on how far back history may be adopted, and
-        a bare `except` — a journal we cannot read costs the tick nothing and holds nothing."""
+        Self-guarded and fails OPEN in every direction: a journal we cannot read, a record we
+        cannot classify, an unusable timestamp — each costs a sample, never a hold.
+        """
+        lanes, flights = {}, {}
         try:
             records = journal.tail(self.home)
         except Exception:                              # pragma: no cover - defensive
-            return
+            return {"lanes": [], "flights": []}
         cutoff = now - AUTH_DEATH_STREAK_WINDOW_SECONDS
-        # IN FILE ORDER, which is the true completion order: append() is one O_APPEND write per
-        # record, so every writer lands in the order things actually finished. The `ts` FIELD is the
-        # thing that can lie — this runner stamps its records with the clock the TICK started on
-        # while the other spawners stamp real wall time, and a launch may take up to LAUNCH_TIMEOUT,
-        # so sorting by ts would put a delivery BEFORE a refusal that really preceded it and keep a
-        # streak the delivery had already answered.
-        #
-        # The watermark is therefore a dedup, not an ordering: it skips what was consumed before.
-        # It is deliberately LAGGED by that same skew, so a record written late but stamped early is
-        # still seen. Re-reading an overlap costs nothing — replaying a suffix in file order lands
-        # on the same state it landed on the first time (a re-added id is the same id; a repeated
-        # clear is the same clear) — while missing a CLEAR would leave a hold standing.
-        seen = self._journal_watermark - ABSORB_REPLAY_SECONDS
         for rec in records:
             at = rec.get("ts")
-            if not isinstance(at, (int, float)) or isinstance(at, bool) or not math.isfinite(at):
+            if not isinstance(at, (int, float)) or isinstance(at, bool) or not math.isfinite(at) \
+                    or at < cutoff:
                 continue
-            if at <= seen or at < cutoff:
-                continue
-            # CLAMPED to this tick's clock: a record stamped in the future — a clock step, a
-            # restored state home — would otherwise push the watermark past every record that
-            # follows it and silently deafen this absorb until wall time caught up.
-            self._journal_watermark = max(self._journal_watermark, min(at, now))
             act, outcome = rec.get("act"), rec.get("outcome")
-            if outcome == RUNNER_DELIVERY_OK and (
-                    act in RUNNER_LAUNCH_ACTS
-                    or (act == RUNNER_RELAUNCH_ACT
-                        and rec.get("tier") in RUNNER_RELAUNCH_TIERS)):
-                self._launch_attempt_fails = {}        # this runner's own verified delivery
+            mine = act in RUNNER_LAUNCH_ACTS or (act == RUNNER_RELAUNCH_ACT
+                                                 and rec.get("tier") in RUNNER_RELAUNCH_TIERS)
+            if mine:
+                if outcome == RUNNER_DELIVERY_OK:
+                    lanes, flights = {}, {}            # this runner started a session
+                elif not rec.get("canary"):
+                    # A #115 CANARY is never a sample (#320's rule, rounds 2 and 3): a probe only
+                    # runs while a hold already stands, so it says nothing new about whether one
+                    # should — and it can refuse for a fault of the LANE it happened to probe,
+                    # which would enter as though the machine had produced it.
+                    self._note_attempt_failure(lanes, rec.get("id"), self._streak_reason(rec))
                 continue
-            if act not in OUT_OF_PROCESS_OUTCOMES or not isinstance(outcome, str):
-                continue                               # NB: an act with no outcome at all must not
-            ok, failed = OUT_OF_PROCESS_OUTCOMES[act]  # match a missing table row and read as a
-            if outcome == ok:                          # verified delivery (it did, and cleared it)
+            if act not in FOREIGN_LAUNCH_OUTCOMES or not isinstance(outcome, str):
+                continue                               # NB: an act with NO outcome must not match a
+            ok, failed = FOREIGN_LAUNCH_OUTCOMES[act]  # missing table row and read as a delivery
+            if outcome == ok:
                 # A verified delivery from another process. It clears THIS streak only: the channel
-                # and per-reason environment streaks above are the runner's own accounting, and a
+                # and per-reason environment streaks are the runner's own accounting, and a
                 # debugger flight is not a sample of the WORKER environments they describe.
-                self._launch_attempt_fails = {}
+                lanes, flights = {}, {}
             elif outcome == failed:
-                ev = self._out_of_process_evidence(rec)
-                if ev is not None:
-                    self._record_launch_attempt_failure(rec.get("id"), ev["reason"])
+                self._note_attempt_failure(flights, rec.get("id"), self._streak_reason(rec))
+        return {"lanes": sorted(lanes), "flights": sorted(flights)}
 
-    def _out_of_process_evidence(self, rec):
-        """Classify one out-of-process launch failure, or None when its record says too little.
+    @staticmethod
+    def _note_attempt_failure(bucket, sid, reason):
+        """Record one refused flight, if it is a sample at all (issue #457).
 
-        The spawners record what the launcher told them: the watchdog carries the rc, and
-        `superlooper debug` carries the rc plus the launcher's own stderr (which is what names
-        CLAUDE IDENTITY REFUSED). Both go through `lib/evidence`, the same reader the runner's own
-        launches use, because there is ONE exit-code contract across all three spawn paths.
+        Only the credential/environment family enters (AUTH_DEATH_STREAK_REASONS). A per-issue
+        fault is about the ISSUE and a channel fault is about the delivery channel; neither is
+        evidence that the machine cannot start a session, and both already have detectors and
+        remedies of their own."""
+        if isinstance(sid, str) and sid and reason in AUTH_DEATH_STREAK_REASONS:
+            bucket[sid] = reason
 
-        A record with no usable rc classifies to nothing and is DROPPED rather than guessed at: a
-        refusal we cannot name is not evidence about the machine, and admitting it would let an
+    def _streak_reason(self, rec):
+        """The evidence reason one refused-launch record names, or None when it names none.
+
+        THIS runner's own records already carry the classified evidence `_journal_outcome` stamped
+        on them (#152). A foreign spawner's carry what its verb recorded — the launcher's rc, and
+        for the owner-typed verbs its stderr too — which goes through the same `lib/evidence` for
+        the same reason there is one exit-code contract across all three spawn paths.
+
+        A record with neither classifies to nothing and is DROPPED rather than guessed at: a
+        refusal we cannot name is not evidence about credentials, and admitting it would let an
         unnamed fault wear a credential's remedy."""
+        ev = rec.get("evidence")
+        if isinstance(ev, dict) and isinstance(ev.get("reason"), str):
+            return ev["reason"]
         rc = rec.get("rc")
         if not isinstance(rc, int) or isinstance(rc, bool):
             return None
         text = rec.get("error")
         try:
-            return evidence.build("launch", rc, text if isinstance(text, str) else "")
+            return evidence.build("launch", rc, text if isinstance(text, str) else "")["reason"]
         except Exception:                              # pragma: no cover - defensive
             return None
 
@@ -3383,19 +3300,6 @@ class Runner:
         `fields` are the caller's path-specific loopstate fields; launch_evidence is always stamped.
         Returns True when charged to the channel (held), False when charged to the issue."""
         merged = dict(fields or {}, launch_evidence=ev)
-        # (#457) A CREDENTIAL/ENVIRONMENT refusal is a sample of "can this machine start a session"
-        # whichever way it is charged below. `_record_launch_attempt_failure` applies the family
-        # filter, so a per-issue fault (a worktree that would not create, a brief that could not be
-        # written) and a channel fault (a dead anchor, an unfired shim) both fall straight through:
-        # neither is evidence about credentials, and each already has a detector and a remedy.
-        #
-        # A #115 CANARY is excluded, exactly as it is from the two streaks below and for the same
-        # reason (#320, fresh review rounds 2 and 3): a probe only ever runs while a hold already
-        # stands, so it answers "is one standing" with nothing new — and it can refuse for a fault
-        # of the LANE it happened to probe, which would enter this streak as though the machine had
-        # produced it. A probe is not a sample.
-        if not canary:
-            self._record_launch_attempt_failure(iid, ev.get("reason") if isinstance(ev, dict) else None)
         if canary or evidence.is_channel_fault(ev):
             self._launch_fail_at = now
             # A canary is a PROBE, not a SAMPLE, and the difference is what keeps a held queue to one

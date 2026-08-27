@@ -802,10 +802,18 @@ def _dark_meter(now=NOW):
 
 def _attempts(ids, fail_at=NOW - 10, **over):
     """A disk view whose ATTEMPT streak names `ids` — the distinct session ids whose launch refused
-    for a credential/environment reason with no verified delivery since, which is what the runner
-    publishes after folding in the launches it did not run (the watchdog's, the owner's taps)."""
+    for a credential/environment reason with no verified delivery since. The runner publishes them
+    SPLIT BY SPAWNER: `lanes` are its own launches, `flights` are a foreign spawner's (the
+    watchdog's repair session, an owner's Debug tap, a `resume`). This helper takes a plain list
+    and splits it by id shape purely for readability — the engine never does, and
+    `test_a_RESUME_is_a_foreign_spawner_however_its_id_is_shaped` is why."""
     over.setdefault("launch_anchor", {"ok": True})
-    return disk(launch_attempt_fail_ids=ids, launch_fail_at=fail_at, **over)
+    if isinstance(ids, (list, tuple)):
+        streak = {"lanes": [x for x in ids if str(x)[:1] == "i"],
+                  "flights": [x for x in ids if str(x)[:1] != "i"]}
+    else:
+        streak = ids
+    return disk(launch_attempt_streak=streak, launch_fail_at=fail_at, **over)
 
 
 def _reasons(out):
@@ -946,7 +954,7 @@ def test_a_more_specific_class_keeps_its_own_name_and_this_one_stays_quiet():
     assert _reasons(out) == ["auth_dead"], _reasons(out)
     # #320's environment escalation, with an attempt streak standing beside it
     dsk = _env_streak("gh_auth_dead", ["i5", "i6"])
-    dsk["launch_attempt_fail_ids"] = ["i5", "d26"]
+    dsk["launch_attempt_streak"] = {"lanes": ["i5"], "flights": ["d26"]}
     dsk["auth_probe"] = _AUTH_UNKNOWN
     out = decide(parsed_issues=[parsed(5), parsed(6), parsed(7)], dsk=dsk)
     assert _reasons(out) == ["gh_auth_dead_workers"], _reasons(out)
@@ -987,8 +995,13 @@ def test_a_meter_that_reads_again_is_not_a_launch_and_journals_no_recovery():
 def test_a_garbage_attempt_streak_never_holds_the_queue():
     """Fail OPEN on unreadable input — a wrongly-held queue is the bigger, quieter outage, and this
     view is data the runner writes."""
-    for bad in (None, "x", 5, {}, ["", None], ["nope", "alsonope"], [5, 6], ["d26", "d26"],
-                {"ids": ["d26", "d27"]}):
+    for bad in (None, "x", 5, {}, {"lanes": None, "flights": None},
+                {"lanes": "i5", "flights": "d26"},
+                {"lanes": ["i5"], "flights": []}, {"lanes": [], "flights": ["d26", "d27"]},
+                {"lanes": ["", None], "flights": ["d26"]},
+                {"lanes": ["nope"], "flights": ["alsonope"]},
+                {"lanes": [5], "flights": [6]},
+                {"ids": ["i5", "d26"]}):
         dsk = _attempts(bad, auth_probe=_AUTH_UNKNOWN)
         out = decide(parsed_issues=[parsed(5), parsed(6)], dsk=dsk, usage=_dark_meter())
         assert AUTH_DEATH not in _reasons(out), bad
@@ -1116,13 +1129,33 @@ def test_the_status_line_and_the_morning_report_name_the_auth_death_hold():
 
 
 # --------------- the runner half: what the runner could not see before ----------------------
+#
+# The streak is DERIVED from the journal once per tick, not accumulated in memory. That is the
+# choice these tests exist to protect: an in-memory streak has to be reconciled with the journal
+# for the launches this process did not run, and every incremental reconciliation this issue tried
+# — a byte offset, a timestamp watermark, a lagged one — had a boundary at which a VERIFIED
+# DELIVERY fell outside the window while the refusals it answered fell inside, which re-holds a
+# machine that just launched a session. A pure function of a bounded window has no such boundary.
+
 
 def _oop(rig, act, outcome, sid, ts=NOW, **extra):
-    """Journal the record an OUT-OF-PROCESS spawner writes — the watchdog's own check process, the
-    owner's `superlooper debug` tap, `superlooper resume`. None of them runs inside the runner, so
-    the journal is the only place it can ever learn a launch was attempted at all."""
+    """Journal the record a FOREIGN spawner writes — the watchdog's own check process, the owner's
+    `superlooper debug` tap, `superlooper resume`. None of them runs inside the runner, so the
+    journal is the only place it can ever learn a launch was attempted at all."""
     import journal as journal_mod
     journal_mod.append(str(rig.home), dict({"act": act, "outcome": outcome, "id": sid}, **extra), ts)
+
+
+def _mine(rig, act, outcome, sid, ts=NOW, **extra):
+    """Journal one of the RUNNER's own launch outcomes, in the shape `_journal_outcome` writes."""
+    import journal as journal_mod
+    journal_mod.append(str(rig.home), dict({"act": act, "outcome": outcome, "id": sid}, **extra), ts)
+
+
+def _fly(rig, action, now):
+    """Execute one launch action AND journal its outcome, the way the tick does — the record's
+    stamped `evidence` (#152) is what the derivation classifies the runner's own refusals from."""
+    rig.r._journal_outcome(action, rig.r._execute(action, now), now)
 
 
 def _streak(rig, now=NOW + 20):
@@ -1135,8 +1168,7 @@ def test_a_watchdog_debugger_launch_failure_feeds_the_attempt_streak(rig):
     rig.r.tick(now=NOW)
     _oop(rig, "watchdog", "launch_failed", "d26", ts=NOW + 1, rc=5, signals=["alert"])
     _oop(rig, "watchdog", "launch_failed", "d27", ts=NOW + 2, rc=5, signals=["alert"])
-    rig.r.tick(now=NOW + 20)
-    assert _streak(rig) == ["d26", "d27"]
+    assert _streak(rig) == {"lanes": [], "flights": ["d26", "d27"]}
 
 
 def test_an_owner_tapped_debug_launch_failure_feeds_the_attempt_streak(rig):
@@ -1145,35 +1177,45 @@ def test_an_owner_tapped_debug_launch_failure_feeds_the_attempt_streak(rig):
     rig.r.tick(now=NOW)
     _oop(rig, "debug_launch", "launch_failed", "d29", ts=NOW + 1, rc=7, operator="willprout",
          source="command-center", error="[d29] CLAUDE IDENTITY REFUSED in the session's own env")
-    rig.r.tick(now=NOW + 20)
-    assert _streak(rig) == ["d29"]
+    assert _streak(rig) == {"lanes": [], "flights": ["d29"]}
 
 
-def test_a_resume_is_the_same_launcher_and_counts_both_ways(rig):
-    """`superlooper resume` drives the SAME launcher from its own process. Its refusal is a sample;
-    its success is proof the machine can start a session, and a hold left standing over a machine
+def test_a_RESUME_is_a_foreign_spawner_however_its_id_is_shaped(rig):
+    """THE reason the two sides are split by spawner and never by id shape. `superlooper resume`
+    carries a lane's own `i<N>`, but it is shelled from an operator's shell or the dashboard — so
+    its refusal reads THAT environment, the very one the flight side exists to be independent of.
+    Counted as a lane, one poisoned shell would produce both halves on its own and freeze a healthy
+    queue under a page saying nothing on the machine can start a session."""
+    rig.r.tick(now=NOW)
+    _oop(rig, "debug_launch", "launch_failed", "d29", ts=NOW + 1, rc=6,
+         error="[d29] ENV POISONED: ANTHROPIC_API_KEY survived the scrub")
+    _oop(rig, "resume", "resume_failed", "i104", ts=NOW + 2, rc=6, session_id="abc",
+         error="[i104] ENV POISONED: ANTHROPIC_API_KEY survived the scrub")
+    assert _streak(rig) == {"lanes": [], "flights": ["d29", "i104"]}, "both are foreign"
+    out = decide(parsed_issues=[parsed(5), parsed(6)], usage=_dark_meter(),
+                 dsk=disk(launch_anchor={"ok": True}, auth_probe=_AUTH_UNKNOWN,
+                          launch_attempt_streak=_streak(rig)))
+    assert AUTH_DEATH not in _reasons(out), _reasons(out)
+
+
+def test_a_successful_resume_still_clears_the_streak(rig):
+    """Its success is proof the machine can start a session, and a hold left standing over a machine
     the owner has just visibly resumed work on is the failure this whole class is about."""
     rig.r.tick(now=NOW)
     _oop(rig, "watchdog", "launch_failed", "d26", ts=NOW + 1, rc=5)
-    _oop(rig, "resume", "resume_failed", "i104", ts=NOW + 2, rc=7, session_id="abc")
-    rig.r.tick(now=NOW + 20)
-    assert _streak(rig) == ["d26", "i104"]
-    _oop(rig, "resume", "resumed", "i104", ts=NOW + 30, session_id="abc")
-    rig.r.tick(now=NOW + 40)
-    assert _streak(rig, NOW + 40) == []
+    _oop(rig, "resume", "resumed", "i104", ts=NOW + 2, session_id="abc")
+    assert _streak(rig) == {"lanes": [], "flights": []}
 
 
 def test_a_DELIVERY_CHANNEL_refusal_never_enters_this_streak(rig):
     """The mis-blame this filter exists to prevent, and it is not hypothetical: the watchdog mints a
     FRESH d<N> for every retry of one episode, so an ordinary dead-cmux-pane outage produces two
     distinct session ids five minutes apart BY DESIGN. Admitted here it would hold the queue under a
-    credential's banner and send the owner to go log back into Claude over a missing tab. The
-    channel has detectors and a remedy of its own; this streak is about credentials."""
+    credential's banner and send the owner to go log back into Claude over a missing tab."""
     rig.r.tick(now=NOW)
     _oop(rig, "watchdog", "launch_failed", "d26", ts=NOW + 1, rc=2, signals=["alert"])
     _oop(rig, "watchdog", "launch_failed", "d27", ts=NOW + 2, rc=124, signals=["alert"])
-    rig.r.tick(now=NOW + 20)
-    assert _streak(rig) == []
+    assert _streak(rig)["flights"] == []
 
 
 def test_a_PER_ISSUE_refusal_never_enters_this_streak(rig):
@@ -1183,8 +1225,8 @@ def test_a_PER_ISSUE_refusal_never_enters_this_streak(rig):
     rig.r.tick(now=NOW)
     rig.calls.clear()
     rig.rc_queue.append(runner_mod.ScriptRC(1, "[i101] could not create the worktree"))
-    rig.r._execute(_launch_action(), NOW)
-    assert _streak(rig, NOW) == []
+    _fly(rig, _launch_action(), NOW + 1)
+    assert _streak(rig)["lanes"] == []
     assert issue_state(rig, "i101")["launch_failures"] == 1, "it still parks on its own schedule"
 
 
@@ -1196,8 +1238,8 @@ def test_a_CANARY_probes_refusal_is_never_a_sample(rig):
     rig.r.tick(now=NOW)
     rig.calls.clear()
     rig.rc_queue.append(runner_mod.ScriptRC(6, "[i101] ENV POISONED: ANTHROPIC_API_KEY survived"))
-    rig.r._execute(dict(_launch_action(), canary=True), NOW)
-    assert _streak(rig, NOW) == []
+    _fly(rig, dict(_launch_action(), canary=True), NOW + 1)
+    assert _streak(rig)["lanes"] == []
 
 
 def test_a_record_with_no_readable_rc_is_dropped_rather_than_guessed_at(rig):
@@ -1206,148 +1248,154 @@ def test_a_record_with_no_readable_rc_is_dropped_rather_than_guessed_at(rig):
     rig.r.tick(now=NOW)
     _oop(rig, "watchdog", "launch_failed", "d26", ts=NOW + 1, signals=["alert"])
     _oop(rig, "watchdog", "launch_failed", "d27", ts=NOW + 2, rc="five", signals=["alert"])
-    rig.r.tick(now=NOW + 20)
-    assert _streak(rig) == []
+    assert _streak(rig)["flights"] == []
 
 
-def test_an_out_of_process_launch_that_STARTED_clears_the_streak(rig):
-    """A session that really started proves the machine can start sessions, whoever started it."""
+def test_the_runners_OWN_launch_failure_feeds_the_lane_side(rig):
+    """One streak, whoever attempted the launch — otherwise the same outage would need two. The
+    runner's own records already carry the classified evidence (#152), so nothing is re-derived."""
+    rig.r.tick(now=NOW)
+    rig.calls.clear()
+    rig.rc_queue.append(runner_mod.ScriptRC(7, "[i101] CLAUDE IDENTITY REFUSED: not logged in"))
+    _fly(rig, _launch_action(), NOW + 1)
+    assert _streak(rig) == {"lanes": ["i101"], "flights": []}
+
+
+@pytest.mark.parametrize("rec", [
+    {"act": "launch", "id": "i101", "outcome": "ok"},
+    {"act": "recover", "id": "i101", "tier": "exited", "outcome": "ok"},
+    {"act": "resolve_conflict", "id": "i101", "outcome": "ok"},
+])
+def test_every_verified_delivery_this_runner_makes_clears_the_streak(rec, rig):
+    """All three launch paths, read back from the journal so a RESTART sees them too. The recovery
+    relaunch is the load-bearing one: the machine-wide hold deliberately does not suppress it — on
+    an all-in-flight machine it is the only flight left, and the #115 probe's candidates are issue
+    lanes this streak may contain none of."""
+    import journal as journal_mod
     rig.r.tick(now=NOW)
     _oop(rig, "watchdog", "launch_failed", "d26", ts=NOW + 1, rc=5)
-    _oop(rig, "debug_launch", "launched", "d27", ts=NOW + 2, operator="willprout")
-    rig.r.tick(now=NOW + 20)
-    assert _streak(rig) == []
+    _oop(rig, "watchdog", "launch_failed", "d27", ts=NOW + 2, rc=8)
+    assert _streak(rig)["flights"] == ["d26", "d27"]
+    journal_mod.append(str(rig.home), rec, NOW + 30)
+    assert _streak(rig, NOW + 40) == {"lanes": [], "flights": []}
+
+
+@pytest.mark.parametrize("tier", ["idle", "frozen", None])
+def test_a_recover_that_only_NUDGED_clears_nothing(tier, rig):
+    """...and the tier is what tells them apart. `recover` reads outcome "ok" for a delivered NUDGE
+    as well as for a relaunch, and an i336 lane whose auth died in-process answers nudges all day
+    while starting nothing. Clearing on that would disarm the detector during exactly the outage it
+    exists for."""
+    import journal as journal_mod
+    rig.r.tick(now=NOW)
+    _oop(rig, "watchdog", "launch_failed", "d26", ts=NOW + 1, rc=5)
+    _oop(rig, "watchdog", "launch_failed", "d27", ts=NOW + 2, rc=8)
+    journal_mod.append(str(rig.home), {"act": "recover", "id": "i101", "tier": tier,
+                                       "outcome": "ok"}, NOW + 30)
+    assert _streak(rig, NOW + 40)["flights"] == ["d26", "d27"]
 
 
 def test_a_verified_delivery_BETWEEN_two_refusals_breaks_the_streak(rig):
-    """"Consecutive, with no success between them" is the whole claim, and the absorb reads the
-    journal in FILE order to settle it. That order is the true completion order — one O_APPEND write
-    per record, from every writer — whereas the `ts` FIELD can lie: this runner stamps its records
-    with the clock the TICK started on, so a delivery that really came last can carry an earlier
-    stamp than a refusal another process wrote meanwhile."""
+    """"Consecutive, with no success between them" is the whole claim, and the derivation reads the
+    journal in FILE order to settle it — the order things actually finished, one O_APPEND write per
+    record from every writer."""
     rig.r.tick(now=NOW)
     _oop(rig, "watchdog", "launch_failed", "d26", ts=NOW + 1, rc=5)
     _oop(rig, "debug_launch", "launched", "d27", ts=NOW + 2, operator="willprout")
     _oop(rig, "watchdog", "launch_failed", "d28", ts=NOW + 3, rc=5)
-    rig.r.tick(now=NOW + 20)
-    assert _streak(rig) == ["d28"], "the success clears d26 and only d26"
+    assert _streak(rig)["flights"] == ["d28"], "the success clears d26 and only d26"
 
 
 def test_a_delivery_WRITTEN_LATE_BUT_STAMPED_EARLY_still_clears_the_streak(rig):
-    """The reason the watermark lags itself by a launch's worth of clock. This runner stamps its
-    records with the tick's START, and a launch may take up to LAUNCH_TIMEOUT — so its verified
-    delivery can be written after, and carry a stamp before, a refusal another process recorded in
-    between. A strict watermark would skip it, and a skipped DELIVERY is a hold left standing over a
-    machine that recovered."""
+    """The defect that killed every incremental design this issue tried. This runner stamps its
+    journal records with the clock the TICK started on, and a tick may spend minutes in launches and
+    nudges before writing them — so its verified delivery can be written after, and carry a stamp
+    well before, refusals another process recorded meanwhile. Any reader that ORDERS by `ts`, or
+    that skips records at a `ts` threshold, eventually cuts between a delivery and the refusals it
+    answered: the refusals come back, the streak re-forms, and a machine that verifiably launched a
+    session is re-held and paged over. Reading the whole window in file order cannot do that,
+    however far the stamps are apart."""
     rig.r.tick(now=NOW)
-    _oop(rig, "watchdog", "launch_failed", "d26", ts=NOW + 60, rc=5)
-    rig.r.tick(now=NOW + 90)
-    assert _streak(rig, NOW + 90) == ["d26"]
-    import journal as journal_mod                     # stamped BEFORE d26, written after it
-    journal_mod.append(str(rig.home), {"act": "launch", "id": "i101", "outcome": "ok"}, NOW + 30)
-    rig.r.tick(now=NOW + 110)
-    assert _streak(rig, NOW + 110) == []
+    _oop(rig, "watchdog", "launch_failed", "d26", ts=NOW + 3000, rc=5)
+    _oop(rig, "resume", "resume_failed", "i104", ts=NOW + 3001, rc=7, session_id="abc")
+    assert _streak(rig, NOW + 3100)["flights"] == ["d26", "i104"]
+    _mine(rig, "launch", "ok", "i101", ts=NOW)         # stamped 3000s earlier, written last
+    for at in (NOW + 3100, NOW + 3300, NOW + 9000):
+        assert _streak(rig, at) == {"lanes": [], "flights": []}, at
 
 
 def test_the_streak_never_expires_on_its_own_mid_outage(rig):
-    """The fabricated-recovery trap. If entries aged out on a clock, a streak would fall below the
+    """The fabricated-recovery trap. If samples aged out on a clock, a streak would fall below the
     cap while every launch was still refusing — and decide reads that fall as RECOVERY: the alert
     retracts, the journal records "launch delivery verified again" over a machine that verified
-    nothing, the queue resumes, the lanes refuse again and the owner is paged a second time. The
-    2026-08-26 outage ran longer than any window worth having."""
+    nothing, the queue resumes, the lanes refuse again and the owner is paged a second time."""
     rig.r.tick(now=NOW)
     _oop(rig, "watchdog", "launch_failed", "d26", ts=NOW + 1, rc=5)
     _oop(rig, "watchdog", "launch_failed", "d27", ts=NOW + 2, rc=5)
-    rig.r.tick(now=NOW + 20)
-    long_after = NOW + 10 * runner_mod.AUTH_DEATH_STREAK_WINDOW_SECONDS
-    assert _streak(rig, long_after) == ["d26", "d27"], "only a delivery clears it"
+    inside = NOW + runner_mod.AUTH_DEATH_STREAK_WINDOW_SECONDS - 60
+    assert _streak(rig, inside)["flights"] == ["d26", "d27"], "only a delivery clears it"
 
 
-def test_a_stale_out_of_process_failure_is_never_ADOPTED_from_the_journal(rig):
-    """The window's real job, and its only one: what a FRESH process may believe. The absorb reads a
-    bounded tail that can reach back further than the runner has been up, and a refusal from days
-    ago says nothing about whether the machine can start a session this morning."""
+def test_a_STALE_refusal_is_never_read_as_todays_evidence(rig):
+    """The window's job, and its only one. A refusal from days ago says nothing about whether the
+    machine can start a session this morning, and `journal.tail` reads a byte-bounded slice that can
+    reach back much further than the runner has been up."""
     rig.r.tick(now=NOW)
     old = NOW - runner_mod.AUTH_DEATH_STREAK_WINDOW_SECONDS - 60
     _oop(rig, "watchdog", "launch_failed", "d26", ts=old, rc=5)
     _oop(rig, "watchdog", "launch_failed", "d27", ts=old + 1, rc=5)
-    rig.r.tick(now=NOW + 20)
-    assert _streak(rig) == []
+    assert _streak(rig, NOW) == {"lanes": [], "flights": []}
 
 
-def test_the_runners_OWN_launch_failure_feeds_the_same_streak(rig):
-    """One streak, whoever attempted the launch — otherwise the same outage would need two."""
+def test_a_RESTART_reconstructs_the_whole_streak_including_its_lane_side(rig):
+    """A fresh process holds no streak in memory and rebuilds it from the journal — BOTH sides. An
+    earlier design read only the foreign half back, so a restart mid-outage dropped the lane side,
+    the two-sided test failed, and decide read that fall as a recovery: the alert retracted and the
+    queue relaunched into the wall."""
     rig.r.tick(now=NOW)
     rig.calls.clear()
     rig.rc_queue.append(runner_mod.ScriptRC(7, "[i101] CLAUDE IDENTITY REFUSED: not logged in"))
-    rig.r._execute(_launch_action(), NOW)
-    assert _streak(rig, NOW) == ["i101"]
-
-
-def test_a_verified_delivery_clears_the_attempt_streak(rig):
-    rig.r.tick(now=NOW)
-    rig.r._record_launch_attempt_failure("d26", "gh_auth_dead_runner")
-    rig.r._delivery_cleared()
-    assert _streak(rig, NOW) == []
-
-
-def test_a_RESTART_does_not_resurrect_a_streak_a_later_launch_already_answered(rig):
-    """The cold-start trap. A fresh process has no in-memory streak and re-reads a bounded tail of
-    the journal, which still holds refusals a launch of the runner's OWN has since answered —
-    `_delivery_cleared` cleared them in a process that no longer exists. Reading the runner's own
-    verified delivery back out of the journal is what keeps the chronology right."""
-    rig.r.tick(now=NOW)
-    _oop(rig, "watchdog", "launch_failed", "d26", ts=NOW + 1, rc=5)
-    _oop(rig, "watchdog", "launch_failed", "d27", ts=NOW + 2, rc=5)
-    rig.r.tick(now=NOW + 20)
-    assert _streak(rig) == ["d26", "d27"]
-    import journal as journal_mod
-    journal_mod.append(str(rig.home), {"act": "launch", "id": "i101", "num": 101,
-                                       "outcome": "ok"}, NOW + 30)
+    _fly(rig, _launch_action(), NOW + 1)
+    _oop(rig, "watchdog", "launch_failed", "d26", ts=NOW + 2, rc=5)
     reborn = type(rig.r)(repo=str(rig.repo), config=rig.r.config, state_home=str(rig.home),
                          pane="pane-1", run_script=lambda *a, **k: 0,
                          fetch_usage=lambda: {"auth_status": "ok"})
-    reborn._absorb_out_of_process_launches(NOW + 40)
-    assert reborn._launch_attempt_streak(NOW + 40) == []
+    assert reborn._launch_attempt_streak(NOW + 20) == {"lanes": ["i101"], "flights": ["d26"]}
 
 
-def test_a_successful_NUDGE_is_not_a_launch_and_never_clears_the_streak(rig):
-    """The narrowness of the clear, and why it is narrow. `recover` reads outcome "ok" for a
-    delivered NUDGE as well as for a relaunch — and an i336 lane whose auth died in-process answers
-    nudges all day while starting nothing. Clearing on that would disarm the detector during exactly
-    the outage it exists for."""
+def test_an_unrelated_journal_record_is_never_read_as_a_verified_delivery(rig):
+    """The derivation walks EVERY record in the window, and most of them are not launches at all.
+    One with no `outcome` field must not match a missing table row and read as a session that
+    started — it did, once, and silently emptied the streak on the tick the hold should have
+    tripped."""
+    import journal as journal_mod
     rig.r.tick(now=NOW)
     _oop(rig, "watchdog", "launch_failed", "d26", ts=NOW + 1, rc=5)
     _oop(rig, "watchdog", "launch_failed", "d27", ts=NOW + 2, rc=5)
-    import journal as journal_mod
-    journal_mod.append(str(rig.home), {"act": "recover", "id": "i101", "tier": "idle",
-                                       "outcome": "ok"}, NOW + 3)
-    rig.r.tick(now=NOW + 20)
-    assert _streak(rig) == ["d26", "d27"]
+    for rec in ({"act": "brief_comments", "id": "i101", "num": 101, "fetched": 1},
+                {"act": "alert", "reasons": ["usage_stale"], "outcome": "ok"},
+                {"act": "watchdog", "id": "d99"},                  # a launch act, no outcome
+                {"act": "resume", "id": "i5", "outcome": None}):
+        journal_mod.append(str(rig.home), rec, NOW + 3)
+    assert _streak(rig)["flights"] == ["d26", "d27"]
 
 
-def test_a_record_is_absorbed_exactly_once_however_often_the_tail_is_re_read(rig):
-    """The absorb re-reads a bounded TAIL every tick (a byte offset would be wrong — rotate()
-    rewrites this file without its archived prefix). The `ts` watermark is what keeps that from
-    counting one refusal twice, or from re-adopting one a delivery has since cleared."""
+def test_a_record_with_an_unusable_TIMESTAMP_costs_a_sample_and_nothing_else(rig):
+    """json.loads accepts Infinity, clocks step, state homes get restored. An unusable stamp cannot
+    be placed in the window, so the record is skipped — never a hold, never a silent detector."""
     rig.r.tick(now=NOW)
-    _oop(rig, "watchdog", "launch_failed", "d26", ts=NOW + 1, rc=5)
-    rig.r.tick(now=NOW + 20)
-    assert _streak(rig) == ["d26"]
-    # a launch of the runner's own flies, clearing it in-process AND journaling its twin — which is
-    # what keeps the re-read overlap idempotent: replaying that suffix lands on the same state.
+    with open(rig.home / "journal.jsonl", "a") as f:
+        f.write('{"ts": Infinity, "act": "event", "event": {"type": "x"}}\n')
     import journal as journal_mod
-    journal_mod.append(str(rig.home), {"act": "launch", "id": "i101", "outcome": "ok"}, NOW + 30)
-    rig.r._delivery_cleared()
-    for n in range(3):
-        rig.r.tick(now=NOW + 40 + n * 20)
-    assert _streak(rig, NOW + 100) == [], "a cleared streak is not rebuilt from old records"
+    journal_mod.append(str(rig.home), {"act": "event", "event": {"type": "y"}}, NOW + 86400)
+    _oop(rig, "watchdog", "launch_failed", "d26", ts=NOW + 30, rc=5)
+    _oop(rig, "watchdog", "launch_failed", "d27", ts=NOW + 31, rc=8)
+    assert _streak(rig, NOW + 40)["flights"] == ["d26", "d27"]
 
 
 def test_the_attempt_streak_is_published_for_decide_to_read(rig, monkeypatch):
-    """decide is PURE — it can only see what the tick hands it. The evidence REASONS stay on the
-    runner's side: this class wears one name, and a pure boundary that accepts a reason it cannot
-    vet is a reason it will one day act on."""
+    """decide is PURE — it can only see what the tick hands it, and it must be handed BOTH sides:
+    the split cannot be read off the id (see the resume test above)."""
     seen = {}
     real = actions.decide
 
@@ -1360,7 +1408,7 @@ def test_the_attempt_streak_is_published_for_decide_to_read(rig, monkeypatch):
     _oop(rig, "watchdog", "launch_failed", "d26", ts=NOW + 3, rc=5)
     monkeypatch.setattr(actions, "decide", spy)
     rig.r.tick(now=NOW + 20)
-    assert seen["launch_attempt_fail_ids"] == ["d26", "d27"]
+    assert seen["launch_attempt_streak"] == {"lanes": [], "flights": ["d26", "d27"]}
 
 
 # ------------------------- the arc: the 2026-08-26 outage, replayed -------------------------
@@ -1486,89 +1534,3 @@ def test_the_2026_08_26_outage_holds_the_queue_and_resumes_on_its_own(auth_outag
     assert _journal(rig, "park") == [], "and it parked nothing on the way out either"
     assert loopstate.load(str(rig.home / "state" / "issues.json"))["issues"]["i101"]["status"] \
         == "running", "the queue resumed on its own"
-
-
-def test_an_unrelated_journal_record_is_never_read_as_a_verified_delivery(rig):
-    """The absorb walks EVERY record in the tail, and most of them are not launches at all. One with
-    no `outcome` field must not match a missing table row and read as a session that started — it
-    did, once, and silently emptied the streak on the very tick the hold should have tripped."""
-    rig.r.tick(now=NOW)
-    _oop(rig, "watchdog", "launch_failed", "d26", ts=NOW + 1, rc=5)
-    _oop(rig, "watchdog", "launch_failed", "d27", ts=NOW + 2, rc=5)
-    import journal as journal_mod
-    for rec in ({"act": "brief_comments", "id": "i101", "num": 101, "fetched": 1},
-                {"act": "alert", "reasons": ["usage_stale"], "outcome": "ok"},
-                {"act": "watchdog", "id": "d99"},                  # our own act, no outcome
-                {"act": "resume", "id": "i5", "outcome": None}):
-        journal_mod.append(str(rig.home), rec, NOW + 3)
-    rig.r.tick(now=NOW + 20)
-    assert _streak(rig) == ["d26", "d27"]
-
-
-def test_the_runners_own_RELAUNCH_delivery_clears_the_streak_across_a_restart(rig):
-    """The exit this design leans on, read back from the journal. The machine-wide hold deliberately
-    does NOT suppress the recovery relaunch — on an all-in-flight machine it is the only flight
-    left, and the #115 probe's candidates are issue lanes this streak may contain none of. So a
-    reborn runner that could not recognise a relaunch's success would hold a machine that had
-    visibly recovered, with nothing able to tell it otherwise."""
-    import journal as journal_mod
-    for act, rec in (("recover", {"act": "recover", "id": "i101", "tier": "exited",
-                                  "outcome": "ok"}),
-                     ("resolve_conflict", {"act": "resolve_conflict", "id": "i101",
-                                           "outcome": "ok"})):
-        rig.r.tick(now=NOW)
-        _oop(rig, "watchdog", "launch_failed", "d26", ts=NOW + 1, rc=5)
-        _oop(rig, "watchdog", "launch_failed", "d27", ts=NOW + 2, rc=8)
-        rig.r.tick(now=NOW + 20)
-        assert _streak(rig) == ["d26", "d27"], act
-        journal_mod.append(str(rig.home), rec, NOW + 30)
-        reborn = type(rig.r)(repo=str(rig.repo), config=rig.r.config, state_home=str(rig.home),
-                             pane="pane-1", run_script=lambda *a, **k: 0,
-                             fetch_usage=lambda: {"auth_status": "ok"})
-        reborn._absorb_out_of_process_launches(NOW + 40)
-        assert reborn._launch_attempt_streak(NOW + 40) == [], act
-
-
-def test_a_recover_that_only_NUDGED_still_clears_nothing(rig):
-    """...and the tier is what tells them apart. `recover` reads outcome "ok" for a delivered NUDGE
-    as well as for a relaunch, and an i336 lane whose auth died in-process answers nudges all day
-    while starting nothing."""
-    import journal as journal_mod
-    rig.r.tick(now=NOW)
-    _oop(rig, "watchdog", "launch_failed", "d26", ts=NOW + 1, rc=5)
-    _oop(rig, "watchdog", "launch_failed", "d27", ts=NOW + 2, rc=8)
-    rig.r.tick(now=NOW + 20)
-    for tier in ("idle", "frozen", None):
-        journal_mod.append(str(rig.home), {"act": "recover", "id": "i101", "tier": tier,
-                                           "outcome": "ok"}, NOW + 30)
-    reborn = type(rig.r)(repo=str(rig.repo), config=rig.r.config, state_home=str(rig.home),
-                         pane="pane-1", run_script=lambda *a, **k: 0,
-                         fetch_usage=lambda: {"auth_status": "ok"})
-    reborn._absorb_out_of_process_launches(NOW + 40)
-    assert reborn._launch_attempt_streak(NOW + 40) == ["d26", "d27"]
-
-
-def test_a_record_stamped_in_the_FUTURE_never_deafens_the_absorb(rig):
-    """A clock step, a restored state home, a hand-edited journal. The watermark is clamped to the
-    tick's own clock, because a stamp from tomorrow would otherwise push it past every record that
-    follows and silently stop this detector — every refusal AND every clear — until wall time caught
-    up, with nothing to say it had happened."""
-    import journal as journal_mod
-    rig.r.tick(now=NOW)
-    journal_mod.append(str(rig.home), {"act": "event", "event": {"type": "x"}}, NOW + 86400)
-    rig.r.tick(now=NOW + 20)
-    _oop(rig, "watchdog", "launch_failed", "d26", ts=NOW + 30, rc=5)
-    _oop(rig, "watchdog", "launch_failed", "d27", ts=NOW + 31, rc=8)
-    rig.r.tick(now=NOW + 40)
-    assert _streak(rig, NOW + 40) == ["d26", "d27"]
-
-
-def test_the_absorb_survives_a_non_finite_timestamp(rig):
-    """json.loads accepts Infinity, and nothing upstream rejects it."""
-    rig.r.tick(now=NOW)
-    with open(rig.home / "journal.jsonl", "a") as f:
-        f.write('{"ts": Infinity, "act": "event", "event": {"type": "x"}}\n')
-    _oop(rig, "watchdog", "launch_failed", "d26", ts=NOW + 30, rc=5)
-    _oop(rig, "watchdog", "launch_failed", "d27", ts=NOW + 31, rc=8)
-    rig.r.tick(now=NOW + 40)
-    assert _streak(rig, NOW + 40) == ["d26", "d27"]

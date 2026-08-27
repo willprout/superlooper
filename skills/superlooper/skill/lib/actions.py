@@ -434,7 +434,9 @@ ALERT_MESSAGES = {
                                "the account that owns the loop repo; (3) an exported "
                                "ANTHROPIC_API_KEY / ANTHROPIC_BASE_URL / CLAUDE_CODE_* the launch "
                                "floor could not scrub — find it in a shell rc file, a LaunchAgent "
-                               "or a wrapper. `superlooper doctor` checks all three. Launches are "
+                               "or a wrapper. `superlooper doctor --stack` checks the first two "
+                               "(nothing checks the third; the failing flights' stderr is what "
+                               "names it). Launches are "
                                "HELD: the hold itself parks nothing and moves no label, and it "
                                "lifts by itself the moment ANY flight flies — a probe launch of an "
                                "approved issue, a recovery relaunch of an in-flight lane, or a "
@@ -443,7 +445,10 @@ ALERT_MESSAGES = {
                                "one. A lane that reached its OWN cap before the outage was proven "
                                "may already have parked; re-approve that one. IF INSTEAD these "
                                "were unrelated faults, the first flight clears this and no "
-                               "re-approval is owed. This is NOT a cmux/App Nap fault.",
+                               "re-approval is owed. This says nothing about the cmux launch "
+                               "anchor either way: a dead one raises `launch_anchor_down` on its "
+                               "own account as soon as there is approved work — `superlooper "
+                               "status` shows whichever holds.",
     "claude_identity_wrong_workers": "CLAUDE CODE is unusable in every WORKER environment (issue "
                                      "#320): several distinct lanes in a row refused their flight "
                                      "because, from inside the SESSION's own environment, `claude "
@@ -1766,9 +1771,11 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     # a repeated id. And it is the widest net this layer casts, so it is the one most able to be
     # WRONG — which is why the recovery probe below is not optional for it: a hold over two
     # coincidentally-broken lanes lifts itself the first time any flight flies.
-    raw_attempts = dsk.get("launch_attempt_fail_ids")
-    attempt_fail_ids = {x for x in raw_attempts if _is_session_id(x)} \
-        if isinstance(raw_attempts, (list, set, tuple, frozenset)) else set()
+    raw_attempts = dsk.get("launch_attempt_streak")
+    raw_attempts = raw_attempts if isinstance(raw_attempts, dict) else {}
+    attempt_lanes = {x for x in _dget(raw_attempts, "lanes", list) if _is_session_id(x)}
+    attempt_flights = {x for x in _dget(raw_attempts, "flights", list) if _is_session_id(x)}
+    attempt_fail_ids = attempt_lanes | attempt_flights
     # ...and the samples must span BOTH SIDES: at least one queued issue's LANE, and at least one
     # flight the queue does not own (a watchdog repair session, an owner's Debug tap, a resume).
     # That two-sided requirement is the discriminator, and each half rules out a different way of
@@ -1787,12 +1794,21 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     #
     # Both together are the thing neither the lanes nor the spawner can explain away — and, exactly,
     # the evidence #320 structurally cannot count: its streaks are made of issue lanes.
+    #
+    # The runner splits the two sides by WHO SPAWNED the flight, never by the shape of the id, and
+    # that distinction is load-bearing: `superlooper resume` carries a lane's own `i<N>` while
+    # running in an operator's shell or the dashboard's, so read off the id it would satisfy the
+    # lane side using the very environment the flight side is meant to be independent of — one
+    # poisoned shell would then produce both halves on its own.
     attempt_streak = (len(attempt_fail_ids) >= AUTH_DEATH_LAUNCH_CAP
-                      and any(_iid_num(x) is None for x in attempt_fail_ids)
-                      and any(_iid_num(x) is not None for x in attempt_fail_ids))
+                      and attempt_lanes and attempt_flights)
     # Not affirmatively alive: `unknown` (the probe would not answer), absent (no probe was fed),
     # or a definitive dead reading. Only a positive `valid is True` clears this conjunct.
-    auth_unconfirmed = not (isinstance(auth_probe, dict) and auth_probe.get("valid") is True)
+    # ...where "unconfirmed" needs a probe that actually ran and did not say yes. An ABSENT probe is
+    # not a signal: the runner feeds one whenever a spend is pending, and it never feeds one at all
+    # on a Codex repo — where the meter is synthesised healthy too, so treating absence as evidence
+    # would leave this conjunct permanently satisfied and page a Codex machine about `claude auth`.
+    auth_unconfirmed = isinstance(auth_probe, dict) and auth_probe.get("valid") is not True
     # ...and it is a BACKSTOP, silent whenever a more specific detector already holds the queue.
     # This is #320's own rule read the other way round: a hold that arrives wearing another class's
     # banner is the mis-blame that layer exists to end, and stapling a second, cruder name onto an
