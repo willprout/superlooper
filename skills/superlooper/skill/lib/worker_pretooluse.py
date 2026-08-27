@@ -59,6 +59,17 @@ its OWN AskUserQuestion fallback (_ROLES):
                        sl-debugger run ends with (plugin/skills/sl-debugger/references/
                        unattended-contract.md). Never the worker's blocked file: nothing reads one
                        for a `d<N>`, so that fallback would be a dead drop.
+  * `t<N>` TRIAGE   -> the flight (#448). Its run log under <state home>/triage/runs/, and the
+                       escalation sheet its brief names. Never the worker's blocked file either,
+                       and for the same reason: a flight holds no lane, so nothing watches one for
+                       a question and a dialog here waits for a reader that does not exist.
+
+THE THIRD SEAT IS NOT OPTIONAL, and it is the reason this list must be widened the same day a
+launcher gains an id shape. #448 made `t<N>` launchable; until this role existed, `_role("t3")`
+answered None and a flight was allowed EVERYTHING — including the two calls its own standing rule
+says are "denied at the call" (`agent-ready`, `pre-authorized:*`) and the AskUserQuestion that
+would strand it. The launcher denying it the fence token proved nothing about this layer: that is
+one capability, and this is a different one. (Fresh-agent review, P0.)
 
 The ruling named a third seat — the answerer `a<N>` — conditionally: "while any remain pre-#194".
 None remain. #194 merged on 2026-07-21 and retired the answerer scaffolding outright, narrowing
@@ -116,6 +127,11 @@ import os
 import re
 import shlex
 import sys
+
+# A stdlib-only leaf (hashlib/os/re + `issues`, itself `re`-only), so importing it costs this hook
+# — which runs before EVERY tool call — nothing measurable. It is imported for the ONE thing the
+# triage fallback must not hardcode: where a flight's run log actually lives.
+import triage
 
 try:
     import queue_lint
@@ -195,19 +211,44 @@ def _debugger_ask_reason(state_home, issue_id):
         % os.path.join(state_home, "reports"))
 
 
-# The ONE place session id -> role -> fallback is decided. `i<N>` and `d<N>` are exactly the shapes
-# lib/launch.py's own mode guards enforce (`^i[0-9]+$` for a worker, `^d[0-9]+$` for --cwd since
-# #194), so this cannot recognize a session the loop cannot launch — and it stays in step with the
-# launcher: a seat retired there falls out of here, which is why `a<N>` is gone. ASCII digits only,
-# deliberately: `str.isdigit()` would also accept unicode digits that no launcher can produce.
+def _triage_ask_reason(state_home, issue_id):
+    # The flight has NO lane and no blocked file. The runner watches `state/blocked/<id>` for an
+    # `i<N>` alone, so writing one here is a dead drop — and unlike a worker there is no "a fresh
+    # session resumes you with the answer" path to promise, because a flight is not resumed: it
+    # goes out at most once a day and the next one is a new run reading the last three run logs.
+    #
+    # So an unanswerable item is an ESCALATION, never a question, and the standing rule already
+    # says what shape one takes ("one line and a recommendation per item", composed as the owner's
+    # sitting sheet). This text names the two places that exist — this run's log, whose path THIS
+    # engine owns, and the sheet, whose shape the brief owns — rather than inventing a protocol the
+    # brief has not written yet.
+    return _ASK_PREFIX % "triage flight" + (
+        "The runner launched you on a schedule, not a person, and a flight holds no lane — nothing "
+        "watches a t<N> for a question, so this dialog would wait for a reader that does not "
+        "exist. Anything you cannot settle from the evidence is an ESCALATION rather than a "
+        "question: write it as ONE line plus your recommendation on the escalation sheet your "
+        "brief names, record it in this run's log under %s, and finish the run. Prioritisation "
+        "and what to build next are the owner's, always — your job is to hand him the sheet, not "
+        "to wait for an answer."
+        % triage.runs_dir(state_home))
+
+
+# The ONE place session id -> role -> fallback is decided. `i<N>`, `d<N>` and `t<N>` are exactly the
+# shapes lib/launch.py's own mode guards enforce (`^i[0-9]+$` for a worker, `^d[0-9]+$` for --cwd
+# since #194, `^t[0-9]+$` for the triage flight since #448), so this cannot recognize a session the
+# loop cannot launch — and it stays in step with the launcher in BOTH directions: a seat retired
+# there falls out of here (which is why `a<N>` is gone), and a seat ADDED there must arrive here in
+# the same change, or the new class is handed every hazard this module exists to deny. ASCII digits
+# only, deliberately: `str.isdigit()` would also accept unicode digits that no launcher can produce.
 _ROLES = {"i": ("worker", _worker_ask_reason),
-          "d": ("debugger", _debugger_ask_reason)}
-_ID_RE = re.compile(r"^([id])([0-9]+)$")
+          "d": ("debugger", _debugger_ask_reason),
+          "t": ("triage", _triage_ask_reason)}
+_ID_RE = re.compile(r"^([idt])([0-9]+)$")
 
 
 def _role(issue_id):
-    """('worker'|'debugger', reason_fn) for a loop session id, else None. None means a session whose
-    escalation protocol we do not know — we deny it nothing (fail open)."""
+    """('worker'|'debugger'|'triage', reason_fn) for a loop session id, else None. None means a
+    session whose escalation protocol we do not know — we deny it nothing (fail open)."""
     m = _ID_RE.match(issue_id) if isinstance(issue_id, str) else None
     return _ROLES[m.group(1)] if m else None
 

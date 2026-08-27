@@ -203,6 +203,24 @@ _LAUNCH_TEXT = (
       "launched onto it. A machine-level fault no queued issue caused and none can fix by "
       "re-approving: rebuild the patched host and reinstall the fleet server, or declare the "
       "machine unfenced deliberately")),
+    # SECOND (issue #448), and ahead of everything below for the same reason `fence down` leads:
+    # two of the triage launcher's refusals interpolate a value the engine did not choose (a
+    # per-repo `triage.home` string, a checkout path), so any position a later needle could be
+    # inserted above is a position where `SL_TRIAGE_HOME=not_found` reads as a dead cmux workspace.
+    #
+    # It is a PER-ISSUE reason, deliberately, and that is the whole point of the entry: these are
+    # per-REPO CONFIGURATION faults (a typo'd home, an SL_REPO naming a checkout that moved), and
+    # without a needle they fall through to the rc=1 default `launch_failed_before_delivery` —
+    # which IS a channel fault. One repo's config typo would then hold the entire approved queue,
+    # waiting on something that never self-heals and that no queued issue caused. `TRIAGE LAUNCH
+    # REFUSED` is the loop's OWN phrase from lib/launch.py; gh, git and the session host can never
+    # emit it, and it contains spaces, so no variable name or path can carry it by accident.
+    (("triage launch refused",),
+     ("triage_launch_refused",
+      "the triage flight could not be launched because this repo's triage configuration does not "
+      "describe a place to run it — an unreadable `triage.home`, or an SL_REPO naming a checkout "
+      "that is not there. No session was created, and no queued issue caused it: fix the repo's "
+      "`.superlooper/config.json` (or the checkout path) and the next day's flight goes out")),
     # THEN (issue #301), ahead of the gh needles. A poisoned environment is causally
     # UPSTREAM of the auth death it can produce — an inherited XDG_CONFIG_HOME is exactly how `gh`
     # dies — so when the session's refusal names the environment, the environment is the honest

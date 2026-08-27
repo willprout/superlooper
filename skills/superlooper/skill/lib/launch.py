@@ -102,6 +102,12 @@ MODES = (WORKER, DEBUGGER, TRIAGE)
 _MODE_GUARDS = {WORKER: WORKER_RE, DEBUGGER: DEBUGGER_RE, TRIAGE: TRIAGE_RE}
 # One refusal sentence per mode. The first two are VERBATIM — ``evidence.py`` classifies launcher
 # stderr on phrases, and tests/test_launch_delivery drives them through the real CLI.
+#
+# All three deliberately do NOT carry the `TRIAGE LAUNCH REFUSED` lead the home/repo refusals below
+# do, and the difference is the fault's OWNER: a mode crossing is a CALLER bug — the launch stack
+# handed this launcher an id its declared mode cannot take — which is the launch machinery's own
+# fault and reads as a channel fault exactly as the worker and debugger crossings always have. The
+# refusals further down are a per-REPO configuration fault, which must never hold the queue.
 _MODE_REFUSALS = {
     WORKER: "[%s] worker mode expects an issue id (i<N>) — refusing",
     DEBUGGER: "[%s] --cwd mode is for debugger (d<N>) ids only — refusing",
@@ -391,6 +397,15 @@ def _launch(spec, host, edges):
     # names is real, and the class it was confused with is the one holding the fence's token.
     if mode == TRIAGE and spec.cwd is not None:
         return Result(ABORTED, _MODE_REFUSALS[DEBUGGER] % iid)
+    # ...and the symmetric half, now that DEBUGGER can be DECLARED rather than only derived
+    # (fresh-agent review, P2). Derived, `cwd is not None` was the mode, so this could not happen;
+    # declared, it can — and the debugger path skips the fence pre-flight and then reaches
+    # `os.path.isdir(None)`, which raises. `launch`'s catch-all turns that into "the launcher
+    # failed unexpectedly", so a deliberate refusal would render to the owner as a crash — the one
+    # thing `_Refused` exists to prevent.
+    if mode == DEBUGGER and spec.cwd is None:
+        return Result(ABORTED, "[%s] debugger mode needs the directory to run in (--cwd) — "
+                               "refusing" % iid)
     if not _MODE_GUARDS[mode].match(iid):
         return Result(ABORTED, _MODE_REFUSALS[mode] % iid)
     debugger = mode == DEBUGGER
@@ -525,20 +540,32 @@ def _launch(spec, host, edges):
         # `spec.triage_home or CHECKOUT`, which coerced None/False/0/[] into "checkout" and so
         # fail-OPENED a caller bug straight into the owner's REAL working tree (fresh-agent review
         # round 2, P0). Silence takes the ruled default; a value a caller WROTE must be readable.
+        #
+        # All three refusals below LEAD with `TRIAGE LAUNCH REFUSED`, and that phrase is contract
+        # (fresh-agent review, P1). Every one of them is a per-repo CONFIGURATION fault — a typo'd
+        # `triage.home`, an `SL_REPO` naming a checkout that moved — and without a needle of their
+        # own they fall through `evidence.py` to the rc=1 default, `launch_failed_before_delivery`,
+        # which is in CHANNEL_FAULT_REASONS: one repo's config typo would HOLD THE WHOLE APPROVED
+        # QUEUE, waiting for a fault that never self-heals and that no queued issue caused. The
+        # phrase also has to come FIRST in the text, for the reason `fence down` leads the needle
+        # table: two of these interpolate a value the engine did not choose (a config string, a
+        # path), and an interpolated `not_found` or `dial tcp` would otherwise be read as a dead
+        # cmux workspace or a GitHub outage.
         home_kind = getattr(spec, "triage_home", triage.CHECKOUT)
         if type(home_kind) is not str or home_kind not in triage.HOMES:
-            return Result(ABORTED, "[%s] unknown triage home %r (expected: %s) — refusing"
+            return Result(ABORTED, "[%s] TRIAGE LAUNCH REFUSED: unknown triage home %r "
+                                   "(expected: %s) — refusing"
                           % (iid, home_kind, " or ".join(triage.HOMES)))
         if not spec.repo:
             # Named rather than left to git, for the reason the worker refusal below spells out:
             # without it the base probe fails and the launch would blame a dev_branch that is not
             # what went wrong.
-            return Result(ABORTED, "[%s] no target repo was given for a triage launch (SL_REPO) — "
-                                   "not launching" % iid)
+            return Result(ABORTED, "[%s] TRIAGE LAUNCH REFUSED: no target repo was given for a "
+                                   "triage launch (SL_REPO) — not launching" % iid)
         if home_kind == triage.CHECKOUT:
             if not os.path.isdir(spec.repo):
-                return Result(ABORTED, "[%s] the repo checkout does not exist: %s"
-                              % (iid, spec.repo))
+                return Result(ABORTED, "[%s] TRIAGE LAUNCH REFUSED: the repo checkout does not "
+                                       "exist: %s" % (iid, spec.repo))
             # Nothing is created: the flight runs in the checkout an orchestrator would open. Its
             # read-only discipline there (fetch first, judge against origin/main, write only to
             # GitHub and the state home) is the BRIEF's to enforce — no code here writes to it.

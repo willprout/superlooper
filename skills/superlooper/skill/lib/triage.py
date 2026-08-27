@@ -62,13 +62,26 @@ import hashlib
 import os
 import re
 
+import issues
 import loopstate
 
 # --------------------------------------------------------------------------- the layout
 
+# The state folder and the per-repo config block happen to share a word today, and they are
+# SEPARATE constants deliberately (fresh-agent review): one names a directory in the state home,
+# the other a key in `.superlooper/config.json`, and one constant doing both means renaming the
+# folder silently renames every adopter's config key — a rename that would read as "unknown key
+# 'triage'" on somebody else's machine.
 DIR = "triage"                      # <state_home>/triage
+CONFIG_KEY = "triage"               # .superlooper/config.json -> {"triage": {...}}
 RUNS = "runs"                       # <state_home>/triage/runs
 VERDICTS = "verdicts.json"          # <state_home>/triage/verdicts.json
+
+# The approval label, spelled as every other reader in this engine spells it (a bare literal —
+# `labels.py` registers it, and actions.py/issues.py compare against the same string). An APPROVED
+# issue is one the flight may never judge, so it never earns a verdict — which is exactly why
+# `changed()` has to exclude it rather than treat it as permanently unjudged.
+APPROVED_LABEL = "agent-ready"
 
 # The run log's name IS the local date, which is also the day stamp. Matched strictly rather than
 # trusted: this string becomes a path segment, and a caller handing over a date it read from
@@ -179,15 +192,38 @@ def record_verdict(state_home, num, body, verdict, date):
     it exists to answer is "has THIS body been judged". Hashing happens here rather than at the
     call site so the store and ``changed()`` can never disagree about the scheme.
     """
-    current = load_verdicts(state_home)          # already fail-closed to {} on corruption
-    current[_key(num)] = {"body_hash": body_hash(body),
-                          "verdict": verdict if isinstance(verdict, str) else "",
-                          "date": date if isinstance(date, str) else ""}
+    path = verdicts_path(state_home)
     # The folder is created HERE rather than assumed: the first verdict a repo ever records may
     # well arrive before any run log has (`loopstate.save` writes its temp file beside the target,
     # so a missing parent is a FileNotFoundError, not an empty file).
     os.makedirs(home(state_home), exist_ok=True)
-    loopstate.save(verdicts_path(state_home), current)
+    # LOCKED read-modify-write (fresh-agent review, P2). `loopstate.save` is already atomic, so no
+    # reader can see half a ruling — but atomicity is not exclusion: two writers that both read,
+    # both add their own entry and both save leave only the second one's, and the first issue is
+    # then permanently unjudged. The day lease bounds the SCHEDULED path to one flight a day, and
+    # deliberately bounds nothing else: two `--triage` launches by hand share this file, and
+    # start-session.sh's singleton is keyed per-id (`worker.$ID.lock`), so `t1` and `t2` are not
+    # each other's duplicate and both would run.
+    #
+    # `loopstate.update` is the right shape and cannot be used: its L1/S6 guard REFUSES to save any
+    # object without an `issues` key — deliberately, because that guard is what stopped a bad
+    # mutate from writing `[null, null]` over run.json. So this borrows its mutex (the same
+    # portable O_EXCL primitive, the same lock-path convention) rather than its wrapper.
+    lock_path = path + ".lock"
+    token = loopstate._acquire(lock_path)
+    try:
+        current = load_verdicts(state_home)      # already fail-closed to {} on corruption
+        current[_key(num)] = {"body_hash": body_hash(body),
+                              "verdict": verdict if isinstance(verdict, str) else "",
+                              "date": date if isinstance(date, str) else ""}
+        loopstate.save(path, current)
+    finally:
+        # A lock we never got is a lock we must not release — `_release` is token-checked, but
+        # calling it with None would compare against the holder's real token and is simply wrong.
+        # Timing out is not a reason to skip the write: the mutex NARROWS the race, exactly as the
+        # worktree flock does, and a filesystem that cannot lock must not lose a verdict.
+        if token is not None:
+            loopstate._release(lock_path, token)
     return current
 
 
@@ -198,16 +234,32 @@ def _key(num):
 # --------------------------------------------------------------------------- what changed
 
 def changed(open_issues, verdicts):
-    """The open issues whose body differs from the verdict last recorded for them.
+    """The UNAPPROVED open issues whose body differs from the verdict last recorded for them.
 
     Returns issue NUMBERS, sorted and deduplicated. Takes the RAW gh issue dicts rather than
     ``issues.parse_issue`` output, because the body is what is being compared and the parsed
     shape deliberately does not carry it — the open-issue view (``gh._ISSUE_FIELDS``) already
-    fetches ``body``, so this costs no extra GitHub read.
+    fetches ``body`` AND ``labels``, so neither read below costs an extra GitHub call.
+
+    **APPROVED issues are excluded, and that is a correctness rule rather than a scope choice**
+    (fresh-agent review, P1). The standing rule forbids the flight from acting on an
+    ``agent-ready`` issue at all, so no verdict is ever recorded for one — which under a
+    "no verdict means changed" test makes every approved issue permanently changed, and the
+    trigger fires EVERY DAY FOREVER on a queue the flight is not allowed to touch. That directly
+    falsifies the bound this module exists to keep ("unchanged bodies since the last verdicts
+    update -> no launch"). A repo holding one approved issue and an otherwise quiet queue would
+    have launched an unattended session every day with nothing it was permitted to do.
+
+    What is NOT lost by excluding them: a flight already in the air still SEES every approved
+    issue and may flag one — the rule allows lint to flag and escalate. What changes is only
+    whether an approved issue can, by itself, summon a flight. It cannot: an edit to approved text
+    is the owner editing his own frozen text, and the flight has nothing to say about it.
 
     Defensive like every other pure core here: a partial or wrong-typed view (a broken gh call, a
     half-written cache) yields fewer issues to triage, never an exception into a tick. An entry
     whose verdict record is not a readable dict counts as UNJUDGED, which is the re-read direction.
+    A wrong-typed label set reads as NO labels (``issues._label_names``' own contract), i.e. as
+    unapproved — the direction that costs a second look rather than a missed one.
     """
     if not isinstance(open_issues, list):
         return []
@@ -221,6 +273,12 @@ def changed(open_issues, verdicts):
         # triaged as issue #1 — the same coercion trap `issues.dep_met` documents.
         if isinstance(num, bool) or not isinstance(num, int):
             continue
+        # `issues._label_names` by its own (private-looking) name: it is already the cross-module
+        # spelling — `queue_lint` calls exactly this — and renaming it would ripple into a
+        # dashboard docstring for no gain. Its contract is what matters here: any malformed label
+        # set yields [], i.e. UNAPPROVED, which is the re-read direction.
+        if APPROVED_LABEL in issues._label_names(issue):
+            continue                     # never the flight's to judge -> never the flight's cue
         record = known.get(_key(num))
         if not isinstance(record, dict) or record.get("body_hash") != body_hash(issue.get("body")):
             out.add(num)
@@ -318,7 +376,7 @@ def enabled(config):
     read half-way through a write, or a string ``"true"`` from a hand-edit, must not arm a session
     class that closes issues.
     """
-    block = config.get(DIR) if isinstance(config, dict) else None
+    block = config.get(CONFIG_KEY) if isinstance(config, dict) else None
     return (block or {}).get("enabled") is True if isinstance(block, dict) else False
 
 
@@ -329,7 +387,7 @@ def home_kind(config):
     runtime reader may be handed a half-read config. The LOADER is where a typo fails loudly, at
     adopt time, which is the one place an owner can still fix it.
     """
-    block = config.get(DIR) if isinstance(config, dict) else None
+    block = config.get(CONFIG_KEY) if isinstance(config, dict) else None
     value = (block or {}).get("home") if isinstance(block, dict) else None
     return value if value in HOMES else CHECKOUT
 
@@ -340,6 +398,14 @@ def due(open_issues, state_home, date, config):
     """Is a triage flight due right now? ``(bool, reason)`` — the reason is journal/report prose.
 
     The clock is the ``date`` parameter and nothing else; this module reads no wall clock.
+
+    **THIS IS HALF THE DECISION.** ``due()`` only READS the day stamp; it deliberately does not
+    take it, so a caller that merely wants to display "a flight is due" (a report line, a
+    dashboard tile) does not consume the day by asking. The caller that intends to LAUNCH must
+    then take the lease — ``mark_launched(state_home, date)`` — and must not launch if it returns
+    None. Reading `due()` and launching without it is a check-then-act that reproduces exactly the
+    unbounded relaunch the lease exists to prevent (fresh-agent review, P2), so the two calls
+    belong at the same call site, in that order, with nothing between them.
     """
     if not enabled(config):
         return False, "triage is disabled for this repo (triage.enabled is false)"
@@ -356,7 +422,8 @@ def due(open_issues, state_home, date, config):
         len(fresh), named, ", ..." if len(fresh) > 10 else "")
 
 
-__all__ = ["DIR", "RUNS", "VERDICTS", "CHECKOUT", "WORKTREE", "HOMES",
+__all__ = ["DIR", "CONFIG_KEY", "RUNS", "VERDICTS", "APPROVED_LABEL",
+           "CHECKOUT", "WORKTREE", "HOMES",
            "BUILDABLE", "UNDERSPECIFIED", "CONTAINS_OWNER_DECISION", "OVERTAKEN",
            "duplicate_of", "nit", "home", "runs_dir", "verdicts_path", "run_log_path",
            "body_hash", "load_verdicts", "record_verdict", "changed", "ran_on",

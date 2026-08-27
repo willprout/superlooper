@@ -457,17 +457,41 @@ def test_the_cwd_mode_refuses_a_triage_id(rig):
 
 # ------------------------------------------------------- the t<N> session class (issue #448)
 
+def _tree_snapshot(root):
+    """Every path under `root` with its size and mtime — what "the working tree is untouched" has
+    to mean to be worth asserting. An existence check alone only proves nothing was DELETED; the
+    launcher could add or rewrite a file and it would pass (fresh-agent review, P2)."""
+    out = {}
+    for base, dirs, files in os.walk(root):
+        dirs.sort()
+        for name in sorted(files):
+            path = os.path.join(base, name)
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue
+            out[os.path.relpath(path, root)] = (st.st_size, st.st_mtime_ns)
+    return out
+
+
 def test_the_triage_flight_runs_in_the_repos_real_checkout(rig):
     """The RULED default home: the flight opens the checkout an orchestrator would open, so it
-    sees the gitignored working files a fresh worktree by definition cannot show."""
+    sees the gitignored working files a fresh worktree by definition cannot show.
+
+    And it opens it READ-ONLY. That is the issue's own hard boundary — "nothing this issue builds
+    may itself write to the working tree" — so the tree is compared whole (every path, size and
+    mtime) across the launch, not merely spot-checked for a survivor."""
     (rig["run_root"] / "briefs" / "t3.md").write_text("triage the queue")
     (rig["repo"] / "notes.local").write_text("a gitignored working file\n")
+    before = _tree_snapshot(rig["repo"])
+    assert "notes.local" in before, "the rig must actually stage the overlay this is about"
     r = _launch(rig, args=("--triage", "t3"))
     assert r.returncode == 0, f"rc={r.returncode}\n{r.stderr}"
     assert not (rig["run_root"] / "worktrees").exists(), "the checkout home creates no worktree"
     assert (rig["stub"] / "cwd").read_text() == os.path.realpath(str(rig["repo"]))
     assert (rig["run_root"] / "state" / "panes" / "t3").read_text() == "w9:p1"
-    assert (rig["repo"] / "notes.local").exists(), "the launch writes nothing in the working tree"
+    after = _tree_snapshot(rig["repo"])
+    assert after == before, "the launch must not add, remove or rewrite one byte of the checkout"
 
 
 def test_a_worktree_home_gives_the_flight_a_detached_checkout(rig):
@@ -488,7 +512,7 @@ def test_a_triage_home_the_launcher_cannot_read_refuses_rather_than_choosing_one
     (rig["run_root"] / "briefs" / "t3.md").write_text("triage the queue")
     r = _launch(rig, args=("--triage", "t3"), extra_env={"SL_TRIAGE_HOME": "Checkout"})
     assert r.returncode == 1
-    assert "unknown triage home" in r.stderr
+    assert "TRIAGE LAUNCH REFUSED: unknown triage home" in r.stderr
     assert not (rig["stub"] / "pane.env").exists()
 
 

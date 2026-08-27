@@ -16,6 +16,8 @@ tested by waiting for midnight).
 """
 import json
 import os
+import subprocess
+import sys
 
 import triage
 
@@ -141,6 +143,46 @@ def test_changed_is_ordered_and_deduplicated(tmp_path):
     assert got == [2, 9]
 
 
+def test_an_approved_issue_never_summons_a_flight_however_long_it_sits(tmp_path):
+    """The bound this module exists to keep, against the one input that would break it forever.
+
+    The standing rule forbids the flight from acting on an `agent-ready` issue, so no verdict is
+    ever recorded for one — and "no verdict means changed" would then make every approved issue
+    permanently changed. A repo with one approved issue and an otherwise quiet queue would have
+    launched an unattended session every day, forever, with nothing it was permitted to do.
+    """
+    home = str(tmp_path)
+    cfg = {"triage": {"enabled": True}}
+    approved = {"number": 100, "body": "approved and frozen",
+                "labels": [{"name": "type:build"}, {"name": "agent-ready"}]}
+    unapproved = {"number": 200, "body": "still a draft", "labels": [{"name": "type:build"}]}
+
+    assert triage.changed([approved, unapproved], {}) == [200], "only the unapproved one is a cue"
+    triage.record_verdict(home, 200, unapproved["body"], triage.BUILDABLE, "2026-08-25")
+    triage.mark_launched(home, "2026-08-25")
+
+    # Day after day, with the approved issue sitting there untouched, nothing is due.
+    for day in ("2026-08-26", "2026-08-27", "2026-08-28"):
+        due, why = triage.due([approved, unapproved], home, day, cfg)
+        assert due is False, "%s: %s" % (day, why)
+        assert "changed" in why
+
+    # ...and editing the APPROVED issue's frozen text still summons nothing: that edit is the
+    # owner's own, and the flight is not allowed to have an opinion that acts on it.
+    approved["body"] = "approved, and edited by the owner"
+    assert triage.due([approved, unapproved], home, "2026-08-29", cfg)[0] is False
+    # while one character in the UNAPPROVED one does.
+    unapproved["body"] = "still a draft, revised"
+    assert triage.due([approved, unapproved], home, "2026-08-29", cfg)[0] is True
+
+
+def test_a_wrong_typed_label_set_reads_as_unapproved(tmp_path):
+    """`issues.label_names` yields [] for any malformed label set, and [] means unapproved — the
+    direction that costs a second look rather than an issue silently never triaged."""
+    for bad in (None, "agent-ready", [None, 7], [{"nope": 1}], {}):
+        assert triage.changed([{"number": 5, "body": "x", "labels": bad}], {}) == [5], bad
+
+
 def test_changed_never_raises_on_a_malformed_view():
     """The open-issue view can come back partial or wrong-typed from a broken gh call. An entry
     this cannot read is simply not an issue to triage — never an exception into a tick."""
@@ -213,6 +255,31 @@ def test_a_date_that_is_not_one_can_never_name_a_path(tmp_path):
         assert triage.run_log_path(tmp_path, junk) is None, junk
         assert triage.mark_launched(tmp_path, junk) is None, junk
         assert triage.ran_on(tmp_path, junk) is True, junk
+
+
+def test_concurrent_verdict_writers_do_not_lose_each_others_rulings(tmp_path):
+    """Atomicity is not exclusion. `loopstate.save` guarantees no reader sees half a ruling, but
+    two writers that both load, both add an entry and both save leave only the second one's — and
+    the first issue is then permanently unjudged, which is the one thing this store exists to
+    prevent. Driven with REAL processes, because a threaded stand-in would not exercise the
+    file-level mutex the fix uses (fresh-agent review, P2)."""
+    home = str(tmp_path)
+    triage.record_verdict(home, 1, "seed", triage.BUILDABLE, "2026-08-25")   # create the folder
+    script = tmp_path / "writer.py"
+    script.write_text(
+        "import sys\n"
+        "sys.path.insert(0, %r)\n"
+        "import triage\n"
+        "triage.record_verdict(sys.argv[1], int(sys.argv[2]), 'body-' + sys.argv[2],\n"
+        "                      triage.BUILDABLE, '2026-08-25')\n"
+        % os.path.dirname(triage.__file__))
+    procs = [subprocess.Popen([sys.executable, str(script), home, str(n)])
+             for n in range(10, 26)]
+    for proc in procs:
+        assert proc.wait(timeout=60) == 0
+    recorded = triage.load_verdicts(home)
+    assert sorted(int(k) for k in recorded) == [1] + list(range(10, 26)), \
+        "every writer's ruling must survive: %s" % sorted(recorded)
 
 
 def test_recent_run_logs_never_raises_on_a_wrong_typed_limit(tmp_path):

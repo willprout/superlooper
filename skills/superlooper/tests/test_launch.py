@@ -1157,6 +1157,21 @@ def test_a_debugger_id_can_never_be_launched_as_a_triage_flight(tmp_path):
     assert host.spawned == []
 
 
+def test_a_declared_debugger_with_no_cwd_refuses_rather_than_crashing(tmp_path):
+    """The symmetric half of the guard above, live only since `mode` can be DECLARED. Derived,
+    `cwd is not None` WAS the mode and this could not happen; declared, the debugger path skips the
+    fence pre-flight and then reaches `os.path.isdir(None)` — and `launch`'s catch-all would render
+    a deliberate refusal to the owner as "the launcher failed unexpectedly"."""
+    spec = _spec(tmp_path, iid="d12", home=_home(tmp_path, "d12"), mode=launch.DEBUGGER)
+    result, edges, host = _run(spec)
+    assert result.rc == launch.ABORTED
+    assert "failed unexpectedly" not in result.stderr, \
+        "a deliberate refusal must not render as a crash"
+    assert "needs the directory to run in (--cwd)" in result.stderr
+    assert host.spawned == []
+    assert edges.fence_asked == [], "and it costs no probe: nothing was ever going to launch"
+
+
 def test_a_triage_spec_that_also_passes_cwd_is_refused(tmp_path):
     """--cwd belongs to the debugger and to nothing else. A triage flight's home is chosen by the
     repo's config, so a caller offering a directory here is a caller that has confused two
@@ -1211,7 +1226,7 @@ def test_an_unreadable_triage_home_refuses_rather_than_choosing_one(tmp_path):
     spec = _triage_spec(tmp_path, triage_home="somewhere")
     result, _edges, host = _run(spec)
     assert result.rc == launch.ABORTED
-    assert "unknown triage home" in result.stderr
+    assert "TRIAGE LAUNCH REFUSED: unknown triage home" in result.stderr
     assert host.spawned == []
 
 
@@ -1221,6 +1236,44 @@ def test_a_triage_flight_without_a_repo_names_that_rather_than_the_branch(tmp_pa
     assert result.rc == launch.ABORTED
     assert "no target repo" in result.stderr
     assert host.spawned == []
+
+
+def test_a_triage_config_fault_can_never_hold_the_whole_queue(tmp_path):
+    """A per-REPO configuration fault must never read as a delivery-CHANNEL fault.
+
+    Without a needle of its own, every one of these rc=1 refusals falls through `evidence.py` to
+    `launch_failed_before_delivery` — which IS in CHANNEL_FAULT_REASONS — so one repo's typo'd
+    `triage.home` would hold the entire approved queue, waiting on something that never
+    self-heals and that no queued issue caused (fresh-agent review, P1).
+    """
+    import evidence
+    for spec in (_triage_spec(tmp_path, triage_home="somewhere"),
+                 _triage_spec(tmp_path, repo=""),
+                 _triage_spec(tmp_path, repo=str(tmp_path / "gone"))):
+        result, _edges, host = _run(spec)
+        assert result.rc == launch.ABORTED
+        assert host.spawned == []
+        rec = evidence.build("launch", result.rc, result.stderr)
+        assert rec["reason"] == "triage_launch_refused", rec
+        assert not evidence.is_channel_fault(rec), \
+            "a repo's own triage config must never hold the queue"
+
+
+@pytest.mark.parametrize("hostile", ["not_found", "dial tcp", "could not connect",
+                                     "no answer within", "broken pipe", "http 429"])
+def test_a_hostile_triage_home_value_cannot_forge_a_channel_fault(tmp_path, hostile):
+    """Two of these refusals interpolate a value the ENGINE did not choose. Every string here is a
+    needle belonging to a channel reason further down the table — a held queue with a remedy
+    ("wait for GitHub", "restart cmux") for a fault that is neither. The loop's own lead phrase is
+    what outranks them, exactly as `FENCE DOWN` does for the socket path it interpolates. This is
+    the `[i429]` bug's shape one variable over."""
+    import evidence
+    result, _edges, host = _run(_triage_spec(tmp_path, triage_home=hostile))
+    assert result.rc == launch.ABORTED and host.spawned == []
+    assert hostile in result.stderr, "the owner still sees what was written"
+    rec = evidence.build("launch", result.rc, result.stderr)
+    assert rec["reason"] == "triage_launch_refused", rec
+    assert not evidence.is_channel_fault(rec), rec
 
 
 def test_a_triage_worktree_off_a_missing_base_still_exits_3(tmp_path):
@@ -1372,7 +1425,7 @@ def test_a_wrong_typed_triage_home_is_refused_rather_than_defaulted(tmp_path):
         spec = _triage_spec(tmp_path, triage_home=junk)
         result, _edges, host = _run(spec)
         assert result.rc == launch.ABORTED, junk
-        assert "unknown triage home" in result.stderr, junk
+        assert "TRIAGE LAUNCH REFUSED: unknown triage home" in result.stderr, junk
         assert host.spawned == []
 
 
