@@ -37,5 +37,5 @@
               "quiet_hours": { "start": "21:00", "end": "08:00" } },
   "report_time": "08:45",
   "runner_home": "pane",
-  "triage": { "enabled": false, "home": "checkout" }
+  "triage": { "enabled": false, "home": "checkout", "rubric": null }
 }

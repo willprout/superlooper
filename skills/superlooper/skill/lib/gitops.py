@@ -33,6 +33,46 @@ def fetch(worktree):
     return rc == 0
 
 
+def commit_on_branch(worktree, commit, ref):
+    """Is `commit` an ancestor of `ref` (i.e. does that history really contain it)?
+
+    True / False / None, and the tri-state is the point (issue #449). This is what turns the
+    standing rule's "citing commit-level evidence on `origin/main`" from a habit into a CHECK: a
+    triage flight closing an issue as overtaken names a sha, and this is where the naming is
+    verified before the issue is shut. Judging against `origin/<dev>` — never the working tree —
+    is that rule's own discipline, and a ref this resolves is the only thing it will answer about.
+
+    None means "git could not tell us", and a caller must treat it exactly as False for the
+    purpose of ACTING: an unresolvable sha, a missing ref, a git that is not there. It is kept
+    distinct so the refusal can say WHICH — "that commit is not on origin/main" and "git could not
+    answer" send a flight to two different next steps.
+
+    The argument is validated as a rev shape before it reaches git, because it arrives from an
+    unattended session's own words: `--commit "$(rm -rf ~)"` is a string, not a commit, and the
+    argv form already prevents a shell from seeing it — this makes it not even reach git.
+    """
+    if not isinstance(commit, str) or not isinstance(ref, str):
+        return None
+    c, r = commit.strip(), ref.strip()
+    # A commit-ish, not an expression: no `..`, no `^`, no `~`, no whitespace, no leading dash.
+    if not c or not all(ch.isalnum() or ch in "-_./" for ch in c) or c.startswith("-"):
+        return None
+    if ".." in c or not r or r.startswith("-"):
+        return None
+    rc, _ = _git(worktree, "rev-parse", "--verify", "--quiet", c + "^{commit}")
+    if rc != 0:
+        return None                      # not a commit this repository has at all
+    rc, _ = _git(worktree, "rev-parse", "--verify", "--quiet", r + "^{commit}")
+    if rc != 0:
+        return None                      # the ref itself is unresolvable (never fetched?)
+    rc, _ = _git(worktree, "merge-base", "--is-ancestor", c, r)
+    if rc == 0:
+        return True
+    if rc == 1:
+        return False                     # git's own "no" — the commit is real but not on that ref
+    return None                          # any other rc is git failing, not git answering
+
+
 def head_oid(worktree):
     """The worktree's current HEAD oid, or None if git could not answer (fail closed: the caller
     records no carry rather than a wrong one — issue #154). Used after a merge-update to name the

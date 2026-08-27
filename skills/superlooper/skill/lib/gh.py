@@ -243,6 +243,21 @@ def marked_issues_health(label, limit=100):
                               "--json", _LEDGER_FIELDS, "--limit", str(limit)])
 
 
+def open_issues_all_health(limit=200):
+    """open_issues_all() as a ReadHealth(issues, ok) — the triage trigger's read (issue #449).
+
+    `ok` is load-bearing here for the same reason it is on the ledger read: the trigger's answer to
+    an empty list is "no open issue's body has changed since the last recorded verdicts", which it
+    then PRINTS as the reason no flight went out. A throttled or refused read answers [] too, so
+    without this the one repo whose gh is unreachable would be told, honestly-sounding and every
+    single day, that its queue is simply quiet. The direction is unchanged (no flight); only the
+    diagnosis is — which is exactly the #92/#172 discipline this engine keeps everywhere a refusal
+    and an empty answer would otherwise be spelled the same.
+    """
+    return _json_list_health(["issue", "list", "--state", "open",
+                              "--json", _ISSUE_FIELDS, "--limit", str(limit)])
+
+
 def open_issues_all(limit=200):
     """EVERY open issue, raw gh dicts — the queue lint's read (issue #225).
 
@@ -347,6 +362,19 @@ def probe():
 
 def issue(num):
     return _json_dict(["issue", "view", str(num), "--json", _ISSUE_FIELDS])
+
+
+# The triage flight's per-issue read (issue #449). `state` rides along with the ordinary fields
+# because every act the flight is permitted has to know it BEFORE it writes: closing an already
+# closed issue is a no-op that would still record a verdict, and the reopen-protest guard is only
+# meaningful about an issue that is open right now. One read, not two.
+_TRIAGE_FIELDS = _ISSUE_FIELDS + ",state"
+
+
+def triage_issue(num):
+    """One issue as the triage verb needs it — the ordinary fields plus `state`. Fails closed to
+    {} like every other read, and the caller refuses to act on an issue it could not read."""
+    return _json_dict(["issue", "view", str(num), "--json", _TRIAGE_FIELDS])
 
 
 def issue_is_open(num):
@@ -925,6 +953,25 @@ def comment(num, body):
     """Post a comment on an issue. True on success."""
     rc, _ = _run(["issue", "comment", str(num), "--body", body])
     return rc == 0
+
+
+def comment_link(num, body):
+    """Post a comment and return ITS OWN url, or None on failure (issue #449).
+
+    `gh issue comment` prints the new comment's permalink on stdout, and this is the one caller
+    that needs it: a triage flight's nit close links the ledger ENTRY it just filed, not merely the
+    ledger issue, so the trail reads in both directions at the exact entry. The link is captured
+    from the write rather than reconstructed, because a comment id is not something a caller can
+    derive — and a link built by guessing would point at nothing.
+
+    Falls back to None on a gh that printed nothing recognisable; the caller then links the ledger
+    issue instead. A weaker link is not a reason to leave a nit unfiled.
+    """
+    rc, out = _run(["issue", "comment", str(num), "--body", body])
+    if rc != 0:
+        return None
+    url = (out or "").strip().splitlines()[-1].strip() if (out or "").strip() else ""
+    return url if url.startswith("http") else None
 
 
 def pr_comment(num, body):
