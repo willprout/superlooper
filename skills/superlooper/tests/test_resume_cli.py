@@ -232,6 +232,24 @@ def test_a_failed_launch_is_reported_as_failed_not_as_success(rig):
     assert out["ok"] is False and out["error"]
 
 
+def test_the_journal_record_carries_the_launchers_exit_code(rig):
+    """This verb drives the shared launcher from its OWN process, so the runner's machine-wide
+    launch-attempt streak (issue #457) hears about a refused resume only through this record — and
+    it classifies through lib/evidence, which reads the stderr first (relayed here verbatim) and
+    falls back to the rc for the refusals that name themselves in neither — a timeout, an unrunnable
+    shim, an empty-output failure. A record with neither is a sample that cannot be named, and an
+    unnameable refusal is dropped rather than guessed at."""
+    import json as _json
+    rig.seed_lane()
+    rig.record_session()
+    run(rig, "resume", "i1", "--json", env_over={"STUB_RC": "7"})
+    recs = [_json.loads(x) for x in
+            (rig.home / "journal.jsonl").read_text().splitlines() if x.strip()]
+    failed = [x for x in recs if x.get("act") == "resume" and x.get("outcome") == "resume_failed"]
+    assert len(failed) == 1, recs
+    assert failed[0]["rc"] == 7 and failed[0]["id"] == "i1"
+
+
 def test_check_is_read_only_and_reports_what_could_be_resumed(rig):
     rig.seed_lane()
     rig.record_session()

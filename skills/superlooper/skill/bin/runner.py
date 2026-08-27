@@ -126,6 +126,90 @@ LAUNCH_TIMEOUT = 120           # the launcher verifies delivery within ~30s; be 
 # exist" (issue #28) — a per-repo config fault, kept out of the systemic-anchor streak so the park
 # memo can name the branch instead of the launch machinery. Must match lib/launch.BASE_MISSING.
 LAUNCH_BASE_MISSING_RC = 3
+# THE MACHINE-WIDE LAUNCH-ATTEMPT STREAK (issue #457), derived from the journal.
+#
+# 2026-08-26: the meter went unreadable, the engine failed open, and then every launch on the
+# machine refused for hours while `claude auth status` answered `unknown`. No hold, no alert, no
+# pause. #320's two streaks could see none of it: they count launches THIS process ran and key on
+# ONE evidence reason reaching a cap. What the journal actually recorded that day was
+#
+#     08-25 19:03  watchdog      launch_failed  d26  rc=5   (the runner-env `gh`)
+#     08-25 19:08  watchdog      launch_failed  d27  rc=5
+#     08-25 19:13  watchdog      launch_failed  d28  rc=5
+#     08-26 15:19  debug_launch  launch_failed  d29         ("CLAUDE IDENTITY REFUSED …")
+#
+# and not one launch of the runner's own: the queue was serialized behind a wildcard in-flight lane
+# that never exited, so it attempted none for over a day. Any rule that needs a sample from the
+# runner's own launches is silent on the outage it was written for.
+#
+# WHAT THE EVIDENCE IS. Two INDEPENDENT SPAWNERS refusing the same way. Each spawner runs the
+# launcher in its own environment — the runner's, the watchdog's launchd job, an operator's shell
+# or the dashboard — so one of them refusing says only that ITS environment is wrong, and two of
+# them agreeing is the thing neither can explain away. That is what the incident produced (the
+# watchdog's launchd job and the owner's Debug tap), and it is what rules out the two ways of being
+# wrong about the same records:
+#
+#   * ONE SPAWNER, MANY FLIGHTS. The watchdog mints a FRESH d<N> for every retry of one episode
+#     (three per episode), so a watchdog started with a bare PATH refuses every flight identically
+#     while the runner's own launches are demonstrably fine. Counted as distinct evidence that
+#     would freeze a healthy queue — and the page this hold raises is itself a watchdog signal, so
+#     it would re-arm from the episode it opened.
+#   * ONE SPAWNER, MANY IDS. `superlooper debug` and `superlooper resume` are shelled from the same
+#     places (an operator's shell, the dashboard), and `resume` carries a LANE's own `i<N>`. One
+#     shell with an ambient ANTHROPIC_API_KEY produces two ids and two verbs; it is still one
+#     environment, so it is one spawner here.
+#
+# DERIVED, NOT ACCUMULATED, and that is load-bearing. An in-memory streak has to be reconciled with
+# the journal for the launches this process did not run, and every incremental reconciliation this
+# issue tried (a byte offset, a timestamp watermark, a lagged one) had a boundary at which a
+# VERIFIED DELIVERY fell outside the window while the refusals it answered fell inside — which
+# re-holds a machine that just launched a session. A pure function of the journal's tail has no
+# such boundary, costs ~2 ms, and reconstructs itself exactly across a restart.
+SPAWNER_RUNNER = "runner"
+SPAWNER_WATCHDOG = "watchdog"
+SPAWNER_OPERATOR = "operator"
+# This runner's own launch outcomes. `recover` only at the `exited` tier — the only tier that
+# relaunches; it reads "ok" for a delivered NUDGE too, and an i336 lane whose auth died in-process
+# answers nudges all day while starting nothing.
+RUNNER_LAUNCH_ACTS = ("launch", "resolve_conflict")
+RUNNER_RELAUNCH_ACT = "recover"
+RUNNER_RELAUNCH_TIERS = ("exited",)
+RUNNER_DELIVERY_OK = "ok"
+# The FOREIGN spawners: {act: (success outcome, failure outcome, spawner)}. A table and not a
+# branch, so WHEN A FOURTH SPAWNER APPEARS ITS ROW BELONGS HERE — with the environment it runs in,
+# which is what the two-spawner rule actually counts. The triage flight (#448) ships disabled and
+# journals no launch act yet; `actions._is_session_id` already admits its `t<N>` ids.
+FOREIGN_LAUNCH_OUTCOMES = {
+    "watchdog": ("launched", "launch_failed", SPAWNER_WATCHDOG),
+    "debug_launch": ("launched", "launch_failed", SPAWNER_OPERATOR),
+    "resume": ("resumed", "resume_failed", SPAWNER_OPERATOR),
+}
+# NO TIME WINDOW, deliberately. The streak is "every refusal since the last verified delivery", and
+# an earlier cut bounded it to six hours as well — which is a time-based EXPIRY wearing a window's
+# name: while a hold stands the only thing that flies is the #115 canary, whose refusals are not
+# samples, so nothing refreshes the streak and it aged below the cap mid-outage. decide reads that
+# fall as recovery — it journals "launch delivery verified again" over a machine that verified
+# nothing, retracts the alert, resumes, and walks the at-cap lanes into parks. The real incident
+# settles it too: its two independent samples were TWENTY HOURS apart. The only bound is
+# `journal.tail`'s byte slice, which is a bound on how much history is READ rather than a clock on
+# what it means, and truncating a prefix is safe by construction — a clear that scrolls off takes
+# every refusal it answered with it.
+AUTH_DEATH_STREAK_REASONS = frozenset({
+    "gh_auth_dead",                  # rc=4 — the SESSION's own gh could not say who it is
+    "gh_auth_dead_runner",           # rc=5 — the RUNNER's own gh could not either
+    "claude_identity_wrong",         # rc=7 — the SESSION's Anthropic account is absent/wrong
+    "claude_identity_wrong_runner",  # rc=8 — the machine's fleet config dir is logged out
+    "env_poisoned",                  # rc=6 — the launch-floor scrub could not clean the env
+})
+# WHICH refusals are evidence about the MACHINE — the set above. Not every failed launch is: a
+# worktree that would not create, a brief that could not be written, a missing base branch name
+# THIS issue's own state, and two of those in a row are two broken lanes; paging the owner "your
+# Claude login has expired" over a stale git index.lock is the mis-blame #299/#320 exist to end.
+# Nor is a dead cmux pane or an unfired shim: those are the DELIVERY CHANNEL, with detectors and
+# remedies of their own. What is left is the credential/environment family — the launcher refused
+# because the identity or the environment a session would run under is wrong. Each is per-issue on
+# one sample (#320 keeps them so), and #320 escalates them only when the SAME one repeats across
+# two distinct ISSUE lanes; the 2026-08-26 shape is what falls between.
 # How long the nudge script gets. Raised from 60 with #334: a nudge now asks the session host to
 # vouch for the pane, reads the session's own record and then PROVES the delivery, where it used to
 # make three cmux calls and trust an rc. The failure mode of sizing this too tightly is not a slow
@@ -2243,6 +2327,10 @@ class Runner:
         disk["launch_env_fail_ids"] = {r: sorted(ids)
                                        for r, ids in self._launch_env_fail_ids.items() if ids}
         disk["launch_fail_at"] = self._launch_fail_at    # the #115 canary retry clock (decide reads it)
+        # ...and the machine-wide ATTEMPT streak (#457), derived fresh from the journal so it counts
+        # the launches this process did not run — the watchdog's repair flights, an owner's Debug
+        # tap or resume — exactly as it counts its own.
+        disk["launch_attempt_streak"] = self._launch_attempt_streak(now)
         anchor = self._probe_launch_anchor()             # None = this home has no anchor, or no demand
         if anchor is not None:
             disk["launch_anchor"] = anchor
@@ -3117,6 +3205,124 @@ class Runner:
         self._launch_fail_ids.clear()
         self._launch_env_fail_ids.clear()
         self._launch_fail_at = 0
+
+    def _launch_attempt_streak(self, now=None):
+        """The machine-wide launch-attempt streak (issue #457), derived from the journal.
+
+        Returns ``{"samples": {session id: [spawners]}, "delivered": bool}``.
+
+        `samples` are the distinct session ids whose launch refused for a CREDENTIAL/ENVIRONMENT
+        reason with no verified delivery since, each mapped to EVERY spawner whose environment read
+        a refusal of it. A list rather than one name because the same session can be refused by two:
+        the runner tries to relaunch a lane, and the owner then hand-`resume`s it. Keeping only the
+        last would DOWNGRADE the evidence: two environments agreeing collapse to one, and the hold
+        quietly drops below its own threshold on the strength of a SECOND refusal.
+
+        `delivered` says whether this walk actually SAW a session start. An empty `samples` map does
+        not say that on its own: a journal we could not read, or one whose whole window scrolled
+        past `journal.tail`'s slice, is empty too. decide's recovery edge keys on this flag, because
+        reading "empty" as "a session started" turns a lost read into a false durable record — the
+        page retracted mid-outage, the suppressed launch-cap parks landing, and the queue launched
+        back into the wall. decide holds on two spawners agreeing,
+        never on two ids: each spawner runs the launcher in its own environment, so one of them
+        refusing says only that ITS environment is wrong (see the constants above for both ways
+        that goes wrong when ids are counted instead).
+
+        The MAP crosses the boundary rather than two lists, so decide can vet an id and its spawner
+        TOGETHER: given separate lists it counted a spawner whose only sample it had rejected, and a
+        garbage view could then manufacture the very independence this rule is made of.
+
+        PURE over the journal's tail: walk it in FILE order, which is the order things actually
+        finished — one O_APPEND write per record, from every writer — clearing on any verified
+        delivery and adding on any classified refusal. The `ts` field is never used to order: this
+        runner stamps its records with the clock the TICK started on, so a delivery that really came
+        last can carry an earlier stamp than a refusal another process wrote meanwhile.
+
+        `now` is accepted and unused — this streak has no clock at all (see the constants' note on
+        why there is no window) — and kept so the publish site reads like the two beside it.
+
+        Self-guarded and fails OPEN in every direction: a journal we cannot read, a record we cannot
+        classify, a record whose act we do not know — each costs a sample, never a hold.
+        """
+        samples, delivered = {}, False
+        try:
+            records = journal.tail(self.home)
+        except Exception:                              # pragma: no cover - defensive
+            return {"samples": {}, "delivered": False}
+        for rec in records:
+            act, outcome = rec.get("act"), rec.get("outcome")
+            if not isinstance(act, str):
+                continue                               # hash-safe: a wrong-typed act would RAISE at
+                                                       # the table lookup below, and this runs
+                                                       # before the tick stamps its heartbeat (#95)
+            mine = act in RUNNER_LAUNCH_ACTS or (act == RUNNER_RELAUNCH_ACT
+                                                 and rec.get("tier") in RUNNER_RELAUNCH_TIERS)
+            if mine:
+                if outcome == RUNNER_DELIVERY_OK:
+                    samples, delivered = {}, True      # this runner started a session
+                elif not rec.get("canary"):
+                    # A #115 CANARY is never a sample (#320's rule, rounds 2 and 3): a probe only
+                    # runs while a hold already stands, so it says nothing new about whether one
+                    # should — and it can refuse for a fault of the LANE it happened to probe,
+                    # which would enter as though the machine had produced it.
+                    self._note_attempt_failure(samples, rec, SPAWNER_RUNNER)
+                continue
+            row = FOREIGN_LAUNCH_OUTCOMES.get(act)
+            if row is None or not isinstance(outcome, str):
+                continue                               # NB: an act with NO outcome must not match a
+            ok, failed, spawner = row                  # missing table row and read as a delivery
+            if outcome == ok:
+                # A verified delivery from another process. It clears THIS streak only: the channel
+                # and per-reason environment streaks are the runner's own accounting, and a
+                # debugger flight is not a sample of the WORKER environments they describe.
+                samples, delivered = {}, True
+            elif outcome == failed:
+                self._note_attempt_failure(samples, rec, spawner)
+        return {"samples": {k: sorted(v) for k, v in sorted(samples.items())},
+                "delivered": delivered and not samples}
+
+    def _note_attempt_failure(self, samples, rec, spawner):
+        """Record one refused flight, if it is a sample at all (issue #457).
+
+        Only the credential/environment family enters (AUTH_DEATH_STREAK_REASONS). A per-issue
+        fault is about the ISSUE and a channel fault is about the delivery channel; neither is
+        evidence that the machine cannot start a session, and both already have detectors and
+        remedies of their own."""
+        sid = rec.get("id")
+        if not actions._is_session_id(sid):            # the same shape decide vets, from one place:
+            return                                     # two sides disagreeing about what a sample
+                                                       # is is how a rejected id once still counted
+        if self._streak_reason(rec) in AUTH_DEATH_STREAK_REASONS:
+            samples.setdefault(sid, set()).add(spawner)
+
+    @staticmethod
+    def _streak_reason(rec):
+        """The evidence reason one refused-launch record names, or None when it names none.
+
+        THIS runner's own records already carry the classified evidence `_journal_outcome` stamped
+        on them (#152). A foreign spawner's carry what its verb recorded — the launcher's rc, its
+        stderr, or both — and either alone is enough, because `lib/evidence` reads the TEXT first
+        and falls back to the rc. That matters: the owner-tapped Debug record from the real
+        2026-08-26 outage carries no rc at all, only the launcher's "CLAUDE IDENTITY REFUSED" line,
+        and requiring an rc made the whole existing journal invisible to this detector.
+
+        rc=1 is the stand-in when a record carries no rc: it is the launcher's own "aborted before
+        any pane could host a worker", the code whose text pass IS the classification. A text that
+        matches nothing then lands on a CHANNEL reason, which the family filter drops — so an
+        unreadable refusal stays unreadable rather than borrowing a credential's remedy."""
+        ev = rec.get("evidence")
+        if isinstance(ev, dict) and isinstance(ev.get("reason"), str):
+            return ev["reason"]
+        rc = rec.get("rc")
+        text = rec.get("error")
+        if not isinstance(text, str) and (not isinstance(rc, int) or isinstance(rc, bool)):
+            return None
+        try:
+            return evidence.build(
+                "launch", rc if isinstance(rc, int) and not isinstance(rc, bool) else 1,
+                text if isinstance(text, str) else "")["reason"]
+        except Exception:                              # pragma: no cover - defensive
+            return None
 
     def _charge_launch_failure(self, iid, ev, now, canary=False, fields=None):
         """Charge ONE non-verified launch delivery to whoever is actually at fault (issue #153), the
@@ -5120,10 +5326,15 @@ class Runner:
         return a.get("reason", "usage meter readable again — normal usage gating resumed")
 
     def _exec_launch_recovered(self, a, now):
-        """Issue #115: a verified delivery (a canary probe or a restart) cleared the systemic-launch
-        streak, so the #24 hold is lifting. Journal-only — normal launching resumes via the empty
-        streak and the systemic ALERT is retracted by decide's reasons diff; the outcome text records
-        the recovery. Emitted ONCE per episode by decide (deduped on the durable ALERT marker)."""
+        """Issue #115: a launch hold is LIFTING. Journal-only — normal launching resumes via the
+        empty streak and the ALERT is retracted by decide's reasons diff; the outcome text is the
+        record. Emitted ONCE per episode by decide (deduped on the durable ALERT marker).
+
+        Two holds write this act and they do not say the same thing, so the REASON is the record and
+        this docstring must not paraphrase it: #24/#320's says a verified delivery cleared the
+        systemic-launch streak; #457's says a session started again and names what resumes with it.
+        Both are claims about a launch that actually landed — #457 had a second edge for a hold
+        ending on something else, and it went when that could no longer happen (see decide)."""
         return a.get("reason", "launch delivery verified again — the systemic launch hold is cleared")
 
     def _exec_morning_report(self, a, now):

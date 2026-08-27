@@ -76,6 +76,99 @@ def read(state_home):
     return _read_records(_path(state_home))
 
 
+# How much of the hot journal a bounded tail read looks at. Sized by HISTORY, not by rate: its one
+# caller (issue #457's launch-attempt streak) reads back to its last verified delivery, so the slice
+# has to span however long a machine can go without starting a session — and the 2026-08-26 incident
+# put its two independent samples 20 h 16 m apart.
+#
+# MEASURED, because the first guess was wrong by an order of magnitude: this repo's own archive runs
+# 250-270 KB on an ordinary busy day and hit 9.7 MB on 2026-08-04 (a question storm, ~5 KB a
+# record). Two megabytes is roughly a week of ordinary days and comfortably past that incident's
+# span. A storm can still outrun it — 2026-08-04 was a label-retry loop that delivered nothing for
+# nine hours, so "busy" and "delivering" are not the same thing — and truncation is safe anyway, by
+# construction rather than by luck: what the slice yields is always a SUFFIX of the true streak,
+# because a delivery that scrolls off the front takes every refusal it answered with it. A smaller
+# slice can only mean FEWER samples — never a sample that did not happen — so a lost one costs a
+# hold that arrives late, or one that lifts early and re-arms on the next refusal. It can never
+# manufacture a hold; and it cannot manufacture a RECOVERY RECORD either, because that edge keys on
+# the runner having seen a delivery rather than on the streak being gone — a slice that lost the
+# refusals lost the delivery with them, and reports no delivery seen.
+#
+# Cost is a constant rather than a function of the retention window: measured ~15 ms for a 2 MB
+# slice of this journal's typical ~200-byte records, against a tick measured in tens of seconds.
+TAIL_MAX_BYTES = 2 * 1024 * 1024
+
+
+def tail(state_home, max_bytes=TAIL_MAX_BYTES):
+    """The last `max_bytes` of the hot journal, parsed — a bounded read for a per-tick reader.
+
+    The runner learns about launches it did not run — the watchdog's unattended sl-debugger, the
+    owner's `superlooper debug` tap — only from this file (issue #457), and it may not re-parse a
+    14-day window every ~20 s to do it.
+
+    DELIBERATELY STATELESS: nothing is carried between calls. The caller derives its whole answer
+    from the slice each time, which is what lets it be a pure function of the journal rather than a
+    running total to be reconciled with one. A byte offset would be wrong here anyway, because this
+    file is not append-only over time — `rotate()` rewrites it WITHOUT its archived prefix, and the
+    runner rotates on its first tick and every few hours after — so a saved offset lands mid-record
+    (silently dropping the record it cut) or past the end.
+
+    TRUNCATING A PREFIX IS SAFE for that caller by construction: its answer is a function of the
+    records after the last verified delivery, so a delivery that scrolls off the front takes every
+    refusal it answered with it. What the slice must be big enough for is the caller's own history
+    (issue #457's streak reaches back to its last delivery, which on a healthy loop is minutes and
+    on a dead one is however long it has been dead) — not for any per-tick rate.
+
+    Fails closed exactly like read(): an unreadable file yields [], a corrupt or wrong-typed line is
+    skipped, the FIRST line is dropped when the byte seek landed INSIDE it (checked, not assumed),
+    and a TRAILING partial line is left unparsed rather than parsed in halves. (append() writes each record with a
+    single write+flush+fsync, so a partial tail is rare; being wrong about it once would mis-read a
+    record, which is why it is handled.)
+    """
+    path = _path(state_home)
+    try:
+        with open(path, "rb") as f:
+            try:
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+            except OSError:                             # pragma: no cover - defensive
+                size = 0
+            start = max(0, size - int(max_bytes))
+            # Is `start` already a record boundary? Reading the byte BEFORE it answers that, and it
+            # is worth one seek: without the check the first line is dropped unconditionally, which
+            # throws away a COMPLETE record whenever the arithmetic happens to land on a newline.
+            # The streak this feeds trips on two samples, so one lost record is a hold that arrives
+            # late — cheap to prevent, awkward to reproduce.
+            aligned = start == 0
+            if not aligned:
+                f.seek(start - 1)
+                aligned = f.read(1) == b"\n"
+            f.seek(start)
+            blob = f.read()
+    except OSError:
+        return []
+    consumed = blob.rfind(b"\n") + 1                    # 0 when no COMPLETE line is present
+    # split("\n"), never splitlines(): str.splitlines also breaks on \x0b/\x0c/\x1c/\x85/\u2028,
+    # which would cut ONE record into two unparseable halves. append() writes ensure_ascii JSON, so
+    # none of those can appear raw today. (_read_records is not the same reader — text-mode
+    # readlines() splits on \r and \r\n as well — so neither is a strict superset of the other;
+    # what matters here is that this one never splits INSIDE a record.)
+    lines = blob[:consumed].decode("utf-8", "replace").split("\n")
+    if not aligned and lines:
+        lines = lines[1:]                               # the seek landed mid-record
+    out = []
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            rec = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(rec, dict):
+            out.append(rec)
+    return out
+
+
 def read_all(state_home):
     """Every record ever logged — archived first, then the hot window — for audit/forensics. NOT
     the hot path: its cost grows with total history BY DESIGN (that is what read() avoids). Same
@@ -112,12 +205,24 @@ def rotate(state_home, now, retain_seconds=HOT_RETAIN_SECONDS):
       * A corrupt line (no parseable ts — the tolerant reader already skips it) is KEPT hot, never
         archived and never dropped.
 
+    Caveat worth stating since #457: a record lost in the concurrency window below is no longer
+    audit-only — the runner's machine-wide launch-attempt streak reads this file back through
+    tail(). Losing a REFUSAL costs one sample of an outage that is still refusing every launch: the
+    hold arrives a tick later, or lifts and re-arms on the next refusal — never a hold that should
+    not have arrived, and never a recovery record (that edge keys on a delivery actually seen). Losing a foreign spawner's verified DELIVERY (`launched` /
+    `resumed`) is the direction that costs something: the streak keeps refusals that delivery
+    already answered, so a hold persists or re-arms over a machine that did start a session. Both
+    are bounded by the next flight that starts a session — usually the #115 probe, though a machine
+    with nothing approved and every lane alive has none to make — and the window is milliseconds,
+    four times a day, against a runner that is this file's dominant writer.
+
     Concurrency caveat: unlike append() (lock-free, O_APPEND-atomic across processes), the read ->
     os.replace here is NOT atomic against a CONCURRENT appender in another process (watchdog / a
     stray CLI). A record appended between this call's readlines() and its os.replace() would be
     overwritten. The runner is the journal's dominant writer and the sole rotate caller (4x/day, a
-    ms-scale window), and the journal is audit-only — no runner decision replays from it — so this
-    is an accepted narrow window, not a safety risk; call rotate only from the runner tick.
+    ms-scale window), and the one runner decision that reads this file back is bounded either way by
+    its own recovery probe (see the note above) — so this is an accepted narrow window, not a safety
+    risk; call rotate only from the runner tick.
 
     Records are partitioned by `ts`: ts < cutoff -> archived; everything else stays hot."""
     cutoff = now - retain_seconds

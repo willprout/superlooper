@@ -202,6 +202,28 @@ LAUNCH_ALERT_REASONS = {
 # "every worker env", and the second distinct lane is exactly the evidence that settles it. Two
 # different environment faults with one lane each is the one-off case twice over, not an outage.
 SYSTEMIC_ENV_FAILURE_CAP = 2
+# >= this many DISTINCT SESSION ids whose launch failed CONSECUTIVELY, with no verified delivery
+# between them, before the machine-wide Claude-auth-death class is read (issue #457). Two, and
+# deliberately the same number as the environment cap above, because it is the same inference one
+# rung wider: one sample cannot tell a broken lane from a broken machine, and the second distinct
+# SESSION is what settles it. Two rather than three is what keeps the DoD's "zero per-issue parks"
+# structural — a lane's own launch cap is LAUNCH_FAILURE_CAP (2) attempts, so a third sample would
+# always arrive after the first lane had already parked itself.
+AUTH_DEATH_LAUNCH_CAP = 2
+# ...and >= this many INDEPENDENT SPAWNERS among them. The launcher is driven by four processes
+# with four environments (this runner, the watchdog's job, `superlooper debug`, `superlooper
+# resume` — the last two shelled from the same places, so they count as one), and a refusal only
+# ever proves something about the environment it was read in. Two is the smallest number that
+# means "not one environment's problem"; the runner names the spawner on every sample it publishes,
+# because the id cannot be read for it (a `resume` carries a lane's own `i<N>`).
+AUTH_DEATH_SPAWNER_CAP = 2
+# The spawner names decide will accept from that view. Vetted rather than counted raw: this is the
+# pure boundary, and a garbage view must not be able to manufacture independence.
+AUTH_DEATH_SPAWNERS = frozenset({"runner", "watchdog", "operator"})
+# The one name that hold ever wears. It is NOT keyed off an evidence reason like the entries in
+# LAUNCH_ALERT_REASONS above, and that is the point: the class is what several DIFFERENT refusal
+# reasons look like when none of them ever reaches a cap of its own.
+AUTH_DEATH_ALERT_REASON = "claude_auth_dead_machine"
 # How long the launcher prefers an UNSAMPLED lane while an environment streak is open but below the
 # cap (issue #320). With one refusal on the board the environment question is open, and the cheapest
 # way to settle it is to try a DIFFERENT lane — otherwise a serialized queue (one lane, or one
@@ -396,6 +418,61 @@ ALERT_MESSAGES = {
                             "XDG_CONFIG_HOME/GH_CONFIG_DIR in a shell rc file, a LaunchAgent or a "
                             "wrapper. This is NOT the runner's own credential (gh_auth_dead_runner) "
                             "and NOT a cmux/App Nap fault.",
+    # ---- the machine-wide credential/environment class (issue #457) ----
+    # The 2026-08-26 shape, and the one class above that had no name. Every sample in its streak is
+    # a CREDENTIAL/ENVIRONMENT refusal — the identity or the environment a session would run under
+    # is wrong — but they wear several different reasons at once, and at least one of them refused a
+    # flight the queue does not own (a watchdog repair session, an owner's Debug tap). #320 can
+    # express neither: its streaks are made of issue lanes, and they escalate one reason at a time.
+    #
+    # The body names all three remedies rather than guessing between them, because the streak by
+    # construction has not settled on one. The queue lanes' own park memos and the journal carry the
+    # per-flight classification for whoever wants it. It also says the alternative reading out loud:
+    # this is the widest net the layer casts, so it is the one most able to be wrong.
+    # The remedies lead, deliberately: this is the longest body the loop sends, and a push channel
+    # that truncates (Pushover caps at 1024 chars) must cut the explanation rather than the fix.
+    # NB that property is this body's alone — `auth_dead` can now stand beside it (a definitive dead
+    # reading arriving mid-episode no longer renames the hold), and reasons are sorted, so it goes
+    # first and eats the budget. Its own leading remedy is the right one for that reading, so the
+    # composition still opens with something true and actionable; only remedy (3) falls off.
+    "claude_auth_dead_machine": "NOTHING ON THIS MACHINE CAN START A SESSION (issue #457). Every "
+                               "refusal was the launcher saying the IDENTITY or the ENVIRONMENT a "
+                               "session would run under is wrong, so the repair is one of three "
+                               "and the failing flights' own evidence in the journal says which: "
+                               "(1) `claude auth status` under the fleet's config dir is logged "
+                               "out or on the wrong account — log back in from a supervised "
+                               "window; (2) `gh auth login --hostname github.com` as the account "
+                               "that owns the loop repo; (3) an exported ANTHROPIC_API_KEY / "
+                               "ANTHROPIC_BASE_URL / CLAUDE_CODE_* the launch floor could not "
+                               "scrub — find it in a shell rc file, a LaunchAgent or a wrapper. "
+                               "`superlooper doctor --stack` checks the first two (nothing checks "
+                               "the third). WHAT WAS SEEN: several "
+                               "flights in a row refused before they started, with no successful "
+                               "launch between them — from at least TWO INDEPENDENT SPAWNERS (this "
+                               "runner, the watchdog's own job, an owner-typed verb), and at least "
+                               "one of them a session with no worktree of its own, so neither one "
+                               "environment nor one lane explains it — while "
+                               "the usage meter was unreadable and/or `claude auth status` would "
+                               "not confirm the account this machine assigns workers. Launches are "
+                               "HELD: the hold itself parks nothing and moves no label, and it "
+                               "lifts by itself the moment ANY flight flies — a probe launch of an "
+                               "approved issue, a recovery relaunch of an exited lane, or a repair "
+                               "session. With nothing approved and every in-flight lane alive there "
+                               "is no flight to make, so it waits for the first one. If nothing is approved and no lane is in flight, "
+                               "nothing is being denied and this page retracts on its own; the "
+                               "refusal streak stands, so it returns the moment there is work "
+                               "again and the machine is still refusing. A lane that reached its OWN cap before the outage was proven "
+                               "may park the moment this lifts, or on its own account even while "
+                               "it stands — the hold "
+                               "suppresses the LAUNCH-cap park, not an in-flight lane's own retry "
+                               "cap, because holding that too would leave an all-in-flight machine "
+                               "with no flight left to lift this. Re-approve that one. IF INSTEAD these "
+                               "were unrelated faults, the first flight clears this — and any "
+                               "lane that sat at its cap meanwhile parks as it lifts, so look for "
+                               "one to re-approve. This says nothing about the cmux launch "
+                               "anchor either way: a dead one raises `launch_anchor_down` on its "
+                               "own account as soon as there is approved work — `superlooper "
+                               "status` shows whichever holds.",
     "claude_identity_wrong_workers": "CLAUDE CODE is unusable in every WORKER environment (issue "
                                      "#320): several distinct lanes in a row refused their flight "
                                      "because, from inside the SESSION's own environment, `claude "
@@ -582,7 +659,8 @@ def _alert_message(reason):
 # reports "idle" must be able to say "held" instead, from ONE list, so a class added to the layer
 # above becomes visible everywhere without a second edit.
 QUEUE_HELD_ALERT_REASONS = frozenset(
-    {"launch_anchor_down", "launch_systemic_failure", "auth_dead"} | set(LAUNCH_ALERT_REASONS.values()))
+    {"launch_anchor_down", "launch_systemic_failure", "auth_dead", AUTH_DEATH_ALERT_REASON}
+    | set(LAUNCH_ALERT_REASONS.values()))
 
 # The subset of those that ONLY a launch-streak hold ever raises — so their FALLING edge really is
 # "launch delivery works again" and nothing else. This is the durable episode marker the #115
@@ -592,6 +670,14 @@ QUEUE_HELD_ALERT_REASONS = frozenset(
 #   * `gh_unreachable` — the POLL detector raises it too, from consecutive_failures.
 #   * `launch_anchor_down` / `auth_dead` — separate detectors with their own self-re-arming probes;
 #     neither is a streak, so neither has a streak to recover.
+#
+# (#457) `claude_auth_dead_machine` is deliberately ABSENT, a third exclusion for a third reason.
+# It is a streak hold — but its streak is DERIVED from the journal where every other one here is
+# in-memory, so on a runner restart the two fall out of lockstep and one shared edge journals the
+# wrong thing for whichever class did not reset.
+# It owns an exit edge of its own instead (see decide), and is kept out of this set rather than
+# subtracted at the one reader, so a second reader cannot pick up the name this discipline
+# excludes.
 LAUNCH_HOLD_ALERT_REASONS = frozenset(
     {"launch_systemic_failure"} | set(LAUNCH_ALERT_REASONS.values())) - {"gh_unreachable"}
 
@@ -860,6 +946,28 @@ def _iid_num(iid):
 
 def _sorted_ids(ids):
     return sorted(ids, key=_iid_num)
+
+
+# Longer than any issue number or flight counter will ever be, and short enough that `int()` will
+# always take it. TWO ways this matters, and both end at `_iid_num`'s bare `int(iid[1:])`: Python
+# refuses to parse an integer literal past 4300 digits, and `str.isdigit` accepts superscripts and
+# other numeric forms `int()` also refuses. Either raises out of the whole tick — before the
+# heartbeat is stamped, so the dashboard reads a live runner as dead (#95) — where every other
+# garbage shape in this path costs one sample. The ids reaching here come off a journal three
+# separate processes append to. `gate.py` guards the identical hazard the same way.
+_SESSION_ID_MAX = 13
+
+
+def _is_session_id(sid):
+    """True for any launch SESSION id: a queued issue's lane (i<N>), an sl-debugger flight (d<N>)
+    or a triage flight (t<N>) — issue #457.
+
+    Wider than `_iid_num` on purpose, and only the machine-wide launch question may use it. Every
+    per-issue accounting in this module is about an ISSUE and must keep refusing a d/t id; but
+    "can this machine start a session at all" is answered by ANY flight, and on 2026-08-26 the only
+    flights attempted for hours were the watchdog's d<N> repair launches."""
+    return (isinstance(sid, str) and 1 < len(sid) <= _SESSION_ID_MAX
+            and sid[0] in ("i", "d", "t") and sid[1:].isascii() and sid[1:].isdigit())
 
 
 def _dget(d, key, want):
@@ -1656,30 +1764,6 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
         return ("agent-ready" in labels and "in-progress" not in labels
                 and _status_of(ist_of(iid)) in RELAUNCHABLE_STATUSES)
     has_pending_launch = any(_held_queue_member(iid, p) for iid, p in parsed_by_id.items())
-    # One degraded mode for both detectors: hold every fresh launch and suppress the per-issue
-    # launch-cap park (phases D+E), so the queue is left intact for when the anchor resolves.
-    launch_degraded = anchor_down or systemic_launch or systemic_env
-    # Account-level AUTH gate (issue #159 / forensics U3). The runner hands us a `claude auth status`
-    # + credential-keychain snapshot when a spend is pending; a DEFINITIVE dead reading (valid is
-    # literally False — the CLI is not-logged-in, or the keychain item is gone) means a fresh launch
-    # or a recovery relaunch would start LOGGED OUT and burn the spend (the i336 class the in-window
-    # 'logged_out' state catches only AFTER a session is up). Fail OPEN on anything unreadable (valid
-    # None/absent/wrong-typed): a probe we merely could not run must never freeze the whole loop — the
-    # #46/#76 dark-meter asymmetry, applied to auth. auth_invalid holds fresh launches AND recovery
-    # relaunches (below) and, when there is real spend demand, raises the auth_dead ALERT.
-    auth_probe = dsk.get("auth_probe")
-    auth_invalid = isinstance(auth_probe, dict) and auth_probe.get("valid") is False
-    # Display-sleep launch hold (issue #124). macOS will not boot a fresh cmux tab's shell while the
-    # DISPLAY sleeps, so a launch attempted then is created and closed as an orphan (exit 2) — a burned
-    # attempt that feeds #24's systemic streak and churns an alert every sleeping episode. The runner
-    # hands us a per-tick display-power read (only when there is launch demand); we HOLD every fresh
-    # launch — and the #115 canary — QUIETLY while it reads CONFIRMED asleep, and resume automatically
-    # on wake (the next tick reads awake). FAIL OPEN on anything but an explicit True (unreadable /
-    # absent / awake all launch normally, EXACTLY today's behavior): a false hold would wedge the whole
-    # queue, whereas a missed hold merely costs one already-self-recovering canary cycle. Unlike the
-    # anchor / auth detectors this raises NO alert and enters NO streak — a sleeping display is normal,
-    # expected behavior (the owner's Mac overnight), not a fault to page on.
-    display_asleep = dsk.get("display_asleep") is True
     # A recovery relaunch is spend demand too — a dead-auth reading with no fresh queue but an
     # in-flight lane (an ORPHAN RESUME after a restart, a crash relaunch, a conflict resolve) must
     # still surface and never hold SILENTLY (fresh-review P1 sub-note; i336 was a recovery scenario).
@@ -1691,6 +1775,167 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
             and "in-progress" in p["labels"]
             for p in parsed_by_id.values())
         or any(_iid_num(k) is not None for k in exited))
+    # Account-level AUTH gate (issue #159 / forensics U3). The runner hands us a `claude auth status`
+    # + credential-keychain snapshot when a spend is pending; a DEFINITIVE dead reading (valid is
+    # literally False — the CLI is not-logged-in, or the keychain item is gone) means a fresh launch
+    # or a recovery relaunch would start LOGGED OUT and burn the spend (the i336 class the in-window
+    # 'logged_out' state catches only AFTER a session is up). Fail OPEN on anything unreadable (valid
+    # None/absent/wrong-typed): a probe we merely could not run must never freeze the whole loop — the
+    # #46/#76 dark-meter asymmetry, applied to auth. auth_invalid holds fresh launches AND recovery
+    # relaunches (below) and, when there is real spend demand, raises the auth_dead ALERT.
+    auth_probe = dsk.get("auth_probe")
+    auth_invalid = isinstance(auth_probe, dict) and auth_probe.get("valid") is False
+    # ---- the machine-wide CLAUDE-AUTH-DEATH class (issue #457), one rung wider than #320 --------
+    # 2026-08-26 was exactly the outage this layer exists for and it never tripped. The meter went
+    # unreadable and the engine failed open (its own decision, untouched here); then EVERY launch on
+    # the machine refused for hours — three watchdog repair flights, an owner-tapped Debug, and the
+    # in-flight lanes' dead sessions — while the auth probe answered `unknown`. No hold, no alert,
+    # no pause. Nothing above could see it: both #320 streaks count launches THIS process ran and
+    # key on a single reason reaching its own cap, and here the runner ran none, the reasons were
+    # mixed, and no cap was ever reached.
+    #
+    # So this detector asks a deliberately cruder question, and asks it of SESSIONS rather than
+    # issues: did N distinct session ids in a row fail to start, with no successful launch between
+    # them? The runner publishes that streak, absorbing the out-of-process spawners' outcomes from
+    # the journal so a d<N> flight counts exactly as a lane does.
+    #
+    # ...AND the conjunct that keeps it honest. `unknown` is refused-not-answered: the probe reads
+    # it on healthy machines every day, so it may never hold anything BY ITSELF (the owner's rule,
+    # and the reason this is a conjunction rather than an auth reading with a longer grace). The
+    # launch failures are the evidence; the unreadable meter / unconfirmed account is what makes
+    # "the machine cannot start a session" the reading rather than "two lanes broke".
+    #
+    # Fails OPEN on everything unusable, like every streak here: a non-list view, a non-session id,
+    # a repeated id. And it is the widest net this layer casts, so it is the one most able to be
+    # WRONG — which is why the recovery probe below is not optional for it: a hold over two
+    # coincidentally-broken lanes lifts itself the first time any flight flies.
+    raw_attempts = dsk.get("launch_attempt_streak")
+    raw_attempts = raw_attempts if isinstance(raw_attempts, dict) else {}
+    # Vetted TOGETHER, id and spawner in one pass: given two separate lists this counted a spawner
+    # whose only sample it had rejected, which is exactly the independence a garbage view must not
+    # be able to manufacture.
+    attempt_samples = {
+        k: [x for x in v if isinstance(x, str) and x in AUTH_DEATH_SPAWNERS]
+        for k, v in _dget(raw_attempts, "samples", dict).items()
+        if _is_session_id(k) and isinstance(v, (list, tuple))}
+    attempt_samples = {k: v for k, v in attempt_samples.items() if v}
+    attempt_fail_ids = set(attempt_samples)
+    attempt_spawners = {x for v in attempt_samples.values() for x in v}
+    # Did the runner's walk actually SEE a session start? An empty map does not say so on its own —
+    # a journal it could not read, or one whose window scrolled past the slice, is empty too.
+    attempt_delivered = raw_attempts.get("delivered") is True
+    # ...and they must come from at least AUTH_DEATH_SPAWNER_CAP INDEPENDENT SPAWNERS. Each spawner
+    # runs the launcher in an environment of its own — the runner's, the watchdog's launchd job, an
+    # operator's shell or the dashboard — so one of them refusing says only that ITS environment is
+    # wrong, and two of them agreeing is the thing neither can explain away. That is exactly what
+    # the 2026-08-26 journal recorded (the watchdog's launchd job at 19:03 and the owner's Debug tap
+    # the next afternoon), and it is what rules out the two ways of misreading the same records: one
+    # watchdog episode mints a fresh d<N> per retry, and one operator shell can produce two verbs
+    # and two id shapes. Counting IDS reads either as the machine; counting SPAWNERS does not.
+    #
+    # It also keeps the owner's own rule (2026-08-03, quoted at SYSTEMIC_ENV_FAILURE_CAP) intact:
+    # two lanes with two separately broken worktrees are one spawner, so they still park with their
+    # own memos rather than freezing the queue behind them.
+    # ...and at least one refusal must have come from a flight with NO WORKTREE OF ITS OWN. Two
+    # spawners is independence of ENVIRONMENT; this is independence of the thing the owner's rule is
+    # actually about. `superlooper resume` is the case that separates them: it is shelled from an
+    # operator's shell, so it is a spawner of its own — but it resumes a LANE, inside that lane's
+    # worktree, so its refusal is exactly what "one broken worktree" looks like. Two lanes, one
+    # resumed by hand, would otherwise hold the queue under this banner and never lift: the canary's
+    # only candidates are those same broken lanes, and the hold suppresses the park that would
+    # otherwise end it. A watchdog flight or a Debug tap runs in the repo's own checkout and owns no
+    # worktree, which is what makes it the machine's answer rather than a lane's.
+    attempt_streak = (len(attempt_fail_ids) >= AUTH_DEATH_LAUNCH_CAP
+                      and len(attempt_spawners) >= AUTH_DEATH_SPAWNER_CAP
+                      and any(_iid_num(x) is None for x in attempt_fail_ids))
+    # Not affirmatively alive: `unknown` (the probe would not answer), absent (no probe was fed),
+    # or a definitive dead reading. Only a positive `valid is True` clears this conjunct.
+    # ...where "unconfirmed" needs a probe that actually ran and did not say yes. An ABSENT probe is
+    # not a signal: the runner feeds one whenever a spend is pending, and it never feeds one at all
+    # on a Codex repo — where the meter is synthesised healthy too, so treating absence as evidence
+    # would leave this conjunct permanently satisfied and page a Codex machine about `claude auth`.
+    auth_unconfirmed = isinstance(auth_probe, dict) and auth_probe.get("valid") is not True
+    # ...and it is a BACKSTOP, silent whenever a more specific detector already holds the queue.
+    # This is #320's own rule read the other way round: a hold that arrives wearing another class's
+    # banner is the mis-blame that layer exists to end, and stapling a second, cruder name onto an
+    # episode `claude_identity_wrong_workers` (or a dead anchor, or a definitive `auth_dead`
+    # reading) has already named precisely is the same harm — two names AT ONCE for one outage, and
+    # an owner told to check two different things. The specific classes hold when they can see the
+    # fault; this one speaks for the shape none of them could see.
+    #
+    # What that does NOT promise is one name forever. This detector sees a d<N> flight and a mixed
+    # streak, which #320 cannot count at all, so it often trips FIRST; if a second lane then refuses
+    # the same way and #320's cap is reached, the episode is re-named — and re-paged — under the
+    # more specific class. That page is an IMPROVEMENT (a vaguer cause replaced by a precise one
+    # with a precise remedy), and it is bounded to once: the naming rule above already gives an
+    # agreeing streak the same specific name, so the common case renames nothing.
+    # ...and it is muted by the reason a specific class actually RAISES, not by that class's
+    # detector flag. Two of them are demand-gated more narrowly than this one is (the anchor alert
+    # needs a FRESH launch pending; auth_dead and this class also count an in-flight lane), so
+    # muting on the flag produced a queue held with nothing said at all — the one outcome worse
+    # than a hold with a vague name.
+    auth_death_standing = AUTH_DEATH_ALERT_REASON in _dget(alert_on_disk, "reasons", list)
+    anchor_named = anchor_down and has_pending_launch
+    auth_dead_named = auth_invalid and (has_pending_launch or has_relaunch_demand)
+    # ...and the two PROBE-DRIVEN ones mute this class only while it is not already standing. The
+    # mute exists so an episode is never named twice AT ONCE; it is not a reason to RENAME one every
+    # time a five-second subprocess answers differently. Both of those read a live probe every tick
+    # (`claude auth status`, the pane probe), and renaming rewrites the durable ALERT — which is
+    # where this class's own latch keeps its memory, so a flapping probe erased the latch and paged
+    # the owner once a minute for a whole outage. An episode keeps the name it opened under; that is
+    # #320's own rule for a canary re-reading an outage, one class up.
+    #
+    # `systemic_launch`/`systemic_env` stay unconditional: they are in-memory streaks that do not
+    # flap tick to tick, and a channel or per-reason environment escalation is a genuinely more
+    # precise reading of the same evidence.
+    already_named = systemic_launch or systemic_env or (
+        (anchor_named or auth_dead_named) and not auth_death_standing)
+    # ...and, like the anchor and auth_dead alerts beside it, only while something is actually
+    # waiting on it. That gate belongs on the CLASS and not merely on its page: the runner stops
+    # feeding an auth probe the moment there is no spend pending, so a class that kept evaluating
+    # its conjunct through that gap would read the probe's disappearance as the account coming back
+    # — ending the hold, and journaling a lift, because the QUEUE emptied.
+    # ...and it asks for demand of its OWN rather than borrowing #159's, over one clause. That one
+    # counts a bare `state/exited/<id>` marker, which start-session.sh writes on EVERY session exit
+    # and only the relaunch paths remove — never a park, never a teardown — so the owner's live
+    # machine has carried one for a lane that merged on 2026-07-11. #159 is deliberately loose
+    # there and can afford to be: its reading auto-clears on the next healthy probe. This class
+    # HOLDS a queue and pages until a flight flies, and on an idle machine there is no flight to
+    # make — so a marker nobody will ever act on would page a quiet machine and never retract.
+    # A marker whose lane is NOT terminal still counts (its recovery ladder may yet relaunch it),
+    # and so does one the state file has forgotten entirely — fail-safe, exactly as #159 is.
+    auth_death_demand = has_pending_launch or any(
+        isinstance(p, dict) and isinstance(p.get("labels"), list) and "in-progress" in p["labels"]
+        for p in parsed_by_id.values()) or any(
+        _iid_num(k) is not None and _status_of(ist_of(k)) not in TERMINAL_STATUSES for k in exited)
+    # THE CONJUNCT LATCHES, exactly as its usage sibling does. `episode_active` continues on
+    # `prev_dark`, the durable usage_stale marker, precisely so a dark-meter episode cannot flap;
+    # this one had no equivalent, and it is read from a 5-second `claude auth status` subprocess
+    # refreshed every 60 s that reports `unknown` on any timeout. Re-evaluated fresh every tick in
+    # the shape this class is FOR — the runner launching nothing, so no flight ever settles it — a
+    # probe flipping unknown/logged_in raised, retracted and re-raised once a minute, journalling a
+    # lift each time and landing the launch-cap parks it had been suppressing on every release.
+    #
+    # So the conjunct decides whether the episode OPENS; once the durable ALERT names it, only the
+    # streak ends it — and the streak ends on exactly one thing, a session starting. That is also
+    # what its exit record claims, so the lifecycle and the claim are one fact. The #115 probe is
+    # what supplies that fact on a machine that has recovered.
+    systemic_auth_death = (attempt_streak and auth_death_demand and not already_named
+                           and (episode_active or auth_unconfirmed or auth_death_standing))
+    # ONE degraded mode for every detector above: hold every fresh launch and suppress the
+    # per-issue launch-cap park (phases D+E), so the queue is left intact for when the cause clears.
+    launch_degraded = anchor_down or systemic_launch or systemic_env or systemic_auth_death
+    # Display-sleep launch hold (issue #124). macOS will not boot a fresh cmux tab's shell while the
+    # DISPLAY sleeps, so a launch attempted then is created and closed as an orphan (exit 2) — a burned
+    # attempt that feeds #24's systemic streak and churns an alert every sleeping episode. The runner
+    # hands us a per-tick display-power read (only when there is launch demand); we HOLD every fresh
+    # launch — and the #115 canary — QUIETLY while it reads CONFIRMED asleep, and resume automatically
+    # on wake (the next tick reads awake). FAIL OPEN on anything but an explicit True (unreadable /
+    # absent / awake all launch normally, EXACTLY today's behavior): a false hold would wedge the whole
+    # queue, whereas a missed hold merely costs one already-self-recovering canary cycle. Unlike the
+    # anchor / auth detectors this raises NO alert and enters NO streak — a sleeping display is normal,
+    # expected behavior (the owner's Mac overnight), not a fault to page on.
+    display_asleep = dsk.get("display_asleep") is True
     # launches_held folds auth AND a sleeping display (#124) into the same fresh-launch suppression the
     # anchor/systemic detectors use, so the queue is held intact (never parked) while either stands,
     # exactly as under a dead anchor. The recovery-relaunch and orphan-resume holds are applied
@@ -1709,6 +1954,16 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     # gh-auth hold names itself and journaled no recovery when it lifted) and this issue widened it
     # to five more classes, so a hold under any of them would clear silently — the alert retracts,
     # launching resumes, and the journal records that the outage simply stopped existing.
+    #
+    # (#457) ...MINUS this issue's own class, which owns an exit edge of its own below. Its streak is
+    # DERIVED from the journal while every other launch streak is in-memory, so on a restart — the
+    # documented #24 fallback, which the generic record's own text names — the two fall out of
+    # lockstep: the channel/environment streaks reset with the process while this one does not.
+    # Sharing one edge then meant a #320 hold lifting via restart journalled nothing at all, which
+    # is the silence LAUNCH_HOLD_ALERT_REASONS was widened to prevent. They co-occur by design, not
+    # by accident: #320's escalatable reasons are members of this streak's family too, and its
+    # standing ALERT is itself a watchdog signal, so the episode that supplies this class's second
+    # spawner is opened by #320's own page.
     prev_systemic = any(r in LAUNCH_HOLD_ALERT_REASONS
                         for r in _dget(alert_on_disk, "reasons", list))
     # The reasons the durable ALERT already names — the same on-disk episode marker prev_systemic
@@ -1910,6 +2165,12 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     # fallback here and none wanted: this streak is keyed BY the reason, so a class that reached the
     # cap is a class this engine has a message for — the reader above drops any reason it does not.
     reasons.extend(LAUNCH_ALERT_REASONS[r] for r in systemic_env_reasons)
+    # (#457) ...and the machine-wide credential/environment hold, under the name its own samples
+    # earn. Gated on real demand exactly as the anchor and auth_dead alerts are: an idle machine
+    # with no queue and no lane in flight is being denied nothing, and a page it cannot act on is a
+    # page that teaches the owner to ignore the next one.
+    if systemic_auth_death:                            # (demand is already one of its conjuncts)
+        reasons.append(AUTH_DEATH_ALERT_REASON)
     if auth_invalid and (has_pending_launch or has_relaunch_demand):   # dead auth only matters with a
         reasons.append("auth_dead")                    # spend pending (idle -> quiet, like the anchor)
     # DEDUPE, not just sort (#299). Two independent detectors can now name the SAME reason:
@@ -1956,8 +2217,45 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     # LAUNCH_HOLD_ALERT_REASONS, covers every name a launch streak can wear. The `held_now` conjunct
     # is what keeps that from mis-firing when two classes stand at once: one clearing must not
     # announce that launching resumed while the other still holds the queue.
+    # (#457) The attempt streak is read RAW here — not through `systemic_auth_death`. That flag
+    # carries two conjuncts which can fall for reasons that are not evidence about launching at all:
+    # the meter reads again, or `claude auth status` finally answers, or a MORE specific class
+    # (`auth_dead`, a dead anchor) rises and takes the naming. Any of those would drop `held_now`
+    # while every launch on the machine was still refusing — and this edge would journal "launch
+    # delivery verified again" over a machine that verified nothing, retract the alert, and page the
+    # owner a second time when the class re-armed. The streak itself clears on ONE thing, a verified
+    # delivery, which is exactly what this record claims.
     held_now = systemic_launch or systemic_env
-    if prev_systemic and not held_now:
+    # (#457) This class's own exit edge, kept apart from the generic one above for the reason its
+    # note gives: the streak cleared, which happens on exactly one thing — a verified delivery — so
+    # this may make the claim the generic record makes.
+    # ...and it keys on the runner having SEEN a delivery, never on the streak merely being gone.
+    # Those are different facts, and every weaker reading of "gone" has teeth: the threshold can
+    # fall because a sample was lost, and the map can empty because the journal could not be read or
+    # its whole window scrolled past the slice. Read as a delivery, any of those retracts a standing
+    # page mid-outage, lands every launch-cap park the hold was suppressing, and launches the queue
+    # back into the wall. A streak that merely thinned or went unread says nothing here; the alert
+    # stops naming it and the journal records no claim it cannot stand behind.
+    generic_recovered = prev_systemic and not held_now
+    if (AUTH_DEATH_ALERT_REASON in prev_alert_reasons and attempt_delivered
+            and not attempt_fail_ids and not generic_recovered):
+        out.append({"act": "launch_recovered",
+                    "reason": "a session started again (a canary probe, a recovery relaunch or a "
+                              "repair flight) — the machine-wide credential streak is cleared and "
+                              "normal launching resumes in priority order, unless a separate hold "
+                              "still stands. The per-issue launch-cap parks this hold was "
+                              "suppressing resume with it: a lane already at its cap parks on this "
+                              "tick and needs re-approving."})
+    # There is no second edge any more. An earlier cut journalled one when this class's CONJUNCT
+    # fell while the streak stood — but with the conjunct LATCHED (see its note above), a hold that
+    # is standing ends on the streak and nothing else, so that record has no event left to describe.
+    # Its other trigger, demand going away, was never a lift: that is a queue with nothing to hold,
+    # and the page retracts then for the same reason `launch_anchor_down` and `auth_dead` retract
+    # theirs. It re-raises when work is next approved IF the conjunct opens again — the latch went
+    # with the page, so a machine whose meter and probe both read healthy stays quiet until the next
+    # refusal, which then feeds #24/#320 on its own account. One extra page across an outage that
+    # spans an empty queue is the price those two classes already pay.
+    if generic_recovered:
         out.append({"act": "launch_recovered",
                     "reason": "launch delivery verified again (a canary probe or a restart) — the "
                               "systemic launch streak is cleared and normal launching resumes in "
@@ -2692,6 +2990,16 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                 launch_hold(iid, num, p, relaunch=True,
                             reason="the display is asleep — relaunch held; macOS will not boot the "
                                    "new tab's shell until wake, when it resumes automatically")
+            # (#457) NOTE what is deliberately NOT here: a branch holding an at-cap lane while
+            # the machine-wide credential hold stands. Parking it during that hold does charge a
+            # re-approval for a fault the lane did not cause, and an earlier cut of #457 held it for
+            # exactly that reason — but a hold that suppresses BOTH the park and the relaunch can
+            # become a state the loop cannot leave. The machine-wide streak clears on one thing, a
+            # verified delivery; on a machine whose lanes are all in flight, a recovery relaunch is
+            # the only flight left to give it, and the #115 probe has no candidate at all when the
+            # queue is empty. So the relaunch flies and the cap still parks: one visible park the
+            # owner can re-approve beats a silently frozen loop, which is this file's standing
+            # preference wherever the two trade off.
             elif type(retries) is not int:             # corrupt counter -> to William, not a loop
                 park(iid, num, "exited, and the retry counter is unreadable — parking" + stderr_memo,
                      cause="exited_cap")
@@ -3190,7 +3498,8 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                 # costs the same by a second route (`or gh_stale` above swaps the wording whenever
                 # the whole view is doubted).
                 launch_hold(cid, c.get("num"), c, reason=reason)
-    elif ((systemic_launch or systemic_env) and not anchor_down and not auth_invalid
+    elif ((systemic_launch or systemic_env or systemic_auth_death)
+            and not anchor_down and not auth_invalid
             and not display_asleep
             and not gh_stale and not issue_state_corrupt_for_launches):
         # ...and NOT while the display sleeps (#124): a canary into a sleeping display would just
