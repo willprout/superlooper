@@ -430,9 +430,11 @@ ALERT_MESSAGES = {
     # per-flight classification for whoever wants it. It also says the alternative reading out loud:
     # this is the widest net the layer casts, so it is the one most able to be wrong.
     "claude_auth_dead_machine": "NOTHING ON THIS MACHINE CAN START A SESSION (issue #457): several "
-                               "flights in a row — at least one of them NOT a queued issue's lane, "
-                               "so not something any lane's own worktree can explain — refused "
-                               "before they started, with no successful launch between them, while "
+                               "flights in a row refused before they started, with no successful "
+                               "launch between them — from at least TWO INDEPENDENT SPAWNERS (this "
+                               "runner, the watchdog's own job, an owner-typed verb), and at least "
+                               "one of them a session with no worktree of its own, so neither one "
+                               "environment nor one lane explains it — while "
                                "the usage meter was unreadable and/or `claude auth status` would "
                                "not confirm the account this machine assigns workers. Every one of "
                                "those refusals was the launcher saying the IDENTITY or the "
@@ -1786,9 +1788,13 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     # coincidentally-broken lanes lifts itself the first time any flight flies.
     raw_attempts = dsk.get("launch_attempt_streak")
     raw_attempts = raw_attempts if isinstance(raw_attempts, dict) else {}
-    attempt_fail_ids = {x for x in _dget(raw_attempts, "ids", list) if _is_session_id(x)}
-    attempt_spawners = {x for x in _dget(raw_attempts, "spawners", list)
-                        if x in AUTH_DEATH_SPAWNERS}
+    # Vetted TOGETHER, id and spawner in one pass: given two separate lists this counted a spawner
+    # whose only sample it had rejected, which is exactly the independence a garbage view must not
+    # be able to manufacture.
+    attempt_samples = {k: v for k, v in _dget(raw_attempts, "samples", dict).items()
+                       if _is_session_id(k) and v in AUTH_DEATH_SPAWNERS}
+    attempt_fail_ids = set(attempt_samples)
+    attempt_spawners = set(attempt_samples.values())
     # ...and they must come from at least AUTH_DEATH_SPAWNER_CAP INDEPENDENT SPAWNERS. Each spawner
     # runs the launcher in an environment of its own — the runner's, the watchdog's launchd job, an
     # operator's shell or the dashboard — so one of them refusing says only that ITS environment is
@@ -1801,8 +1807,18 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     # It also keeps the owner's own rule (2026-08-03, quoted at SYSTEMIC_ENV_FAILURE_CAP) intact:
     # two lanes with two separately broken worktrees are one spawner, so they still park with their
     # own memos rather than freezing the queue behind them.
+    # ...and at least one refusal must have come from a flight with NO WORKTREE OF ITS OWN. Two
+    # spawners is independence of ENVIRONMENT; this is independence of the thing the owner's rule is
+    # actually about. `superlooper resume` is the case that separates them: it is shelled from an
+    # operator's shell, so it is a spawner of its own — but it resumes a LANE, inside that lane's
+    # worktree, so its refusal is exactly what "one broken worktree" looks like. Two lanes, one
+    # resumed by hand, would otherwise hold the queue under this banner and never lift: the canary's
+    # only candidates are those same broken lanes, and the hold suppresses the park that would
+    # otherwise end it. A watchdog flight or a Debug tap runs in the repo's own checkout and owns no
+    # worktree, which is what makes it the machine's answer rather than a lane's.
     attempt_streak = (len(attempt_fail_ids) >= AUTH_DEATH_LAUNCH_CAP
-                      and len(attempt_spawners) >= AUTH_DEATH_SPAWNER_CAP)
+                      and len(attempt_spawners) >= AUTH_DEATH_SPAWNER_CAP
+                      and any(_iid_num(x) is None for x in attempt_fail_ids))
     # Not affirmatively alive: `unknown` (the probe would not answer), absent (no probe was fed),
     # or a definitive dead reading. Only a positive `valid is True` clears this conjunct.
     # ...where "unconfirmed" needs a probe that actually ran and did not say yes. An ABSENT probe is
@@ -2128,6 +2144,22 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     # owner a second time when the class re-armed. The streak itself clears on ONE thing, a verified
     # delivery, which is exactly what this record claims.
     held_now = systemic_launch or systemic_env or attempt_streak
+    # (#457) ...and the OTHER way this class's hold ends: its CONJUNCT falls while the streak still
+    # stands — the meter reads again, or `claude auth status` finally confirms the account. That is
+    # a real lift (launching resumes on the same tick) but it is NOT a verified delivery, so it may
+    # not borrow the record below. Without one of its own the alert simply retracted and the journal
+    # said nothing at all, which is the silence LAUNCH_HOLD_ALERT_REASONS exists to prevent. Deduped
+    # by the same durable marker every edge here uses: once section A rewrites the ALERT this reads
+    # False. Guarded on `already_named` so a narrower class TAKING the naming is never read as a
+    # lift — that is a worsening outage, not an ending one.
+    if (AUTH_DEATH_ALERT_REASON in prev_alert_reasons and attempt_streak
+            and not systemic_auth_death and not already_named):
+        out.append({"act": "launch_recovered",
+                    "reason": "the machine-wide credential hold no longer stands: the usage meter "
+                              "reads again and/or `claude auth status` confirms the account. NOT a "
+                              "verified delivery — the launch-refusal streak is unchanged, so if "
+                              "flights are still refusing this will re-arm; the queue resumes "
+                              "meanwhile and nothing was parked or relabeled."})
     if prev_systemic and not held_now:
         out.append({"act": "launch_recovered",
                     "reason": "launch delivery verified again (a canary probe or a restart) — the "

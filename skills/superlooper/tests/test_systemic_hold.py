@@ -806,7 +806,9 @@ def _attempts(ids, fail_at=NOW - 10, spawners=("runner", "watchdog"), **over):
     refusals came from, which is what the hold actually counts."""
     over.setdefault("launch_anchor", {"ok": True})
     if isinstance(ids, (list, tuple)):
-        streak = {"ids": list(ids), "spawners": list(spawners)}
+        # each id gets a spawner, cycling through the ones named — the runner publishes the MAP, so
+        # a test may not name a spawner without a sample that produced it
+        streak = {"samples": {x: list(spawners)[i % len(spawners)] for i, x in enumerate(ids)}}
     else:
         streak = ids
     return disk(launch_attempt_streak=streak, launch_fail_at=fail_at, **over)
@@ -956,7 +958,7 @@ def test_a_more_specific_class_keeps_its_own_name_and_this_one_stays_quiet():
     assert _reasons(out) == ["auth_dead"], _reasons(out)
     # #320's environment escalation, with an attempt streak standing beside it
     dsk = _env_streak("gh_auth_dead", ["i5", "i6"])
-    dsk["launch_attempt_streak"] = {"ids": ["i5", "d26"], "spawners": ["runner", "watchdog"]}
+    dsk["launch_attempt_streak"] = {"samples": {"i5": "runner", "d26": "watchdog"}}
     dsk["auth_probe"] = _AUTH_UNKNOWN
     out = decide(parsed_issues=[parsed(5), parsed(6), parsed(7)], dsk=dsk)
     assert _reasons(out) == ["gh_auth_dead_workers"], _reasons(out)
@@ -984,29 +986,47 @@ def test_a_WORSENING_outage_never_journals_a_recovery(rising):
     assert only(out, "launch_recovered") == [], out
 
 
-def test_a_meter_that_reads_again_is_not_a_launch_and_journals_no_recovery():
-    """Same rule through the other conjunct. Three of the faults this streak admits (`gh_auth_dead`,
-    its runner sibling, `env_poisoned`) are things `claude auth status` and the usage meter cannot
-    see at all, so their recovery is not evidence about them."""
+def test_a_meter_that_reads_again_lifts_the_hold_but_says_so_HONESTLY():
+    """The other way this hold ends, and it must not borrow the delivery record. Three of the faults
+    this streak admits (`gh_auth_dead`, its runner sibling, `env_poisoned`) are things `claude auth
+    status` and the usage meter cannot see at all, so their reading healthy is not evidence about
+    them — nothing was verified and the refusal streak is unchanged. But the lift is real (launching
+    resumes on this tick), and an alert that simply retracts with the journal saying nothing is the
+    silence this whole family of records exists to prevent."""
     dsk = _attempts(["i5", "d26"], auth_probe=_AUTH_HEALTHY,
                     alert={"reasons": [AUTH_DEATH], "since": NOW - 600})
     out = decide(parsed_issues=[parsed(5), parsed(6)], dsk=dsk)
+    rec = only(out, "launch_recovered")
+    assert len(rec) == 1, out
+    assert "NOT a verified delivery" in rec[0]["reason"], rec
+    assert only(out, "clear_alert") and [a["id"] for a in only(out, "launch")]
+    assert only(out, "park") == [] and only(out, "relabel") == []
+
+
+def test_a_narrower_class_TAKING_the_naming_is_never_read_as_a_lift():
+    """...and the guard on that record. A more specific class rising is a worsening outage, not an
+    ending one — the queue stays held under its name, and journalling a lift there would be the
+    fabricated-recovery defect wearing new words."""
+    dsk = _attempts(["i5", "d26"], auth_probe=_AUTH_DEAD,
+                    alert={"reasons": [AUTH_DEATH], "since": NOW - 600})
+    out = decide(parsed_issues=[parsed(5), parsed(6)], dsk=dsk, usage=_dark_meter())
     assert only(out, "launch_recovered") == [], out
 
 
 def test_a_garbage_attempt_streak_never_holds_the_queue():
     """Fail OPEN on unreadable input — a wrongly-held queue is the bigger, quieter outage, and this
     view is data the runner writes."""
-    for bad in (None, "x", 5, {}, {"ids": None, "spawners": None},
-                {"ids": "i5d26", "spawners": "runner"},
-                {"ids": ["i5", "d26"]},                     # no spawners named at all
-                {"ids": ["i5", "d26"], "spawners": ["runner"]},
-                {"ids": ["i5", "d26"], "spawners": ["nope", "alsonope"]},
-                {"ids": ["i5", "d26"], "spawners": [1, 2]},
-                {"ids": ["", None], "spawners": ["runner", "watchdog"]},
-                {"ids": ["nope", "alsonope"], "spawners": ["runner", "watchdog"]},
-                {"ids": [5, 6], "spawners": ["runner", "watchdog"]},
-                {"ids": ["i5"], "spawners": ["runner", "watchdog"]}):
+    for bad in (None, "x", 5, {}, {"samples": None}, {"samples": "i5"},
+                {"ids": ["i5", "d26"], "spawners": ["runner", "watchdog"]},   # the old shape
+                {"samples": {"i5": "runner", "d26": "runner"}},        # one spawner
+                {"samples": {"i5": "runner", "i6": "operator"}},       # no worktree-free flight
+                {"samples": {"i5": "nope", "d26": "alsonope"}},        # unknown spawners
+                {"samples": {"i5": 1, "d26": 2}},
+                {"samples": {"": "runner", "d26": "watchdog"}},
+                {"samples": {"nope": "runner", "alsonope": "watchdog"}},
+                {"samples": {"i5": "runner"}},
+                # a REJECTED id may not contribute the second spawner
+                {"samples": {"i5": "runner", "i6": "runner", "zzz": "watchdog"}}):
         dsk = _attempts(bad, auth_probe=_AUTH_UNKNOWN)
         out = decide(parsed_issues=[parsed(5), parsed(6)], dsk=dsk, usage=_dark_meter())
         assert AUTH_DEATH not in _reasons(out), bad
@@ -1062,7 +1082,7 @@ def test_a_recovery_lifts_the_hold_and_relabels_nothing():
 
     NOTE the probe is still `unknown` here. The streak clearing is what lifts this hold; an auth
     reading that never answers must not be able to keep it standing."""
-    dsk = disk(launch_anchor={"ok": True}, launch_attempt_streak={"ids": [], "spawners": []},
+    dsk = disk(launch_anchor={"ok": True}, launch_attempt_streak={"samples": {}},
                auth_probe=_AUTH_UNKNOWN,
                alert={"reasons": [AUTH_DEATH], "since": NOW - 600},
                issues_state={"version": 1, "issues": {}})
@@ -1173,7 +1193,7 @@ def test_a_watchdog_debugger_launch_failure_feeds_the_attempt_streak(rig):
     rig.r.tick(now=NOW)
     _oop(rig, "watchdog", "launch_failed", "d26", ts=NOW + 1, rc=5, signals=["alert"])
     _oop(rig, "watchdog", "launch_failed", "d27", ts=NOW + 2, rc=5, signals=["alert"])
-    assert _streak(rig) == {"ids": ["d26", "d27"], "spawners": ["watchdog"]}
+    assert _streak(rig) == {"samples": {"d26": "watchdog", "d27": "watchdog"}}
 
 
 def test_an_owner_tapped_debug_launch_failure_feeds_the_attempt_streak(rig):
@@ -1182,7 +1202,7 @@ def test_an_owner_tapped_debug_launch_failure_feeds_the_attempt_streak(rig):
     rig.r.tick(now=NOW)
     _oop(rig, "debug_launch", "launch_failed", "d29", ts=NOW + 1, rc=7, operator="willprout",
          source="command-center", error="[d29] CLAUDE IDENTITY REFUSED in the session's own env")
-    assert _streak(rig) == {"ids": ["d29"], "spawners": ["operator"]}
+    assert _streak(rig) == {"samples": {"d29": "operator"}}
 
 
 def test_a_RESUME_is_a_foreign_spawner_however_its_id_is_shaped(rig):
@@ -1196,7 +1216,7 @@ def test_a_RESUME_is_a_foreign_spawner_however_its_id_is_shaped(rig):
          error="[d29] ENV POISONED: ANTHROPIC_API_KEY survived the scrub")
     _oop(rig, "resume", "resume_failed", "i104", ts=NOW + 2, rc=6, session_id="abc",
          error="[i104] ENV POISONED: ANTHROPIC_API_KEY survived the scrub")
-    assert _streak(rig) == {"ids": ["d29", "i104"], "spawners": ["operator"]}, "one environment"
+    assert _streak(rig) == {"samples": {"d29": "operator", "i104": "operator"}}, "one environment"
     out = decide(parsed_issues=[parsed(5), parsed(6)], usage=_dark_meter(),
                  dsk=disk(launch_anchor={"ok": True}, auth_probe=_AUTH_UNKNOWN,
                           launch_attempt_streak=_streak(rig)))
@@ -1209,7 +1229,7 @@ def test_a_successful_resume_still_clears_the_streak(rig):
     rig.r.tick(now=NOW)
     _oop(rig, "watchdog", "launch_failed", "d26", ts=NOW + 1, rc=5)
     _oop(rig, "resume", "resumed", "i104", ts=NOW + 2, session_id="abc")
-    assert _streak(rig) == {"ids": [], "spawners": []}
+    assert _streak(rig) == {"samples": {}}
 
 
 def test_a_DELIVERY_CHANNEL_refusal_never_enters_this_streak(rig):
@@ -1220,7 +1240,7 @@ def test_a_DELIVERY_CHANNEL_refusal_never_enters_this_streak(rig):
     rig.r.tick(now=NOW)
     _oop(rig, "watchdog", "launch_failed", "d26", ts=NOW + 1, rc=2, signals=["alert"])
     _oop(rig, "watchdog", "launch_failed", "d27", ts=NOW + 2, rc=124, signals=["alert"])
-    assert _streak(rig)["ids"] == []
+    assert _streak(rig)["samples"] == {}
 
 
 def test_a_PER_ISSUE_refusal_never_enters_this_streak(rig):
@@ -1231,7 +1251,7 @@ def test_a_PER_ISSUE_refusal_never_enters_this_streak(rig):
     rig.calls.clear()
     rig.rc_queue.append(runner_mod.ScriptRC(1, "[i101] could not create the worktree"))
     _fly(rig, _launch_action(), NOW + 1)
-    assert _streak(rig)["ids"] == []
+    assert _streak(rig)["samples"] == {}
     assert issue_state(rig, "i101")["launch_failures"] == 1, "it still parks on its own schedule"
 
 
@@ -1244,7 +1264,7 @@ def test_a_CANARY_probes_refusal_is_never_a_sample(rig):
     rig.calls.clear()
     rig.rc_queue.append(runner_mod.ScriptRC(6, "[i101] ENV POISONED: ANTHROPIC_API_KEY survived"))
     _fly(rig, dict(_launch_action(), canary=True), NOW + 1)
-    assert _streak(rig)["ids"] == []
+    assert _streak(rig)["samples"] == {}
 
 
 def test_a_record_with_no_readable_rc_is_dropped_rather_than_guessed_at(rig):
@@ -1253,7 +1273,7 @@ def test_a_record_with_no_readable_rc_is_dropped_rather_than_guessed_at(rig):
     rig.r.tick(now=NOW)
     _oop(rig, "watchdog", "launch_failed", "d26", ts=NOW + 1, signals=["alert"])
     _oop(rig, "watchdog", "launch_failed", "d27", ts=NOW + 2, rc="five", signals=["alert"])
-    assert _streak(rig)["ids"] == []
+    assert _streak(rig)["samples"] == {}
 
 
 def test_the_runners_OWN_launch_failure_feeds_the_lane_side(rig):
@@ -1263,7 +1283,7 @@ def test_the_runners_OWN_launch_failure_feeds_the_lane_side(rig):
     rig.calls.clear()
     rig.rc_queue.append(runner_mod.ScriptRC(7, "[i101] CLAUDE IDENTITY REFUSED: not logged in"))
     _fly(rig, _launch_action(), NOW + 1)
-    assert _streak(rig) == {"ids": ["i101"], "spawners": ["runner"]}
+    assert _streak(rig) == {"samples": {"i101": "runner"}}
 
 
 @pytest.mark.parametrize("rec", [
@@ -1280,9 +1300,9 @@ def test_every_verified_delivery_this_runner_makes_clears_the_streak(rec, rig):
     rig.r.tick(now=NOW)
     _oop(rig, "watchdog", "launch_failed", "d26", ts=NOW + 1, rc=5)
     _oop(rig, "watchdog", "launch_failed", "d27", ts=NOW + 2, rc=8)
-    assert _streak(rig)["ids"] == ["d26", "d27"]
+    assert sorted(_streak(rig)["samples"]) == ["d26", "d27"]
     journal_mod.append(str(rig.home), rec, NOW + 30)
-    assert _streak(rig, NOW + 40) == {"ids": [], "spawners": []}
+    assert _streak(rig, NOW + 40) == {"samples": {}}
 
 
 @pytest.mark.parametrize("tier", ["idle", "frozen", None])
@@ -1297,7 +1317,7 @@ def test_a_recover_that_only_NUDGED_clears_nothing(tier, rig):
     _oop(rig, "watchdog", "launch_failed", "d27", ts=NOW + 2, rc=8)
     journal_mod.append(str(rig.home), {"act": "recover", "id": "i101", "tier": tier,
                                        "outcome": "ok"}, NOW + 30)
-    assert _streak(rig, NOW + 40)["ids"] == ["d26", "d27"]
+    assert sorted(_streak(rig, NOW + 40)["samples"]) == ["d26", "d27"]
 
 
 def test_a_verified_delivery_BETWEEN_two_refusals_breaks_the_streak(rig):
@@ -1308,7 +1328,7 @@ def test_a_verified_delivery_BETWEEN_two_refusals_breaks_the_streak(rig):
     _oop(rig, "watchdog", "launch_failed", "d26", ts=NOW + 1, rc=5)
     _oop(rig, "debug_launch", "launched", "d27", ts=NOW + 2, operator="willprout")
     _oop(rig, "watchdog", "launch_failed", "d28", ts=NOW + 3, rc=5)
-    assert _streak(rig)["ids"] == ["d28"], "the success clears d26 and only d26"
+    assert sorted(_streak(rig)["samples"]) == ["d28"], "the success clears d26 and only d26"
 
 
 def test_a_delivery_WRITTEN_LATE_BUT_STAMPED_EARLY_still_clears_the_streak(rig):
@@ -1323,10 +1343,10 @@ def test_a_delivery_WRITTEN_LATE_BUT_STAMPED_EARLY_still_clears_the_streak(rig):
     rig.r.tick(now=NOW)
     _oop(rig, "watchdog", "launch_failed", "d26", ts=NOW + 3000, rc=5)
     _oop(rig, "resume", "resume_failed", "i104", ts=NOW + 3001, rc=7, session_id="abc")
-    assert _streak(rig, NOW + 3100)["ids"] == ["d26", "i104"]
+    assert sorted(_streak(rig, NOW + 3100)["samples"]) == ["d26", "i104"]
     _mine(rig, "launch", "ok", "i101", ts=NOW)         # stamped 3000s earlier, written last
     for at in (NOW + 3100, NOW + 3300, NOW + 9000):
-        assert _streak(rig, at) == {"ids": [], "spawners": []}, at
+        assert _streak(rig, at) == {"samples": {}}, at
 
 
 def test_the_streak_NEVER_expires_on_a_clock_however_long_the_outage_runs(rig):
@@ -1341,8 +1361,7 @@ def test_the_streak_NEVER_expires_on_a_clock_however_long_the_outage_runs(rig):
     _oop(rig, "watchdog", "launch_failed", "d26", ts=NOW + 1, rc=5)
     _oop(rig, "debug_launch", "launch_failed", "d29", ts=NOW + 2, rc=7)
     for at in (NOW + 3600, NOW + 6 * 3600 + 60, NOW + 20 * 3600, NOW + 7 * 24 * 3600):
-        assert _streak(rig, at) == {"ids": ["d26", "d29"],
-                                    "spawners": ["operator", "watchdog"]}, at
+        assert _streak(rig, at) == {"samples": {"d26": "watchdog", "d29": "operator"}}, at
 
 
 def test_only_a_VERIFIED_DELIVERY_ever_clears_it(rig):
@@ -1352,7 +1371,7 @@ def test_only_a_VERIFIED_DELIVERY_ever_clears_it(rig):
     _oop(rig, "watchdog", "launch_failed", "d26", ts=NOW + 1, rc=5)
     _oop(rig, "debug_launch", "launch_failed", "d29", ts=NOW + 2, rc=7)
     _oop(rig, "watchdog", "launched", "d30", ts=NOW + 8 * 24 * 3600)
-    assert _streak(rig, NOW + 8 * 24 * 3600 + 1) == {"ids": [], "spawners": []}
+    assert _streak(rig, NOW + 8 * 24 * 3600 + 1) == {"samples": {}}
 
 
 def test_a_RESTART_reconstructs_the_whole_streak_including_its_lane_side(rig):
@@ -1368,8 +1387,8 @@ def test_a_RESTART_reconstructs_the_whole_streak_including_its_lane_side(rig):
     reborn = type(rig.r)(repo=str(rig.repo), config=rig.r.config, state_home=str(rig.home),
                          pane="pane-1", run_script=lambda *a, **k: 0,
                          fetch_usage=lambda: {"auth_status": "ok"})
-    assert reborn._launch_attempt_streak(NOW + 20) == {"ids": ["d26", "i101"],
-                                                       "spawners": ["runner", "watchdog"]}
+    assert reborn._launch_attempt_streak(NOW + 20) == {
+        "samples": {"d26": "watchdog", "i101": "runner"}}
 
 
 def test_an_unrelated_journal_record_is_never_read_as_a_verified_delivery(rig):
@@ -1386,7 +1405,7 @@ def test_an_unrelated_journal_record_is_never_read_as_a_verified_delivery(rig):
                 {"act": "watchdog", "id": "d99"},                  # a launch act, no outcome
                 {"act": "resume", "id": "i5", "outcome": None}):
         journal_mod.append(str(rig.home), rec, NOW + 3)
-    assert _streak(rig)["ids"] == ["d26", "d27"]
+    assert sorted(_streak(rig)["samples"]) == ["d26", "d27"]
 
 
 def test_a_record_with_an_unusable_TIMESTAMP_costs_a_sample_and_nothing_else(rig):
@@ -1399,7 +1418,7 @@ def test_a_record_with_an_unusable_TIMESTAMP_costs_a_sample_and_nothing_else(rig
     journal_mod.append(str(rig.home), {"act": "event", "event": {"type": "y"}}, NOW + 86400)
     _oop(rig, "watchdog", "launch_failed", "d26", ts=NOW + 30, rc=5)
     _oop(rig, "watchdog", "launch_failed", "d27", ts=NOW + 31, rc=8)
-    assert _streak(rig, NOW + 40)["ids"] == ["d26", "d27"]
+    assert sorted(_streak(rig, NOW + 40)["samples"]) == ["d26", "d27"]
 
 
 def test_the_attempt_streak_is_published_for_decide_to_read(rig, monkeypatch):
@@ -1417,7 +1436,7 @@ def test_the_attempt_streak_is_published_for_decide_to_read(rig, monkeypatch):
     _oop(rig, "watchdog", "launch_failed", "d26", ts=NOW + 3, rc=5)
     monkeypatch.setattr(actions, "decide", spy)
     rig.r.tick(now=NOW + 20)
-    assert seen["launch_attempt_streak"] == {"ids": ["d26", "d27"], "spawners": ["watchdog"]}
+    assert seen["launch_attempt_streak"] == {"samples": {"d26": "watchdog", "d27": "watchdog"}}
 
 
 # ------------------------- the arc: the 2026-08-26 outage, replayed -------------------------
@@ -1545,6 +1564,67 @@ def test_the_2026_08_26_outage_holds_the_queue_and_resumes_on_its_own(auth_outag
         == "running", "the queue resumed on its own"
 
 
+@pytest.fixture
+def serialized_outage(rig):
+    """The 2026-08-26 machine as the journal actually records it: NO approved queue at all (it was
+    serialized behind a wildcard in-flight lane that never exited), one lane in flight, a dark meter
+    and an auth probe answering `unknown`. The runner attempts no launch of its own for the whole
+    outage — every flight on the machine is somebody else's process."""
+    rows = json.loads((rig.fixdir / "issue_list.json").read_text())
+    for row in rows:
+        row["labels"] = [{"name": "type:build"},
+                         {"name": "in-progress" if row["number"] == 101 else "needs-owner"}]
+    (rig.fixdir / "issue_list.json").write_text(json.dumps(rows))
+    launched = []
+    inner = rig.r._run_script
+
+    def run_script(args, env=None, timeout=None):
+        a = [str(x) for x in args]
+        if a and a[0].endswith("launch-session.py"):
+            launched.append(a[1])
+        return inner(args, env=env, timeout=timeout)
+
+    rig.r._run_script = run_script
+    rig.r._probe_auth = lambda: dict(_AUTH_UNKNOWN)
+    rig.launched = launched
+    return rig
+
+
+def test_the_realized_shape_end_to_end_no_launch_of_the_runners_own(serialized_outage):
+    """THE incident, driven through real ticks in the shape that made it invisible: the runner
+    launches nothing, and the only evidence is a watchdog repair flight and an owner's Debug tap
+    refusing from their own processes. #320's streaks stay empty throughout — they count launches
+    this process ran. The demand that makes it worth saying is an in-flight lane, not a queue."""
+    rig = serialized_outage
+    rig.r.tick(now=NOW)                                 # the in-flight lane resumes; nothing queued
+    assert _alert_file(rig) is None
+    flown = list(rig.launched)
+    relabels = len(_agent_ready_removed(rig))           # the resume's own, before the hold
+
+    _oop(rig, "watchdog", "launch_failed", "d26", ts=NOW + 1, rc=5, signals=["alert"])
+    _oop(rig, "debug_launch", "launch_failed", "d29", ts=NOW + 2, operator="willprout",
+         source="command-center",
+         error="[d29] CLAUDE IDENTITY REFUSED in the session's own environment")
+    rig.r.tick(now=NOW + 20)
+
+    alert = _alert_file(rig)
+    assert AUTH_DEATH in (alert or {}).get("reasons", []), alert
+    assert len([a for a in _journal(rig, "alert")
+                if AUTH_DEATH in (a.get("reasons") or [])]) == 1
+    assert _journal(rig, "park") == []
+    assert len(_agent_ready_removed(rig)) == relabels, "the hold itself moves no label"
+    assert rig.launched == flown, "and the runner attempts nothing of its own while it stands"
+    assert rig.r._launch_fail_ids == set() and rig.r._launch_env_fail_ids == {}, \
+        "#320's own streaks stay empty — this is the evidence they cannot count"
+
+    # ...and it lifts the moment any flight flies, whoever flew it
+    _oop(rig, "debug_launch", "launched", "d30", ts=NOW + 30, operator="willprout")
+    rig.r.tick(now=NOW + 40)
+    assert len(_journal(rig, "launch_recovered")) == 1
+    assert AUTH_DEATH not in ((_alert_file(rig) or {}).get("reasons") or [])
+    assert _journal(rig, "park") == []
+
+
 def test_the_2026_08_26_journal_shape_is_what_this_detector_actually_reads(rig):
     """The realized incident, record for record, in the shapes the real journal holds — including
     the owner-tapped one, which carries NO rc at all and is classifiable only from the launcher's
@@ -1559,8 +1639,8 @@ def test_the_2026_08_26_journal_shape_is_what_this_detector_actually_reads(rig):
                "refused before it started.\n[d29] this environment is not logged in to Claude "
                "(`loggedIn` is False, authMethod 'none')")
     streak = _streak(rig, NOW + 20)
-    assert streak == {"ids": ["d26", "d27", "d28", "d29"],
-                      "spawners": ["operator", "watchdog"]}, streak
+    assert streak == {"samples": {"d26": "watchdog", "d27": "watchdog", "d28": "watchdog",
+                                  "d29": "operator"}}, streak
     out = decide(parsed_issues=[parsed(5)], usage=_dark_meter(),
                  dsk=disk(launch_anchor={"ok": True}, auth_probe=_AUTH_UNKNOWN,
                           launch_attempt_streak=streak))

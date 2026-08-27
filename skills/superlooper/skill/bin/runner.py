@@ -3210,12 +3210,16 @@ class Runner:
     def _launch_attempt_streak(self, now=None):
         """The machine-wide launch-attempt streak (issue #457), derived from the journal.
 
-        Returns ``{"ids": [...], "spawners": [...]}`` — the distinct session ids whose launch
-        refused for a CREDENTIAL/ENVIRONMENT reason with no verified delivery since, and the
-        distinct SPAWNERS those refusals came from. decide holds on two spawners agreeing, never on
-        two ids: each spawner runs the launcher in its own environment, so one of them refusing
-        says only that ITS environment is wrong (see the constants above for both ways that goes
-        wrong when ids are counted instead).
+        Returns ``{"samples": {session id: spawner}}`` — the distinct session ids whose launch
+        refused for a CREDENTIAL/ENVIRONMENT reason with no verified delivery since, each mapped to
+        the SPAWNER whose environment read that refusal. decide holds on two spawners agreeing,
+        never on two ids: each spawner runs the launcher in its own environment, so one of them
+        refusing says only that ITS environment is wrong (see the constants above for both ways
+        that goes wrong when ids are counted instead).
+
+        The MAP crosses the boundary rather than two lists, so decide can vet an id and its spawner
+        TOGETHER: given separate lists it counted a spawner whose only sample it had rejected, and a
+        garbage view could then manufacture the very independence this rule is made of.
 
         PURE over the journal's tail: walk it in FILE order, which is the order things actually
         finished — one O_APPEND write per record, from every writer — clearing on any verified
@@ -3233,9 +3237,13 @@ class Runner:
         try:
             records = journal.tail(self.home)
         except Exception:                              # pragma: no cover - defensive
-            return {"ids": [], "spawners": []}
+            return {"samples": {}}
         for rec in records:
             act, outcome = rec.get("act"), rec.get("outcome")
+            if not isinstance(act, str):
+                continue                               # hash-safe: a wrong-typed act would RAISE at
+                                                       # the table lookup below, and this runs
+                                                       # before the tick stamps its heartbeat (#95)
             mine = act in RUNNER_LAUNCH_ACTS or (act == RUNNER_RELAUNCH_ACT
                                                  and rec.get("tier") in RUNNER_RELAUNCH_TIERS)
             if mine:
@@ -3259,7 +3267,7 @@ class Runner:
                 samples = {}
             elif outcome == failed:
                 self._note_attempt_failure(samples, rec, spawner)
-        return {"ids": sorted(samples), "spawners": sorted(set(samples.values()))}
+        return {"samples": dict(sorted(samples.items()))}
 
     def _note_attempt_failure(self, samples, rec, spawner):
         """Record one refused flight, if it is a sample at all (issue #457).
@@ -3269,8 +3277,9 @@ class Runner:
         evidence that the machine cannot start a session, and both already have detectors and
         remedies of their own."""
         sid = rec.get("id")
-        if not isinstance(sid, str) or not sid:
-            return
+        if not actions._is_session_id(sid):            # the same shape decide vets, from one place:
+            return                                     # two sides disagreeing about what a sample
+                                                       # is is how a rejected id once still counted
         if self._streak_reason(rec) in AUTH_DEATH_STREAK_REASONS:
             samples[sid] = spawner
 
