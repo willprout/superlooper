@@ -176,10 +176,11 @@ def test_read_all_is_empty_when_nothing_written(tmp_path):
 
 # ---------------- tail(): the bounded per-tick read (issue #457) ----------------------------
 #
-# The runner absorbs the launches it did NOT run — the watchdog's unattended sl-debugger, the
-# owner's `superlooper debug` tap — from this file, on every ~20 s tick. read() would re-parse the
-# whole 14-day hot window to do it. tail() reads a bounded slice of the END of the file and nothing
-# else, and it is deliberately STATELESS: the caller filters what it has already seen by record ts.
+# The runner learns about the launches it did NOT run — the watchdog's unattended sl-debugger, the
+# owner's `superlooper debug` tap, a `resume` — from this file, and derives its machine-wide launch
+# streak from it on every ~20 s tick. read() would re-parse the whole 14-day hot window to do it.
+# tail() reads a bounded slice of the END of the file and nothing else, and it is deliberately
+# STATELESS: the caller's answer is a function of the slice, never a running total.
 
 
 def test_tail_returns_the_recent_records(tmp_path):

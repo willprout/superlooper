@@ -210,6 +210,16 @@ SYSTEMIC_ENV_FAILURE_CAP = 2
 # structural — a lane's own launch cap is LAUNCH_FAILURE_CAP (2) attempts, so a third sample would
 # always arrive after the first lane had already parked itself.
 AUTH_DEATH_LAUNCH_CAP = 2
+# ...and >= this many INDEPENDENT SPAWNERS among them. The launcher is driven by four processes
+# with four environments (this runner, the watchdog's job, `superlooper debug`, `superlooper
+# resume` — the last two shelled from the same places, so they count as one), and a refusal only
+# ever proves something about the environment it was read in. Two is the smallest number that
+# means "not one environment's problem"; the runner names the spawner on every sample it publishes,
+# because the id cannot be read for it (a `resume` carries a lane's own `i<N>`).
+AUTH_DEATH_SPAWNER_CAP = 2
+# The spawner names decide will accept from that view. Vetted rather than counted raw: this is the
+# pure boundary, and a garbage view must not be able to manufacture independence.
+AUTH_DEATH_SPAWNERS = frozenset({"runner", "watchdog", "operator"})
 # The one name that hold ever wears. It is NOT keyed off an evidence reason like the entries in
 # LAUNCH_ALERT_REASONS above, and that is the point: the class is what several DIFFERENT refusal
 # reasons look like when none of them ever reaches a cap of its own.
@@ -443,7 +453,10 @@ ALERT_MESSAGES = {
                                "repair session. If nothing is approved and no lane is in flight "
                                "there is nothing to fly, so the hold simply waits for the first "
                                "one. A lane that reached its OWN cap before the outage was proven "
-                               "may already have parked; re-approve that one. IF INSTEAD these "
+                               "may park on its own account even while this stands — the hold "
+                               "suppresses the LAUNCH-cap park, not an in-flight lane's own retry "
+                               "cap, because holding that too would leave an all-in-flight machine "
+                               "with no flight left to lift this. Re-approve that one. IF INSTEAD these "
                                "were unrelated faults, the first flight clears this and no "
                                "re-approval is owed. This says nothing about the cmux launch "
                                "anchor either way: a dead one raises `launch_anchor_down` on its "
@@ -1773,35 +1786,23 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     # coincidentally-broken lanes lifts itself the first time any flight flies.
     raw_attempts = dsk.get("launch_attempt_streak")
     raw_attempts = raw_attempts if isinstance(raw_attempts, dict) else {}
-    attempt_lanes = {x for x in _dget(raw_attempts, "lanes", list) if _is_session_id(x)}
-    attempt_flights = {x for x in _dget(raw_attempts, "flights", list) if _is_session_id(x)}
-    attempt_fail_ids = attempt_lanes | attempt_flights
-    # ...and the samples must span BOTH SIDES: at least one queued issue's LANE, and at least one
-    # flight the queue does not own (a watchdog repair session, an owner's Debug tap, a resume).
-    # That two-sided requirement is the discriminator, and each half rules out a different way of
-    # being wrong about the same evidence:
+    attempt_fail_ids = {x for x in _dget(raw_attempts, "ids", list) if _is_session_id(x)}
+    attempt_spawners = {x for x in _dget(raw_attempts, "spawners", list)
+                        if x in AUTH_DEATH_SPAWNERS}
+    # ...and they must come from at least AUTH_DEATH_SPAWNER_CAP INDEPENDENT SPAWNERS. Each spawner
+    # runs the launcher in an environment of its own — the runner's, the watchdog's launchd job, an
+    # operator's shell or the dashboard — so one of them refusing says only that ITS environment is
+    # wrong, and two of them agreeing is the thing neither can explain away. That is exactly what
+    # the 2026-08-26 journal recorded (the watchdog's launchd job at 19:03 and the owner's Debug tap
+    # the next afternoon), and it is what rules out the two ways of misreading the same records: one
+    # watchdog episode mints a fresh d<N> per retry, and one operator shell can produce two verbs
+    # and two id shapes. Counting IDS reads either as the machine; counting SPAWNERS does not.
     #
-    #   * LANES ONLY is the owner's own case (2026-08-03, quoted at SYSTEMIC_ENV_FAILURE_CAP):
-    #     "two different environment faults with one lane each is the one-off case twice over, not
-    #     an outage". Two separately broken worktrees must park with their own memos, not freeze the
-    #     healthy queue behind them.
-    #   * NON-LANES ONLY is the mirror, and just as real: the watchdog mints a FRESH d<N> for every
-    #     retry of ONE episode (three per episode), and the refusals those flights carry — the
-    #     runner-env gh, the fleet config dir, a poisoned env — are read in the SPAWNER's own
-    #     environment. A watchdog started by launchd with a bare PATH refuses every flight
-    #     identically while the runner's own launches are demonstrably fine, and reading that as the
-    #     machine would freeze a healthy queue on a page saying nothing can start at all.
-    #
-    # Both together are the thing neither the lanes nor the spawner can explain away — and, exactly,
-    # the evidence #320 structurally cannot count: its streaks are made of issue lanes.
-    #
-    # The runner splits the two sides by WHO SPAWNED the flight, never by the shape of the id, and
-    # that distinction is load-bearing: `superlooper resume` carries a lane's own `i<N>` while
-    # running in an operator's shell or the dashboard's, so read off the id it would satisfy the
-    # lane side using the very environment the flight side is meant to be independent of — one
-    # poisoned shell would then produce both halves on its own.
+    # It also keeps the owner's own rule (2026-08-03, quoted at SYSTEMIC_ENV_FAILURE_CAP) intact:
+    # two lanes with two separately broken worktrees are one spawner, so they still park with their
+    # own memos rather than freezing the queue behind them.
     attempt_streak = (len(attempt_fail_ids) >= AUTH_DEATH_LAUNCH_CAP
-                      and attempt_lanes and attempt_flights)
+                      and len(attempt_spawners) >= AUTH_DEATH_SPAWNER_CAP)
     # Not affirmatively alive: `unknown` (the probe would not answer), absent (no probe was fed),
     # or a definitive dead reading. Only a positive `valid is True` clears this conjunct.
     # ...where "unconfirmed" needs a probe that actually ran and did not say yes. An ABSENT probe is

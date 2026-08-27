@@ -76,9 +76,12 @@ def read(state_home):
     return _read_records(_path(state_home))
 
 
-# How much of the hot journal a bounded tail read looks at. Big enough that a ~20 s tick can never
-# outrun it (a burst would have to write a quarter-megabyte of records between two ticks), small
-# enough that the read cost is a constant rather than a function of the retention window.
+# How much of the hot journal a bounded tail read looks at. Sized by HISTORY, not by rate: its one
+# caller (issue #457's launch-attempt streak) reads back to its last verified delivery, so the
+# slice has to span however long a machine can go without starting a session. A quarter-megabyte is
+# several days of this loop's journal, and past that the truncation is safe rather than merely
+# bounded (see tail()'s note). Small enough that the read cost is a constant rather than a function
+# of the retention window: ~2 ms against a multi-megabyte file.
 TAIL_MAX_BYTES = 256 * 1024
 
 
@@ -89,13 +92,18 @@ def tail(state_home, max_bytes=TAIL_MAX_BYTES):
     owner's `superlooper debug` tap — only from this file (issue #457), and it may not re-parse a
     14-day window every ~20 s to do it.
 
-    DELIBERATELY STATELESS: no byte offset is carried between calls, and the caller filters what it
-    has already seen by RECORD (its own `ts` watermark). An offset would be wrong here, because the
-    file this follows is not append-only over time — `rotate()` rewrites it WITHOUT its archived
-    prefix, and the runner rotates on its first tick and every few hours after. A saved offset then
-    indexes a different logical position: it either lands mid-record (silently dropping the record
-    it cut, which is exactly the record class this detector is built on) or past the end. Re-reading
-    a bounded tail every tick costs a constant few hundred KB and cannot be wrong about either.
+    DELIBERATELY STATELESS: nothing is carried between calls. The caller derives its whole answer
+    from the slice each time, which is what lets it be a pure function of the journal rather than a
+    running total to be reconciled with one. A byte offset would be wrong here anyway, because this
+    file is not append-only over time — `rotate()` rewrites it WITHOUT its archived prefix, and the
+    runner rotates on its first tick and every few hours after — so a saved offset lands mid-record
+    (silently dropping the record it cut) or past the end.
+
+    TRUNCATING A PREFIX IS SAFE for that caller by construction: its answer is a function of the
+    records after the last verified delivery, so a delivery that scrolls off the front takes every
+    refusal it answered with it. What the slice must be big enough for is the caller's own history
+    (issue #457's streak reaches back to its last delivery, which on a healthy loop is minutes and
+    on a dead one is however long it has been dead) — not for any per-tick rate.
 
     Fails closed exactly like read(): an unreadable file yields [], a corrupt or wrong-typed line is
     skipped, the FIRST line is dropped when the byte seek landed INSIDE it (checked, not assumed),
