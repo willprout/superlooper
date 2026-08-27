@@ -33,12 +33,13 @@ resolve.)
 
 ```
 superlooper adopt  --repo /path/to/your/repo      # writes the config template, creates the
-                                                   # labels, prints branch-protection advice
+                                                   # labels, scaffolds the limitations ledger,
+                                                   # prints branch-protection advice
 superlooper doctor --repo /path/to/your/repo      # checks everything is wired correctly
 ```
 
-`adopt` is safe to re-run: it never overwrites an existing config, and it skips labels that
-already exist. `doctor` changes nothing — it only reports. Run `doctor` until it is all-green
+`adopt` is safe to re-run: it never overwrites an existing config, it skips labels that
+already exist, and it FINDS the limitations ledger rather than scaffolding a second one. `doctor` changes nothing — it only reports. Run `doctor` until it is all-green
 before you start the runner. (Both commands are live today — publishing (above) puts the
 `superlooper` command on your PATH so you can run them, and the schema below is the contract
 they implement.)
@@ -324,6 +325,32 @@ rest are workflow state the runner and William drive.
   them for him at the finish line. Also what lets the launch gate start such an issue unattended.
   A distinct label for the same reason as the one above; you apply it by hand, never the runner.
   Without it the bright line is unchanged: any diff reaching a referee path parks for the owner.
+- `limitations-ledger` — marks the repo's ONE pinned **limitations ledger** issue (below). Not a
+  workflow state: it is how every consumer finds that one issue. `adopt` creates the label and then
+  creates-or-finds the issue.
+
+---
+
+## The limitations ledger
+
+`adopt` scaffolds one pinned issue in your repo — the **limitations ledger** — and marks it with
+`limitations-ledger`. It is the durable home for findings that are *true but not worth a lane*, so
+closing one as a nit is a **filing, not a loss**.
+
+It lives as a GitHub issue on purpose: changing it never needs a PR, a review, or a merge, so
+anything with only GitHub access can file to it. The issue's own body documents the entry format —
+the rubric line that made it a nit, the limitation's content, and a link to the closed source
+issue.
+
+Two upstream consumers read it, and that is where it earns its keep:
+
+- every **worker brief** tells the session to check the ledger before filing a follow-up issue;
+- the **cross-review** instructions paste its entries into the reviewer's prompt and tell the
+  reviewer that an accepted limitation is not a new finding.
+
+Known nits stop being *born*, instead of being cleaned up later. Re-running `adopt` finds the
+existing ledger and creates nothing; if a refused GitHub read means `adopt` cannot tell whether one
+exists, it creates nothing and says so, rather than risk a second ledger.
 
 ---
 
@@ -362,8 +389,8 @@ report.
    `superlooper` command* above for where the link lands and what to do if that dir isn't on
    your PATH.)
 2. `superlooper adopt --repo <path>` — writes `.superlooper/config.json` from the template,
-   seeds the CLAUDE.md standing-rules block, creates the labels above, and prints the
-   branch-protection advice. *Why here:* it produces the config `doctor` validates in the next
+   seeds the CLAUDE.md standing-rules block, creates the labels above, scaffolds the pinned
+   limitations ledger issue, and prints the branch-protection advice. *Why here:* it produces the config `doctor` validates in the next
    step. Then edit the config: set `repo`, your `areas`, at least one `required_checks` entry,
    and any `bright_lines`.
 3. `superlooper doctor --repo <path>` — verifies: `gh` is authenticated, `cmux` is present, `jq`

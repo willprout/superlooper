@@ -14,6 +14,7 @@ the labels — you touch no labels and you never edit the issue's Goal/DoD yours
 Boundaries. Work this issue should NOT do — and any promise that spills into another PR —
 becomes a NEW issue labeled `needs-owner`, never a code comment.
 Such an issue needs exactly one `type:` label, the `{source_label}` label (it says YOUR session filed it), and a `## Loop metadata` section with a `touches:` line naming this repo's areas — `gh issue create` is refused with the exact fix if it doesn't, so just re-run the corrected command.
+BEFORE you file, read the repo's pinned **limitations ledger** (the open issue labeled `limitations-ledger`): if your finding is already an entry there it is an accepted limitation, already weighed — do not re-file it. If there is no such issue, file as normal.
 
 {work_block}
 

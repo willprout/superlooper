@@ -31,7 +31,7 @@ after). If the path doesn't exist, stop and ask for clarification.
 
 ### 2. Build the review prompt
 
-Assemble a self-contained prompt for the reviewer with four parts:
+Assemble a self-contained prompt for the reviewer with five parts:
 
 1. **Project orientation** — if a `CLAUDE.md` exists in the working directory (project root),
    summarize the first ~200 words: what this project is, tech stack, key conventions. If no
@@ -40,8 +40,20 @@ Assemble a self-contained prompt for the reviewer with four parts:
 2. **Spec context (if applicable)** — if the artifact is a plan (`docs/**/plans/*.md` or
    similar), grep it for a `Design spec:` or `Related spec:` line and include that path so the
    reviewer can read it.
-3. **The artifact** — full file contents inline.
-4. **The review brief** — what to look for, structured output format (below).
+3. **Known-accepted limitations** — read the repo's pinned **limitations ledger**: the one open
+   issue labeled `limitations-ledger`. Find it, then read it:
+
+   ```bash
+   gh issue list --state open --label limitations-ledger --json number,title
+   gh issue view <number>
+   ```
+
+   Paste its entries into the prompt. Each entry is a finding somebody already raised, weighed,
+   and accepted; the reviewer is a separate process with no conversation and no reason to run
+   `gh` itself, so if you don't paste them it cannot know. If the repo has no such issue, write
+   one line: "No limitations ledger in this repo."
+4. **The artifact** — full file contents inline.
+5. **The review brief** — what to look for, structured output format (below).
 
 Prompt template:
 
@@ -64,6 +76,10 @@ modified, tests) if helpful.
 Path: <FILE_PATH>
 Focus: <FOCUS_HINT>
 
+# Known-accepted limitations
+
+[the ledger's entries, or "No limitations ledger in this repo."]
+
 # The artifact
 
 [full file contents]
@@ -81,6 +97,12 @@ Look for problems that would cause real pain in production or implementation:
 - Inconsistencies between sections (docstring says X, code does Y).
 - Security issues (binding 0.0.0.0, missing input validation, hardcoded
   secrets, command injection).
+
+Do NOT flag anything already listed under **Known-accepted limitations** — an entry
+there is a filed, accepted limitation, not a new finding. This narrows what counts
+as a finding and nothing else: if the artifact makes an accepted limitation WORSE,
+or the entry no longer describes what the code does, that is new and you should say
+so, naming the entry.
 
 Be honest. If the artifact is good, say so clearly. Don't invent problems to
 seem useful. Empty findings are fine — that's signal too.
@@ -136,7 +158,7 @@ Claude agent with no Codex CLI installed — do **not** fall back silently and d
 review. The owner ruling of **2026-07-10** (recorded in the superlooper source repo's
 `docs/STACK.md` → `codex CLI` block) makes the choice explicit: on a Claude-only machine, a **fresh same-model subagent that wrote
 none of the code** is an equally valid review path. Dispatch that subagent with the exact same
-self-contained prompt (parts 1–4 above), naming out loud which path you took. `doctor --stack`
+self-contained prompt (parts 1–5 above), naming out loud which path you took. `doctor --stack`
 already reports a missing Codex honestly (a WARN on a Claude-only machine, a hard FAIL only when
 a repo's config selects `agent: codex`), so choosing the subagent path here is honoring that
 posture, not working around it.

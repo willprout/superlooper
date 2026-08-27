@@ -22,6 +22,7 @@ import pytest
 
 import janitor as janitor_lib
 import labels as labels_lib
+import limitations
 import loopstate
 
 _ROOT = Path(__file__).resolve().parent.parent
@@ -57,7 +58,11 @@ ALL_LABELS = ["agent-ready", "in-progress", "needs-owner", "parked",
               # also boot-healed, because the ENGINE applies that one (split pinned in
               # test_labels.py).
               "source:orchestration", "source:build", "source:investigation", "source:debugger",
-              "source:qa", "source:dashboard-flag"]
+              "source:qa", "source:dashboard-flag",
+              # the marker on the repo's ONE pinned limitations ledger issue (#450). adopt creates
+              # the label and THEN creates the issue that carries it — `gh issue create` is
+              # all-or-nothing on labels, so an unseeded marker means no ledger at all.
+              "limitations-ledger"]
 
 RULE_START = "<!-- loop-standing-rules:start -->"
 RULE_END = "<!-- loop-standing-rules:end -->"
@@ -851,6 +856,176 @@ def test_readopt_adds_a_new_starter_label_without_disturbing_the_others(rig):
     # impossible rather than merely untested: skill/lib/gh.py exposes no delete_label at all, so no
     # adopt path can emit one. A test for it would pass vacuously and imply a guard that isn't there.)
     assert not [m for m in muts if m["kind"] == "rename_label" and m["old"].startswith("model:")]
+
+
+# --------------------------- adopt: the limitations ledger (issue #450) ---------------------------
+
+def _ledger_fixture(rig, *entries):
+    """Serve `issue list --label limitations-ledger` from its own fixture (fake-gh prefers
+    issue_list_<label>.json over the shared issue_list.json)."""
+    (rig.fixdir / "issue_list_limitations-ledger.json").write_text(json.dumps(list(entries)))
+
+
+def _ledger_entry(num, pinned=True):
+    return {"number": num, "labels": [{"name": "limitations-ledger"}], "isPinned": pinned}
+
+
+def test_adopt_scaffolds_and_pins_the_limitations_ledger(rig):
+    # A fresh repo has no ledger, so adopt creates one, marks it, and pins it. The ledger is the
+    # durable home for true-but-not-worth-a-lane findings; it lives as a GitHub ISSUE precisely so
+    # that changing it never needs a PR — which is what makes it writable by a triage flight.
+    fresh = rig.tmp / "fresh-ledger"
+    fresh.mkdir()
+    subprocess.run(["git", "init", "-q", str(fresh)], check=True)
+    subprocess.run(["git", "-C", str(fresh), "remote", "add", "origin",
+                    "https://github.com/will/proj.git"], check=True)
+
+    r = cli(rig, "adopt", "--repo", str(fresh))
+
+    assert r.returncode == 0, r.stdout + r.stderr
+    created = [m for m in mutations(rig) if m["kind"] == "create_issue"]
+    assert len(created) == 1, "adopt scaffolds exactly one ledger issue: %s" % created
+    assert created[0]["labels"] == limitations.LEDGER_LABEL, (
+        "the ledger must carry its marker label, or nothing can ever find it again")
+    assert created[0]["title"] == limitations.LEDGER_TITLE
+    assert created[0]["body"] == limitations.ledger_body()
+    assert [m for m in mutations(rig) if m["kind"] == "pin_issue"], "the ledger must be pinned"
+    assert "9001" in r.stdout, "adopt must NAME the ledger issue it created"
+
+
+def test_the_scaffolded_ledger_body_documents_its_own_entry_format(rig):
+    # DoD: the entry format lives on the ledger issue's OWN body — rubric line, the limitation's
+    # content, a link to the closed source issue. Asserted on what adopt actually SENDS, so a
+    # body assembled correctly in the lib but sent from somewhere else still fails here.
+    fresh = rig.tmp / "fresh-ledger-body"
+    fresh.mkdir()
+    r = cli(rig, "adopt", "--repo", str(fresh))
+    assert r.returncode == 0, r.stdout + r.stderr
+    body = [m for m in mutations(rig) if m["kind"] == "create_issue"][0]["body"]
+    assert "rubric" in body.lower()
+    assert "N1" in body and "N4" in body
+    assert re.search(r"#\d+", body), "a worked example entry must show the closed-issue link"
+
+
+def test_readopt_finds_the_existing_ledger_and_creates_nothing_new(rig):
+    # The idempotence DoD, stated as the field states it: `superlooper adopt` is documented as safe
+    # to re-run, and a second run that scaffolded a SECOND ledger would split the one place accepted
+    # limitations live — the failure that makes the ledger worthless rather than merely untidy.
+    _ledger_fixture(rig, _ledger_entry(42))
+
+    r = cli(rig, "adopt", "--repo", str(rig.repo))
+
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert not [m for m in mutations(rig) if m["kind"] == "create_issue"], \
+        "a second adopt must create nothing new"
+    assert not [m for m in mutations(rig) if m["kind"] == "pin_issue"], \
+        "an already-pinned ledger must not be re-pinned — real gh REFUSES a second pin"
+    assert "#42" in r.stdout, "adopt must name the ledger it found"
+
+
+def test_readopt_repins_a_ledger_somebody_unpinned(rig):
+    # Found-but-unpinned is the one case where re-adopt still writes: pinning is what makes the
+    # ledger the first thing a reader sees, and `isPinned` is exactly why the read asks for it.
+    _ledger_fixture(rig, _ledger_entry(42, pinned=False))
+
+    r = cli(rig, "adopt", "--repo", str(rig.repo))
+
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert not [m for m in mutations(rig) if m["kind"] == "create_issue"]
+    assert [m["num"] for m in mutations(rig) if m["kind"] == "pin_issue"] == ["42"]
+
+
+def test_adopt_ignores_issues_that_do_not_actually_carry_the_marker(rig):
+    # The `--label` flag is an argument, not a guarantee. adopt confirms the marker in the payload,
+    # so a read that answered with unrelated issues scaffolds a ledger rather than writing into
+    # somebody else's issue — the shared issue_list.json fixture is exactly that answer.
+    fresh = rig.tmp / "fresh-unmarked"
+    fresh.mkdir()
+    r = cli(rig, "adopt", "--repo", str(fresh))
+    assert r.returncode == 0, r.stdout + r.stderr
+    created = [m for m in mutations(rig) if m["kind"] == "create_issue"]
+    assert len(created) == 1, "the shared fixture's issues carry no marker — scaffold, don't adopt"
+
+
+def test_adopt_refuses_to_scaffold_a_ledger_when_the_read_was_refused(rig):
+    # The #92/#172 refused-vs-answered-empty discipline, at the one call site where "empty" means
+    # CREATE. A throttled read that failed closed to [] would scaffold a duplicate ledger on every
+    # re-run — so a refused read creates NOTHING and says so, and adopt exits nonzero because its
+    # GitHub half is incomplete (the issue-#29 mixed-state rule).
+    (rig.fixdir / "fail_rules.json").write_text(json.dumps(
+        [{"match": "--label limitations-ledger", "times": 1,
+          "stderr": "API rate limit exceeded"}]))
+
+    r = cli(rig, "adopt", "--repo", str(rig.repo))
+
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert not [m for m in mutations(rig) if m["kind"] == "create_issue"], \
+        "a refused read must never be read as 'this repo has no ledger'"
+    assert "ledger" in r.stdout.lower()
+    assert "idempotent" in r.stdout.lower() or "re-run" in r.stdout.lower(), \
+        "the memo must name the one action that fixes it — adopt is safe to re-run"
+
+
+def test_adopt_does_not_attempt_the_ledger_when_its_marker_label_failed(rig):
+    # `gh issue create` is ALL-OR-NOTHING on labels: with the marker missing, the create is refused
+    # outright and the work item silently never exists (#165/#337). So a failed marker create must
+    # STOP the scaffold rather than fire a call that cannot succeed.
+    (rig.fixdir / "fail_rules.json").write_text(json.dumps(
+        [{"match": "label create limitations-ledger", "times": 1,
+          "stderr": "HTTP 403"}]))
+
+    r = cli(rig, "adopt", "--repo", str(rig.repo))
+
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert not [m for m in mutations(rig) if m["kind"] == "create_issue"], \
+        "no ledger create may be attempted while its marker label does not exist"
+    assert "limitations-ledger" in r.stdout
+
+
+def test_adopt_reports_failure_when_the_ledger_could_not_be_pinned(rig):
+    # A failed pin is NOT a success (fresh-agent review). Adoption promises a PINNED ledger, so
+    # exiting 0 on a pin that never landed would report a success that did not happen — the
+    # issue-#29 defect. The ledger itself still stands (create is never undone or re-attempted),
+    # and the memo names the real cause: GitHub pins at most three issues per repo.
+    (rig.fixdir / "fail_rules.json").write_text(json.dumps(
+        [{"match": "issue pin", "times": 1, "stderr": "HTTP 422"}]))
+    fresh = rig.tmp / "fresh-pinfail"
+    fresh.mkdir()
+
+    r = cli(rig, "adopt", "--repo", str(fresh))
+
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert len([m for m in mutations(rig) if m["kind"] == "create_issue"]) == 1, \
+        "the ledger is created once and never undone or re-attempted over a pin refusal"
+    assert "NOT PINNED" in r.stdout
+    assert "THREE pinned issues" in r.stdout, "the memo must name the cause an operator can act on"
+    assert "gh issue pin 9001" in r.stdout, "and the exact hand fix, with the real issue number"
+
+
+def test_readopt_reports_failure_when_re_pinning_an_existing_ledger_fails(rig):
+    # Same rule on the found-but-unpinned path: the ledger is found, the pin is attempted, and a
+    # refusal is reported honestly rather than folded into a green re-adopt.
+    _ledger_fixture(rig, _ledger_entry(42, pinned=False))
+    (rig.fixdir / "fail_rules.json").write_text(json.dumps(
+        [{"match": "issue pin", "times": 1, "stderr": "HTTP 422"}]))
+
+    r = cli(rig, "adopt", "--repo", str(rig.repo))
+
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert not [m for m in mutations(rig) if m["kind"] == "create_issue"], \
+        "a pin refusal must never be answered by scaffolding a second ledger"
+    assert "gh issue pin 42" in r.stdout
+
+
+def test_adopt_scaffolds_no_ledger_before_gh_is_reachable(rig):
+    # gh entirely unreachable: adopt still writes the config (its file half), reports the mixed
+    # state, and attempts NO ledger create — the same fail-closed shape as the label half.
+    fresh = rig.tmp / "fresh-noledger-nogh"
+    fresh.mkdir()
+    r = cli(rig, "adopt", "--repo", str(fresh), env_over={"GH_FAIL": "1"})
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert not [m for m in mutations(rig) if m["kind"] == "create_issue"]
+    assert (fresh / ".superlooper" / "config.json").exists(), "the file half still lands"
 
 
 def test_adopt_never_overwrites_an_existing_config(rig):

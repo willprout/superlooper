@@ -221,6 +221,28 @@ def open_issues(label, limit=200):
                        "--json", _ISSUE_FIELDS, "--limit", str(limit)])
 
 
+# The ledger read (issue #450). Its OWN narrow field list, deliberately: `number` and `labels` so
+# limitations.find_ledger can CONFIRM the marker in the payload rather than trust the `--label`
+# flag we asked for, `isPinned` so a re-adopt re-pins an unpinned ledger instead of erroring on an
+# already-pinned one (real gh refuses a second pin). No body — adopt writes the ledger's body, it
+# never needs to read it back, and an unread field is API burn.
+_LEDGER_FIELDS = "number,labels,isPinned"
+
+
+def marked_issues_health(label, limit=100):
+    """Open issues carrying `label`, as a ReadHealth(issues, ok) — the read behind adopt's ledger
+    scaffold (issue #450), in the #92/#172 refused-vs-answered-empty discipline.
+
+    `ok` is load-bearing here in a way it is not for most reads. Every other list read fails closed
+    to [] and the caller safely acts on nothing; this caller's response to "nothing" is to CREATE
+    an issue, so a throttled or refused read that looked like a genuinely empty answer would
+    scaffold a SECOND ledger on every re-run — and adopt is documented as safe to re-run. So the
+    refusal has to be TELLABLE, and adopt refuses to create anything unless ok is True.
+    """
+    return _json_list_health(["issue", "list", "--state", "open", "--label", label,
+                              "--json", _LEDGER_FIELDS, "--limit", str(limit)])
+
+
 def open_issues_all(limit=200):
     """EVERY open issue, raw gh dicts — the queue lint's read (issue #225).
 
@@ -917,6 +939,18 @@ def pr_add_labels(num, labels):
     if not labels:
         return True
     rc, _ = _run(["pr", "edit", str(num), "--add-label", ",".join(labels)])
+    return rc == 0
+
+
+def pin_issue(num):
+    """Pin an issue to the repository (`gh issue pin`). True on success.
+
+    Real gh REFUSES a second pin on an already-pinned issue (and GitHub caps a repo at three
+    pins), so callers pin only when a read says the issue is unpinned — `marked_issues_health`
+    carries `isPinned` for exactly that. A refusal here is never fatal to its caller: the ledger's
+    existence is the load-bearing half, the pin is discoverability.
+    """
+    rc, _ = _run(["issue", "pin", str(num)])
     return rc == 0
 
 
