@@ -77,12 +77,21 @@ def read(state_home):
 
 
 # How much of the hot journal a bounded tail read looks at. Sized by HISTORY, not by rate: its one
-# caller (issue #457's launch-attempt streak) reads back to its last verified delivery, so the
-# slice has to span however long a machine can go without starting a session. A quarter-megabyte is
-# several days of this loop's journal, and past that the truncation is safe rather than merely
-# bounded (see tail()'s note). Small enough that the read cost is a constant rather than a function
-# of the retention window: ~2 ms against a multi-megabyte file.
-TAIL_MAX_BYTES = 256 * 1024
+# caller (issue #457's launch-attempt streak) reads back to its last verified delivery, so the slice
+# has to span however long a machine can go without starting a session — and the 2026-08-26 incident
+# put its two independent samples 20 h 16 m apart.
+#
+# MEASURED, because the first guess was wrong by an order of magnitude: this repo's own archive runs
+# 250-270 KB on an ordinary busy day and hit 9.7 MB on 2026-08-04 (a question storm, ~5 KB a
+# record). Two megabytes is roughly a week of ordinary days and comfortably past that incident's
+# span; a storm can still outrun it, but a storm means the loop is DELIVERING, and a delivery is
+# what the caller is looking back to anyway. Truncation past the slice is safe rather than merely
+# bounded — a delivery that scrolls off takes every refusal it answered with it (see tail()) — so
+# the failure direction is a hold that arrives late, never one that should not have.
+#
+# Cost is a constant rather than a function of the retention window: ~3 ms per megabyte parsed,
+# against a tick measured in tens of seconds.
+TAIL_MAX_BYTES = 2 * 1024 * 1024
 
 
 def tail(state_home, max_bytes=TAIL_MAX_BYTES):
@@ -139,8 +148,12 @@ def tail(state_home, max_bytes=TAIL_MAX_BYTES):
     # none of those can appear raw today — but _read_records splits on \n only, and two readers of
     # one file that disagree about what a line is would be a defect nobody could reproduce.
     lines = blob[:consumed].decode("utf-8", "replace").split("\n")
-    if not aligned and lines:
-        lines = lines[1:]                               # the seek landed mid-record
+    if not aligned and len(lines) > 1:
+        lines = lines[1:]                               # the seek landed mid-record. Only when
+                                                        # something survives it: a slice holding ONE
+                                                        # line is either that record whole or
+                                                        # unparseable, and dropping it unread would
+                                                        # cost the caller its whole answer.
     out = []
     for line in lines:
         if not line.strip():
@@ -192,16 +205,20 @@ def rotate(state_home, now, retain_seconds=HOT_RETAIN_SECONDS):
 
     Caveat worth stating since #457: a record lost in the concurrency window below is no longer
     audit-only — the runner's machine-wide launch-attempt streak reads this file back through
-    tail(). Losing one there costs at most one SAMPLE of an outage that is still refusing every
-    launch, so it fails OPEN (a hold arrives a tick later, never a hold that should not have).
+    tail(). Losing a REFUSAL costs one sample of an outage that is still refusing every launch, and
+    the hold arrives a tick later. Losing a foreign spawner's verified DELIVERY (`launched` /
+    `resumed`) is the direction that costs something: the streak keeps refusals that delivery
+    already answered, so a hold persists or re-arms over a machine that did start a session. Both
+    are bounded by the next flight — the #115 probe clears the streak on its own — and the window
+    is milliseconds, four times a day, against a runner that is this file's dominant writer.
 
     Concurrency caveat: unlike append() (lock-free, O_APPEND-atomic across processes), the read ->
     os.replace here is NOT atomic against a CONCURRENT appender in another process (watchdog / a
     stray CLI). A record appended between this call's readlines() and its os.replace() would be
     overwritten. The runner is the journal's dominant writer and the sole rotate caller (4x/day, a
-    ms-scale window), and the only runner decision that reads this file back fails OPEN on a lost
-    record (see the note above) — so this is an accepted narrow window, not a safety risk; call
-    rotate only from the runner tick.
+    ms-scale window), and the one runner decision that reads this file back is bounded either way by
+    its own recovery probe (see the note above) — so this is an accepted narrow window, not a safety
+    risk; call rotate only from the runner tick.
 
     Records are partitioned by `ts`: ts < cutoff -> archived; everything else stays hot."""
     cutoff = now - retain_seconds

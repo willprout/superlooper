@@ -18,7 +18,6 @@ Executor <-> action contract: see actions.py's module docstring. Every action is
 with its outcome (journal.jsonl — the morning report and the ratchet read it).
 """
 import json
-import math
 import os
 import re
 import signal

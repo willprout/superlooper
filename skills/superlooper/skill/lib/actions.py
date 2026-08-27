@@ -1792,7 +1792,7 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     # whose only sample it had rejected, which is exactly the independence a garbage view must not
     # be able to manufacture.
     attempt_samples = {k: v for k, v in _dget(raw_attempts, "samples", dict).items()
-                       if _is_session_id(k) and v in AUTH_DEATH_SPAWNERS}
+                       if _is_session_id(k) and isinstance(v, str) and v in AUTH_DEATH_SPAWNERS}
     attempt_fail_ids = set(attempt_samples)
     attempt_spawners = set(attempt_samples.values())
     # ...and they must come from at least AUTH_DEATH_SPAWNER_CAP INDEPENDENT SPAWNERS. Each spawner
@@ -1848,8 +1848,14 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     anchor_named = anchor_down and has_pending_launch
     auth_dead_named = auth_invalid and (has_pending_launch or has_relaunch_demand)
     already_named = anchor_named or systemic_launch or systemic_env or auth_dead_named
-    systemic_auth_death = attempt_streak and (episode_active or auth_unconfirmed) \
-        and not already_named
+    # ...and, like the anchor and auth_dead alerts beside it, only while something is actually
+    # waiting on it. That gate belongs on the CLASS and not merely on its page: the runner stops
+    # feeding an auth probe the moment there is no spend pending, so a class that kept evaluating
+    # its conjunct through that gap would read the probe's disappearance as the account coming back
+    # — ending the hold, and journaling a lift, because the QUEUE emptied.
+    auth_death_demand = has_pending_launch or has_relaunch_demand
+    systemic_auth_death = (attempt_streak and auth_death_demand
+                           and (episode_active or auth_unconfirmed) and not already_named)
     # ONE degraded mode for every detector above: hold every fresh launch and suppress the
     # per-issue launch-cap park (phases D+E), so the queue is left intact for when the cause clears.
     launch_degraded = anchor_down or systemic_launch or systemic_env or systemic_auth_death
@@ -2087,7 +2093,7 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     # earn. Gated on real demand exactly as the anchor and auth_dead alerts are: an idle machine
     # with no queue and no lane in flight is being denied nothing, and a page it cannot act on is a
     # page that teaches the owner to ignore the next one.
-    if systemic_auth_death and (has_pending_launch or has_relaunch_demand):
+    if systemic_auth_death:                            # (demand is already one of its conjuncts)
         reasons.append(AUTH_DEATH_ALERT_REASON)
     if auth_invalid and (has_pending_launch or has_relaunch_demand):   # dead auth only matters with a
         reasons.append("auth_dead")                    # spend pending (idle -> quiet, like the anchor)
@@ -2145,14 +2151,20 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     # delivery, which is exactly what this record claims.
     held_now = systemic_launch or systemic_env or attempt_streak
     # (#457) ...and the OTHER way this class's hold ends: its CONJUNCT falls while the streak still
-    # stands — the meter reads again, or `claude auth status` finally confirms the account. That is
+    # stands. NB the demand conjunct is excluded here on purpose — demand going away (the last lane
+    # parks, the queue empties) is not a lift, it is a queue with nothing to hold, and this class
+    # retracts its page then for the same reason `launch_anchor_down` and `auth_dead` do. It
+    # re-raises when work is next approved and the machine is still refusing, which is one extra
+    # page across an outage that spans an empty queue — the price those two already pay.
+    #
+    # The remaining case is a real lift: its conjunct falls while the streak still stands — the meter reads again, or `claude auth status` finally confirms the account. That is
     # a real lift (launching resumes on the same tick) but it is NOT a verified delivery, so it may
     # not borrow the record below. Without one of its own the alert simply retracted and the journal
     # said nothing at all, which is the silence LAUNCH_HOLD_ALERT_REASONS exists to prevent. Deduped
     # by the same durable marker every edge here uses: once section A rewrites the ALERT this reads
     # False. Guarded on `already_named` so a narrower class TAKING the naming is never read as a
     # lift — that is a worsening outage, not an ending one.
-    if (AUTH_DEATH_ALERT_REASON in prev_alert_reasons and attempt_streak
+    if (AUTH_DEATH_ALERT_REASON in prev_alert_reasons and attempt_streak and auth_death_demand
             and not systemic_auth_death and not already_named):
         out.append({"act": "launch_recovered",
                     "reason": "the machine-wide credential hold no longer stands: the usage meter "

@@ -1026,7 +1026,8 @@ def test_a_garbage_attempt_streak_never_holds_the_queue():
                 {"samples": {"nope": "runner", "alsonope": "watchdog"}},
                 {"samples": {"i5": "runner"}},
                 # a REJECTED id may not contribute the second spawner
-                {"samples": {"i5": "runner", "i6": "runner", "zzz": "watchdog"}}):
+                {"samples": {"i5": "runner", "i6": "runner", "zzz": "watchdog"}},
+                {"samples": {"i5": ["runner"], "d26": "watchdog"}}):   # unhashable: must not raise
         dsk = _attempts(bad, auth_probe=_AUTH_UNKNOWN)
         out = decide(parsed_issues=[parsed(5), parsed(6)], dsk=dsk, usage=_dark_meter())
         assert AUTH_DEATH not in _reasons(out), bad
@@ -1590,6 +1591,25 @@ def serialized_outage(rig):
     return rig
 
 
+def test_the_DARK_METER_half_carries_it_end_to_end_on_its_own(serialized_outage):
+    """The disjunction's other half, driven rather than asserted at the boundary. Here the auth
+    probe answers cleanly — the account is fine as far as anything can tell — and it is the meter's
+    silence past the fail-open grace that makes "the machine cannot start a session" the reading.
+    Three of the faults this streak admits are things `claude auth status` cannot see at all."""
+    rig = serialized_outage
+    rig.r._probe_auth = lambda: dict(_AUTH_HEALTHY)
+    rig.r._fetch_usage = lambda: {"auth_status": "api_error", "five_hour_pct": None,
+                                  "seven_day_pct": None}
+    rig.r._usage["first_attempt_at"] = NOW - 2 * actions.USAGE_FAIL_OPEN_GRACE_SECONDS
+    rig.r.tick(now=NOW)
+    assert _journal(rig, "fail_open"), "the meter is dark past its grace, failing open as designed"
+    _oop(rig, "watchdog", "launch_failed", "d26", ts=NOW + 1, rc=5)
+    _oop(rig, "debug_launch", "launch_failed", "d29", ts=NOW + 2, rc=7)
+    rig.r.tick(now=NOW + 20)
+    assert AUTH_DEATH in (_alert_file(rig) or {}).get("reasons", []), _alert_file(rig)
+    assert _journal(rig, "park") == []
+
+
 def test_the_realized_shape_end_to_end_no_launch_of_the_runners_own(serialized_outage):
     """THE incident, driven through real ticks in the shape that made it invisible: the runner
     launches nothing, and the only evidence is a watchdog repair flight and an owner's Debug tap
@@ -1668,3 +1688,26 @@ def test_every_spawner_the_runner_can_name_is_one_decide_will_accept():
                                            in runner_mod.FOREIGN_LAUNCH_OUTCOMES.values()}
     assert named <= actions.AUTH_DEATH_SPAWNERS, named - actions.AUTH_DEATH_SPAWNERS
     assert len(named) >= actions.AUTH_DEATH_SPAWNER_CAP, "the rule must be satisfiable at all"
+
+
+def test_the_QUEUE_EMPTYING_is_never_read_as_the_machine_coming_back():
+    """The third way a conjunct can fall, and the one that is not evidence at all. The runner stops
+    feeding an auth probe the moment no spend is pending, so a class that kept evaluating its
+    conjunct through that gap would read the probe's DISAPPEARANCE as the account confirming
+    itself — ending the hold and journaling a lift because the queue emptied, on a machine still
+    refusing every flight. The hold retracts its page then (as the anchor and auth_dead alerts
+    beside it do), and says nothing it cannot stand behind."""
+    dsk = _attempts(["i5", "d26"], alert={"reasons": [AUTH_DEATH], "since": NOW - 600})
+    dsk.pop("auth_probe", None)                        # no demand -> the runner feeds no probe
+    out = decide(parsed_issues=[], dsk=dsk)
+    assert only(out, "launch_recovered") == [], out
+    assert AUTH_DEATH not in _reasons(out), _reasons(out)
+
+
+def test_and_it_re_raises_when_work_is_approved_again_and_nothing_has_flown():
+    """...and the price of that gate, stated: one extra page across an outage that spans an empty
+    queue. The streak is unchanged — only a delivery clears it — so the moment there is something to
+    hold, the hold is said again."""
+    dsk = _attempts(["i5", "d26"], auth_probe=_AUTH_UNKNOWN, alert=None)
+    out = decide(parsed_issues=[parsed(5)], dsk=dsk, usage=_dark_meter())
+    assert AUTH_DEATH in _reasons(out), _reasons(out)
