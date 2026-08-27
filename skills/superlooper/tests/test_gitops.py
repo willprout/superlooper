@@ -363,3 +363,32 @@ def test_a_rev_expression_never_reaches_git(repos):
     # of it; this keeps an expression from being resolved into an answer nobody cited.
     for bad in ("HEAD~1..HEAD", "-C", "", "   ", None, 7, "HEAD ; rm -rf /"):
         assert gitops.commit_on_branch(repos["wt"], bad, "origin/main") is None
+
+
+def test_a_ref_NAME_is_not_commit_level_evidence(repos):
+    """`origin/main` is trivially an ancestor of `origin/main`. A flight closing an issue as
+    overtaken must cite a COMMIT — the standing rule's words are "commit-level evidence" — so a
+    ref name has to be refused before git is asked a question whose answer is always yes
+    (fresh-agent review round 3, P1)."""
+    for name in ("origin/main", "main", "HEAD", "@", "v1.0", "origin/HEAD"):
+        assert gitops.commit_on_branch(repos["wt"], name, "origin/main") is None, name
+
+
+def test_a_branch_whose_NAME_looks_like_a_sha_is_still_not_a_sha(repos):
+    """The hex-shape gate alone would let a branch called `deadbeef` through, and git would
+    resolve it. The resolved oid must actually START with what was cited."""
+    _sh(repos["dev"], "branch", "deadbeef")
+    _sh(repos["dev"], "push", "origin", "deadbeef")
+    _sh(repos["wt"], "fetch", "origin")
+    assert gitops.commit_on_branch(repos["wt"], "deadbeef", "origin/main") is None
+    # ...while a real abbreviated oid of the same length still works
+    landed = _sh(repos["dev"], "rev-parse", "HEAD")
+    assert gitops.commit_on_branch(repos["wt"], landed[:8], "origin/main") is True
+    assert gitops.commit_on_branch(repos["wt"], landed.upper(), "origin/main") is True
+
+
+def test_an_abbreviation_too_short_to_be_meant_is_refused(repos):
+    landed = _sh(repos["dev"], "rev-parse", "HEAD")
+    for short in (landed[:1], landed[:4], landed[:6]):
+        assert gitops.commit_on_branch(repos["wt"], short, "origin/main") is None, short
+    assert gitops.commit_on_branch(repos["wt"], landed[:7], "origin/main") is True

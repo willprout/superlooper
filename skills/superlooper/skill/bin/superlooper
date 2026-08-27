@@ -2938,8 +2938,14 @@ def _triage_overtaken(args, cfg, home, date, body, dev, verdict, refuse):
         return refuse("commit %s is not on %s — the working tree is not evidence. Cite a commit "
                       "that actually landed, or escalate." % (args.commit, ref))
     if answer is None:
-        return refuse("git could not resolve %s or %s in %s, so the evidence could not be "
-                      "checked — nothing was closed" % (args.commit, ref, args.repo))
+        # Deliberately one refusal for two causes, and it names both: the citation was not an
+        # object id (a ref NAME is not evidence — `origin/main` is its own ancestor), or git could
+        # not resolve what was cited. A flight acts on either the same way.
+        return refuse("%r is not commit-level evidence on %s: cite the OBJECT ID of the commit "
+                      "that overtook this issue (7-40 hex characters — a branch or tag name is "
+                      "not evidence, since it is trivially its own ancestor). If you did cite a "
+                      "sha, this repository could not resolve it or %s. Nothing was closed."
+                      % (args.commit, ref, ref))
     comment = triage_run.overtaken_close_comment(args.commit, args.why.strip(), dev)
     if not gh.close_issue(args.issue, comment):
         return refuse("GitHub refused the close on #%s — nothing was written" % args.issue)

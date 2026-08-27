@@ -8,10 +8,15 @@ fast-forward refusal) and re-enter the gate. The runner never resolves conflicts
 conflict is aborted and reported, and the regenerate/park decision belongs to gate.py.
 """
 import os
+import re
 import shutil
 import subprocess
 
 GIT_TIMEOUT = 60   # seconds per git command — a hung network fetch must never wedge a tick
+
+# An OBJECT ID as a citation may take: a 7-to-40 character hex abbreviation, either case.
+# `commit_on_branch` explains why a ref name is not allowed to stand in for one.
+_OID_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
 
 
 def _git(cwd, *args, timeout=GIT_TIMEOUT):
@@ -47,21 +52,34 @@ def commit_on_branch(worktree, commit, ref):
     distinct so the refusal can say WHICH — "that commit is not on origin/main" and "git could not
     answer" send a flight to two different next steps.
 
-    The argument is validated as a rev shape before it reaches git, because it arrives from an
-    unattended session's own words: `--commit "$(rm -rf ~)"` is a string, not a commit, and the
-    argv form already prevents a shell from seeing it — this makes it not even reach git.
+    `commit` must be an OBJECT ID — a 7-to-40 character hex abbreviation — and never a ref name.
+    That is not tidiness (fresh-agent review round 3, P1): `commit_on_branch(wt, "origin/main",
+    "origin/main")` is trivially True, so a ref name would let an unattended flight satisfy the
+    standing rule's "commit-level evidence" with a string that names no evidence at all. The shape
+    gate also means an argument composed by that session — `--commit "$(rm -rf ~)"` is a string,
+    not a commit — never reaches git in the first place (the argv form already keeps a shell out
+    of it).
+
+    The gate is TWO checks, because a hex shape alone is not an oid: a branch literally named
+    `deadbeef` passes the regex and git resolves it happily. So the resolved oid must actually
+    BEGIN with what was cited — which a branch's tip will not, and an abbreviation always does.
     """
     if not isinstance(commit, str) or not isinstance(ref, str):
         return None
     c, r = commit.strip(), ref.strip()
-    # A commit-ish, not an expression: no `..`, no `^`, no `~`, no whitespace, no leading dash.
-    if not c or not all(ch.isalnum() or ch in "-_./" for ch in c) or c.startswith("-"):
+    # 7 is git's own floor for a meaningful abbreviation and the shortest thing a person cites; 40
+    # is a full sha-1. Below 7 an abbreviation is a coincidence rather than a citation.
+    if not _OID_RE.match(c):
         return None
-    if ".." in c or not r or r.startswith("-"):
+    if not r or r.startswith("-"):
         return None
-    rc, _ = _git(worktree, "rev-parse", "--verify", "--quiet", c + "^{commit}")
+    rc, out = _git(worktree, "rev-parse", "--verify", "--quiet", c + "^{commit}")
     if rc != 0:
         return None                      # not a commit this repository has at all
+    # The resolved oid must be the thing that was CITED, not something git found by that name.
+    resolved = (out or "").strip().splitlines()[0].strip() if (out or "").strip() else ""
+    if not resolved.lower().startswith(c.lower()):
+        return None                      # a ref that merely LOOKS like an oid (branch `deadbeef`)
     rc, _ = _git(worktree, "rev-parse", "--verify", "--quiet", r + "^{commit}")
     if rc != 0:
         return None                      # the ref itself is unresolvable (never fetched?)

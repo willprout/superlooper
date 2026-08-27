@@ -835,3 +835,18 @@ def test_the_brief_describes_the_home_the_flight_is_actually_standing_in(tmp_pat
     rig.github([_issue(10, "Something")])
     assert out(run(rig, "triage-flight", "--repo", str(rig.repo), "--json"))["ok"]
     assert rig.launches()[0]["TRIAGE_HOME"] == "worktree"
+
+
+def test_a_branch_name_can_never_stand_in_for_commit_level_evidence(rig):
+    """`origin/main` is its own ancestor, so a ref name would satisfy the ancestry check while
+    naming no evidence at all — the standing rule's "commit-level evidence" reduced to a formality
+    (fresh-agent review round 3, P1)."""
+    rig.github([_issue(30, "Allegedly fixed")])
+    for cited in ("origin/main", "main", "HEAD"):
+        res = act(rig, 30, "overtaken", "--commit", cited, "--why", "it is on main", expect=3)
+        assert not res["ok"], cited
+        assert "commit" in res["error"].lower()
+        assert rig.issue(30)["state"] == "open" and rig.comments(30) == []
+    # ...while a real sha still closes it
+    sha = rig.land("fix.txt", "the fix")
+    assert act(rig, 30, "overtaken", "--commit", sha, "--why", "it landed")["ok"]

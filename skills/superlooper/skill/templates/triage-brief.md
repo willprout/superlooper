@@ -96,8 +96,10 @@ Give **exactly one verdict per issue you judge**, from the rule's vocabulary:
   line and your one recommendation.
 - `duplicate-of-#<M>` — `<M>` absorbs this issue: its body gains this one's content, and this one
   closes with a cross-reference. `<M>` must be unapproved too.
-- `overtaken` — the cited commit must be an ancestor of `origin/{dev_branch}`, or you will be
-  refused. That refusal is the rule's "commit-level evidence" being checked, not a formality.
+- `overtaken` — cite the commit's **object id** (7-40 hex characters), and it must be an ancestor
+  of `origin/{dev_branch}` or you will be refused. A branch or tag name is not evidence — it is
+  trivially its own ancestor — and the verb refuses one. That check is the rule's "commit-level
+  evidence" being enforced, not a formality.
 - `nit(<id>)` — closes the issue **and** files the limitation in the ledger, naming the rubric
   line. Both links land, or neither does.
 
