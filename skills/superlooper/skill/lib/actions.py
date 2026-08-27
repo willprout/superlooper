@@ -431,6 +431,10 @@ ALERT_MESSAGES = {
     # this is the widest net the layer casts, so it is the one most able to be wrong.
     # The remedies lead, deliberately: this is the longest body the loop sends, and a push channel
     # that truncates (Pushover caps at 1024 chars) must cut the explanation rather than the fix.
+    # NB that property is this body's alone — `auth_dead` can now stand beside it (a definitive dead
+    # reading arriving mid-episode no longer renames the hold), and reasons are sorted, so it goes
+    # first and eats the budget. Its own leading remedy is the right one for that reading, so the
+    # composition still opens with something true and actionable; only remedy (3) falls off.
     "claude_auth_dead_machine": "NOTHING ON THIS MACHINE CAN START A SESSION (issue #457). Every "
                                "refusal was the launcher saying the IDENTITY or the ENVIRONMENT a "
                                "session would run under is wrong, so the repair is one of three "
@@ -671,8 +675,9 @@ QUEUE_HELD_ALERT_REASONS = frozenset(
 # It is a streak hold — but its streak is DERIVED from the journal where every other one here is
 # in-memory, so on a runner restart the two fall out of lockstep and one shared edge journals the
 # wrong thing for whichever class did not reset. It owns two edges of its own instead (see decide),
-# and is kept out of this set rather than subtracted at the one reader, so a second reader cannot
-# pick up the name this discipline excludes.
+# It owns an exit edge of its own instead (see decide), and is kept out of this set rather than
+# subtracted at the one reader, so a second reader cannot pick up the name this discipline
+# excludes.
 LAUNCH_HOLD_ALERT_REASONS = frozenset(
     {"launch_systemic_failure"} | set(LAUNCH_ALERT_REASONS.values())) - {"gh_unreachable"}
 
@@ -1950,7 +1955,7 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     # to five more classes, so a hold under any of them would clear silently — the alert retracts,
     # launching resumes, and the journal records that the outage simply stopped existing.
     #
-    # (#457) ...MINUS this issue's own class, which owns two edges of its own below. Its streak is
+    # (#457) ...MINUS this issue's own class, which owns an exit edge of its own below. Its streak is
     # DERIVED from the journal while every other launch streak is in-memory, so on a restart — the
     # documented #24 fallback, which the generic record's own text names — the two fall out of
     # lockstep: the channel/environment streaks reset with the process while this one does not.
@@ -2221,9 +2226,9 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     # owner a second time when the class re-armed. The streak itself clears on ONE thing, a verified
     # delivery, which is exactly what this record claims.
     held_now = systemic_launch or systemic_env
-    # (#457) This class's own exit edges, kept apart from the generic one above for the reason its
-    # note gives. FIRST: the streak itself cleared, which happens on exactly one thing — a verified
-    # delivery — so this may make the claim the generic record makes.
+    # (#457) This class's own exit edge, kept apart from the generic one above for the reason its
+    # note gives: the streak cleared, which happens on exactly one thing — a verified delivery — so
+    # this may make the claim the generic record makes.
     # ...and it keys on the runner having SEEN a delivery, never on the streak merely being gone.
     # Those are different facts, and every weaker reading of "gone" has teeth: the threshold can
     # fall because a sample was lost, and the map can empty because the journal could not be read or

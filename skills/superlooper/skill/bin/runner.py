@@ -5330,11 +5330,11 @@ class Runner:
         empty streak and the ALERT is retracted by decide's reasons diff; the outcome text is the
         record. Emitted ONCE per episode by decide (deduped on the durable ALERT marker).
 
-        Three holds write this act now and they do not all mean the same thing, so the REASON is
-        the record and this docstring must not paraphrase it: #24/#320's says a verified delivery
-        cleared the systemic-launch streak; #457's delivery edge says a session started again;
-        #457's other edge says its conjunct fell with the refusal streak UNCHANGED — a real lift,
-        but explicitly not a delivery, and it says so in as many words."""
+        Two holds write this act and they do not say the same thing, so the REASON is the record and
+        this docstring must not paraphrase it: #24/#320's says a verified delivery cleared the
+        systemic-launch streak; #457's says a session started again and names what resumes with it.
+        Both are claims about a launch that actually landed — #457 had a second edge for a hold
+        ending on something else, and it went when that could no longer happen (see decide)."""
         return a.get("reason", "launch delivery verified again — the systemic launch hold is cleared")
 
     def _exec_morning_report(self, a, now):

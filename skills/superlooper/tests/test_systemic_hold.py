@@ -825,7 +825,7 @@ def test_the_auth_death_class_is_held_named_and_carries_its_own_remedy():
     guessing — and says out loud what it would mean if the escalation were wrong."""
     assert AUTH_DEATH in actions.QUEUE_HELD_ALERT_REASONS
     assert AUTH_DEATH not in actions.LAUNCH_HOLD_ALERT_REASONS, \
-        "it owns two exit edges of its own; sharing the generic marker cost #320 its restart record"
+        "it owns an exit edge of its own; sharing the generic marker cost #320 its restart record"
     msg = actions._alert_message(AUTH_DEATH)
     assert msg != AUTH_DEATH, "it falls back to its bare code"
     assert len(msg) > 80
