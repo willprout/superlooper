@@ -90,8 +90,9 @@ def read(state_home):
 # because a delivery that scrolls off the front takes every refusal it answered with it. A smaller
 # slice can only mean FEWER samples — never a sample that did not happen — so a lost one costs a
 # hold that arrives late, or one that lifts early and re-arms on the next refusal. It can never
-# manufacture a hold, and (since #457's recovery edge keys on the samples being GONE rather than on
-# its threshold falling) it can never manufacture a recovery record either.
+# manufacture a hold; and it cannot manufacture a RECOVERY RECORD either, because that edge keys on
+# the runner having seen a delivery rather than on the streak being gone — a slice that lost the
+# refusals lost the delivery with them, and reports no delivery seen.
 #
 # Cost is a constant rather than a function of the retention window: measured ~15 ms for a 2 MB
 # slice of this journal's typical ~200-byte records, against a tick measured in tens of seconds.
@@ -207,7 +208,7 @@ def rotate(state_home, now, retain_seconds=HOT_RETAIN_SECONDS):
     audit-only — the runner's machine-wide launch-attempt streak reads this file back through
     tail(). Losing a REFUSAL costs one sample of an outage that is still refusing every launch: the
     hold arrives a tick later, or lifts and re-arms on the next refusal — never a hold that should
-    not have arrived, and never a recovery record (that edge keys on the samples being gone). Losing a foreign spawner's verified DELIVERY (`launched` /
+    not have arrived, and never a recovery record (that edge keys on a delivery actually seen). Losing a foreign spawner's verified DELIVERY (`launched` /
     `resumed`) is the direction that costs something: the streak keeps refusals that delivery
     already answered, so a hold persists or re-arms over a machine that did start a session. Both
     are bounded by the next flight — the #115 probe clears the streak on its own — and the window

@@ -3209,12 +3209,21 @@ class Runner:
     def _launch_attempt_streak(self, now=None):
         """The machine-wide launch-attempt streak (issue #457), derived from the journal.
 
-        Returns ``{"samples": {session id: [spawners]}}`` — the distinct session ids whose launch
-        refused for a CREDENTIAL/ENVIRONMENT reason with no verified delivery since, each mapped to
-        EVERY spawner whose environment read a refusal of it. A list rather than one name because
-        the same session can be refused by two: the runner tries to relaunch a lane, and the owner
-        then hand-`resume`s it. Keeping only the last would silently DOWNGRADE the evidence — two
-        environments agreeing would collapse to one and read as though the streak had cleared. decide holds on two spawners agreeing,
+        Returns ``{"samples": {session id: [spawners]}, "delivered": bool}``.
+
+        `samples` are the distinct session ids whose launch refused for a CREDENTIAL/ENVIRONMENT
+        reason with no verified delivery since, each mapped to EVERY spawner whose environment read
+        a refusal of it. A list rather than one name because the same session can be refused by two:
+        the runner tries to relaunch a lane, and the owner then hand-`resume`s it. Keeping only the
+        last would DOWNGRADE the evidence: two environments agreeing collapse to one, and the hold
+        quietly drops below its own threshold on the strength of a SECOND refusal.
+
+        `delivered` says whether this walk actually SAW a session start. An empty `samples` map does
+        not say that on its own: a journal we could not read, or one whose whole window scrolled
+        past `journal.tail`'s slice, is empty too. decide's recovery edge keys on this flag, because
+        reading "empty" as "a session started" turns a lost read into a false durable record — the
+        page retracted mid-outage, the suppressed launch-cap parks landing, and the queue launched
+        back into the wall. decide holds on two spawners agreeing,
         never on two ids: each spawner runs the launcher in its own environment, so one of them
         refusing says only that ITS environment is wrong (see the constants above for both ways
         that goes wrong when ids are counted instead).
@@ -3235,11 +3244,11 @@ class Runner:
         Self-guarded and fails OPEN in every direction: a journal we cannot read, a record we cannot
         classify, a record whose act we do not know — each costs a sample, never a hold.
         """
-        samples = {}
+        samples, delivered = {}, False
         try:
             records = journal.tail(self.home)
         except Exception:                              # pragma: no cover - defensive
-            return {"samples": {}}
+            return {"samples": {}, "delivered": False}
         for rec in records:
             act, outcome = rec.get("act"), rec.get("outcome")
             if not isinstance(act, str):
@@ -3250,7 +3259,7 @@ class Runner:
                                                  and rec.get("tier") in RUNNER_RELAUNCH_TIERS)
             if mine:
                 if outcome == RUNNER_DELIVERY_OK:
-                    samples = {}                       # this runner started a session
+                    samples, delivered = {}, True      # this runner started a session
                 elif not rec.get("canary"):
                     # A #115 CANARY is never a sample (#320's rule, rounds 2 and 3): a probe only
                     # runs while a hold already stands, so it says nothing new about whether one
@@ -3266,10 +3275,11 @@ class Runner:
                 # A verified delivery from another process. It clears THIS streak only: the channel
                 # and per-reason environment streaks are the runner's own accounting, and a
                 # debugger flight is not a sample of the WORKER environments they describe.
-                samples = {}
+                samples, delivered = {}, True
             elif outcome == failed:
                 self._note_attempt_failure(samples, rec, spawner)
-        return {"samples": {k: sorted(v) for k, v in sorted(samples.items())}}
+        return {"samples": {k: sorted(v) for k, v in sorted(samples.items())},
+                "delivered": delivered and not samples}
 
     def _note_attempt_failure(self, samples, rec, spawner):
         """Record one refused flight, if it is a sample at all (issue #457).

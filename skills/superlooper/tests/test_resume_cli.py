@@ -235,9 +235,10 @@ def test_a_failed_launch_is_reported_as_failed_not_as_success(rig):
 def test_the_journal_record_carries_the_launchers_exit_code(rig):
     """This verb drives the shared launcher from its OWN process, so the runner's machine-wide
     launch-attempt streak (issue #457) hears about a refused resume only through this record — and
-    it classifies through lib/evidence, which needs the rc: the launcher's stderr arrives here
-    already wrapped in this CLI's own prose. A record with no rc is a sample that cannot be named,
-    and an unnameable refusal is dropped rather than guessed at."""
+    it classifies through lib/evidence, which reads the stderr first (relayed here verbatim) and
+    falls back to the rc for the refusals that name themselves in neither — a timeout, an unrunnable
+    shim, an empty-output failure. A record with neither is a sample that cannot be named, and an
+    unnameable refusal is dropped rather than guessed at."""
     import json as _json
     rig.seed_lane()
     rig.record_session()

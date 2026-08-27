@@ -451,17 +451,20 @@ ALERT_MESSAGES = {
                                "names it). Launches are "
                                "HELD: the hold itself parks nothing and moves no label, and it "
                                "lifts by itself the moment ANY flight flies — a probe launch of an "
-                               "approved issue, a recovery relaunch of an in-flight lane, or a "
-                               "repair session. If nothing is approved and no lane is in flight, "
+                               "approved issue, a recovery relaunch of an exited lane, or a repair "
+                               "session. With nothing approved and every in-flight lane alive there "
+                               "is no flight to make, so it waits for the first one. If nothing is approved and no lane is in flight, "
                                "nothing is being denied and this page retracts on its own; the "
                                "refusal streak stands, so it returns the moment there is work "
                                "again and the machine is still refusing. A lane that reached its OWN cap before the outage was proven "
-                               "may park on its own account even while this stands — the hold "
+                               "may park the moment this lifts, or on its own account even while "
+                               "it stands — the hold "
                                "suppresses the LAUNCH-cap park, not an in-flight lane's own retry "
                                "cap, because holding that too would leave an all-in-flight machine "
                                "with no flight left to lift this. Re-approve that one. IF INSTEAD these "
-                               "were unrelated faults, the first flight clears this and no "
-                               "re-approval is owed. This says nothing about the cmux launch "
+                               "were unrelated faults, the first flight clears this — and any "
+                               "lane that sat at its cap meanwhile parks as it lifts, so look for "
+                               "one to re-approve. This says nothing about the cmux launch "
                                "anchor either way: a dead one raises `launch_anchor_down` on its "
                                "own account as soon as there is approved work — `superlooper "
                                "status` shows whichever holds.",
@@ -940,6 +943,9 @@ def _sorted_ids(ids):
 
 
 def _is_session_id(sid):
+    # NB `.isascii()` before `.isdigit()`: str.isdigit accepts superscripts and other numeric forms
+    # int() then refuses, so without it this admits an id `_iid_num` RAISES on — and that raise
+    # leaves the whole tick, where every other garbage shape in this path costs one sample.
     """True for any launch SESSION id: a queued issue's lane (i<N>), an sl-debugger flight (d<N>)
     or a triage flight (t<N>) — issue #457.
 
@@ -948,7 +954,7 @@ def _is_session_id(sid):
     "can this machine start a session at all" is answered by ANY flight, and on 2026-08-26 the only
     flights attempted for hours were the watchdog's d<N> repair launches."""
     return (isinstance(sid, str) and len(sid) > 1 and sid[0] in ("i", "d", "t")
-            and sid[1:].isdigit())
+            and sid[1:].isascii() and sid[1:].isdigit())
 
 
 def _dget(d, key, want):
@@ -1802,6 +1808,9 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     attempt_samples = {k: v for k, v in attempt_samples.items() if v}
     attempt_fail_ids = set(attempt_samples)
     attempt_spawners = {x for v in attempt_samples.values() for x in v}
+    # Did the runner's walk actually SEE a session start? An empty map does not say so on its own —
+    # a journal it could not read, or one whose window scrolled past the slice, is empty too.
+    attempt_delivered = raw_attempts.get("delivered") is True
     # ...and they must come from at least AUTH_DEATH_SPAWNER_CAP INDEPENDENT SPAWNERS. Each spawner
     # runs the launcher in an environment of its own — the runner's, the watchdog's launchd job, an
     # operator's shell or the dashboard — so one of them refusing says only that ITS environment is
@@ -2170,18 +2179,23 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     # (#457) This class's own exit edges, kept apart from the generic one above for the reason its
     # note gives. FIRST: the streak itself cleared, which happens on exactly one thing — a verified
     # delivery — so this may make the claim the generic record makes.
-    # ...and it keys on the SAMPLES being gone, never on the threshold predicate falling. Those are
-    # different facts: the map empties on exactly one event (a verified delivery), while the
-    # predicate can also drop because a sample was lost to a truncated read. Read as a delivery,
-    # that lost sample retracts a standing page mid-outage, lands every launch-cap park the hold was
-    # suppressing, and launches the queue back into the wall — a false record with teeth. A streak
-    # that merely thinned says nothing here; the alert simply stops naming it.
-    if AUTH_DEATH_ALERT_REASON in prev_alert_reasons and not attempt_fail_ids:
+    # ...and it keys on the runner having SEEN a delivery, never on the streak merely being gone.
+    # Those are different facts, and every weaker reading of "gone" has teeth: the threshold can
+    # fall because a sample was lost, and the map can empty because the journal could not be read or
+    # its whole window scrolled past the slice. Read as a delivery, any of those retracts a standing
+    # page mid-outage, lands every launch-cap park the hold was suppressing, and launches the queue
+    # back into the wall. A streak that merely thinned or went unread says nothing here; the alert
+    # stops naming it and the journal records no claim it cannot stand behind.
+    generic_recovered = prev_systemic and not held_now
+    if (AUTH_DEATH_ALERT_REASON in prev_alert_reasons and attempt_delivered
+            and not attempt_fail_ids and not generic_recovered):
         out.append({"act": "launch_recovered",
                     "reason": "a session started again (a canary probe, a recovery relaunch or a "
                               "repair flight) — the machine-wide credential streak is cleared and "
-                              "normal launching resumes in priority order (unless a separate hold "
-                              "still stands)."})
+                              "normal launching resumes in priority order, unless a separate hold "
+                              "still stands. The per-issue launch-cap parks this hold was "
+                              "suppressing resume with it: a lane already at its cap parks on this "
+                              "tick and needs re-approving."})
     # (#457) ...and the OTHER way this class's hold ends: its CONJUNCT falls while the streak still
     # stands. NB the demand conjunct is excluded here on purpose — demand going away (the last lane
     # parks, the queue empties) is not a lift, it is a queue with nothing to hold, and this class
@@ -2207,7 +2221,7 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                               "still stands — and with it the per-issue launch-cap parks this hold "
                               "had been suppressing: a lane already at its cap parks on this tick "
                               "and needs re-approving."})
-    if prev_systemic and not held_now:
+    if generic_recovered:
         out.append({"act": "launch_recovered",
                     "reason": "launch delivery verified again (a canary probe or a restart) — the "
                               "systemic launch streak is cleared and normal launching resumes in "

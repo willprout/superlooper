@@ -326,10 +326,10 @@ def test_debug_reports_a_failed_launch_honestly(rig):
     # The attempt happened: the id is burned (never re-handed out) and the record is honest.
     assert rig.read_wstate()["next_debugger"] == 5
     assert [(x["outcome"]) for x in rig.djournal()] == ["launch_failed"]
-    # ...and it carries the launcher's EXIT CODE, not only the prose (issue #457). This verb runs in
+    # ...and it carries the launcher's EXIT CODE beside the prose (issue #457). This verb runs in
     # its own process, so this record is the whole of what the runner ever hears about a refused
-    # tap — and the runner classifies it through lib/evidence, which needs the rc to name most
-    # refusals (the launcher's stderr arrives here already wrapped in this CLI's own text).
+    # tap, and it classifies it through lib/evidence — which reads the stderr first (relayed here
+    # verbatim) and falls back to the rc for the refusals that name themselves in neither.
     assert rig.djournal()[0]["rc"] == 3
 
 

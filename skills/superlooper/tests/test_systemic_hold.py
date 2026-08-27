@@ -1084,7 +1084,7 @@ def test_a_recovery_lifts_the_hold_and_relabels_nothing():
 
     NOTE the probe is still `unknown` here. The streak clearing is what lifts this hold; an auth
     reading that never answers must not be able to keep it standing."""
-    dsk = disk(launch_anchor={"ok": True}, launch_attempt_streak={"samples": {}},
+    dsk = disk(launch_anchor={"ok": True}, launch_attempt_streak={"samples": {}, "delivered": True},
                auth_probe=_AUTH_UNKNOWN,
                alert={"reasons": [AUTH_DEATH], "since": NOW - 600},
                issues_state={"version": 1, "issues": {}})
@@ -1195,7 +1195,8 @@ def test_a_watchdog_debugger_launch_failure_feeds_the_attempt_streak(rig):
     rig.r.tick(now=NOW)
     _oop(rig, "watchdog", "launch_failed", "d26", ts=NOW + 1, rc=5, signals=["alert"])
     _oop(rig, "watchdog", "launch_failed", "d27", ts=NOW + 2, rc=5, signals=["alert"])
-    assert _streak(rig) == {"samples": {"d26": ["watchdog"], "d27": ["watchdog"]}}
+    assert _streak(rig) == {"samples": {"d26": ["watchdog"], "d27": ["watchdog"]},
+                            "delivered": False}
 
 
 def test_an_owner_tapped_debug_launch_failure_feeds_the_attempt_streak(rig):
@@ -1204,7 +1205,7 @@ def test_an_owner_tapped_debug_launch_failure_feeds_the_attempt_streak(rig):
     rig.r.tick(now=NOW)
     _oop(rig, "debug_launch", "launch_failed", "d29", ts=NOW + 1, rc=7, operator="willprout",
          source="command-center", error="[d29] CLAUDE IDENTITY REFUSED in the session's own env")
-    assert _streak(rig) == {"samples": {"d29": ["operator"]}}
+    assert _streak(rig) == {"samples": {"d29": ["operator"]}, "delivered": False}
 
 
 def test_a_RESUME_is_a_foreign_spawner_however_its_id_is_shaped(rig):
@@ -1218,7 +1219,7 @@ def test_a_RESUME_is_a_foreign_spawner_however_its_id_is_shaped(rig):
          error="[d29] ENV POISONED: ANTHROPIC_API_KEY survived the scrub")
     _oop(rig, "resume", "resume_failed", "i104", ts=NOW + 2, rc=6, session_id="abc",
          error="[i104] ENV POISONED: ANTHROPIC_API_KEY survived the scrub")
-    assert _streak(rig) == {"samples": {"d29": ["operator"], "i104": ["operator"]}}, "one environment"
+    assert _streak(rig)["samples"] == {"d29": ["operator"], "i104": ["operator"]}, "one environment"
     out = decide(parsed_issues=[parsed(5), parsed(6)], usage=_dark_meter(),
                  dsk=disk(launch_anchor={"ok": True}, auth_probe=_AUTH_UNKNOWN,
                           launch_attempt_streak=_streak(rig)))
@@ -1231,7 +1232,7 @@ def test_a_successful_resume_still_clears_the_streak(rig):
     rig.r.tick(now=NOW)
     _oop(rig, "watchdog", "launch_failed", "d26", ts=NOW + 1, rc=5)
     _oop(rig, "resume", "resumed", "i104", ts=NOW + 2, session_id="abc")
-    assert _streak(rig) == {"samples": {}}
+    assert _streak(rig) == {"samples": {}, "delivered": True}
 
 
 def test_a_DELIVERY_CHANNEL_refusal_never_enters_this_streak(rig):
@@ -1285,7 +1286,7 @@ def test_the_runners_OWN_launch_failure_feeds_the_lane_side(rig):
     rig.calls.clear()
     rig.rc_queue.append(runner_mod.ScriptRC(7, "[i101] CLAUDE IDENTITY REFUSED: not logged in"))
     _fly(rig, _launch_action(), NOW + 1)
-    assert _streak(rig) == {"samples": {"i101": ["runner"]}}
+    assert _streak(rig) == {"samples": {"i101": ["runner"]}, "delivered": False}
 
 
 @pytest.mark.parametrize("rec", [
@@ -1304,7 +1305,7 @@ def test_every_verified_delivery_this_runner_makes_clears_the_streak(rec, rig):
     _oop(rig, "watchdog", "launch_failed", "d27", ts=NOW + 2, rc=8)
     assert sorted(_streak(rig)["samples"]) == ["d26", "d27"]
     journal_mod.append(str(rig.home), rec, NOW + 30)
-    assert _streak(rig, NOW + 40) == {"samples": {}}
+    assert _streak(rig, NOW + 40) == {"samples": {}, "delivered": True}
 
 
 @pytest.mark.parametrize("tier", ["idle", "frozen", None])
@@ -1348,7 +1349,7 @@ def test_a_delivery_WRITTEN_LATE_BUT_STAMPED_EARLY_still_clears_the_streak(rig):
     assert sorted(_streak(rig, NOW + 3100)["samples"]) == ["d26", "i104"]
     _mine(rig, "launch", "ok", "i101", ts=NOW)         # stamped 3000s earlier, written last
     for at in (NOW + 3100, NOW + 3300, NOW + 9000):
-        assert _streak(rig, at) == {"samples": {}}, at
+        assert _streak(rig, at) == {"samples": {}, "delivered": True}, at
 
 
 def test_the_streak_NEVER_expires_on_a_clock_however_long_the_outage_runs(rig):
@@ -1363,7 +1364,7 @@ def test_the_streak_NEVER_expires_on_a_clock_however_long_the_outage_runs(rig):
     _oop(rig, "watchdog", "launch_failed", "d26", ts=NOW + 1, rc=5)
     _oop(rig, "debug_launch", "launch_failed", "d29", ts=NOW + 2, rc=7)
     for at in (NOW + 3600, NOW + 6 * 3600 + 60, NOW + 20 * 3600, NOW + 7 * 24 * 3600):
-        assert _streak(rig, at) == {"samples": {"d26": ["watchdog"], "d29": ["operator"]}}, at
+        assert _streak(rig, at)["samples"] == {"d26": ["watchdog"], "d29": ["operator"]}, at
 
 
 def test_only_a_VERIFIED_DELIVERY_ever_clears_it(rig):
@@ -1373,7 +1374,7 @@ def test_only_a_VERIFIED_DELIVERY_ever_clears_it(rig):
     _oop(rig, "watchdog", "launch_failed", "d26", ts=NOW + 1, rc=5)
     _oop(rig, "debug_launch", "launch_failed", "d29", ts=NOW + 2, rc=7)
     _oop(rig, "watchdog", "launched", "d30", ts=NOW + 8 * 24 * 3600)
-    assert _streak(rig, NOW + 8 * 24 * 3600 + 1) == {"samples": {}}
+    assert _streak(rig, NOW + 8 * 24 * 3600 + 1) == {"samples": {}, "delivered": True}
 
 
 def test_a_RESTART_reconstructs_the_whole_streak_including_its_lane_side(rig):
@@ -1389,8 +1390,8 @@ def test_a_RESTART_reconstructs_the_whole_streak_including_its_lane_side(rig):
     reborn = type(rig.r)(repo=str(rig.repo), config=rig.r.config, state_home=str(rig.home),
                          pane="pane-1", run_script=lambda *a, **k: 0,
                          fetch_usage=lambda: {"auth_status": "ok"})
-    assert reborn._launch_attempt_streak(NOW + 20) == {
-        "samples": {"d26": ["watchdog"], "i101": ["runner"]}}
+    assert reborn._launch_attempt_streak(NOW + 20)["samples"] == {
+        "d26": ["watchdog"], "i101": ["runner"]}
 
 
 def test_an_unrelated_journal_record_is_never_read_as_a_verified_delivery(rig):
@@ -1438,7 +1439,8 @@ def test_the_attempt_streak_is_published_for_decide_to_read(rig, monkeypatch):
     _oop(rig, "watchdog", "launch_failed", "d26", ts=NOW + 3, rc=5)
     monkeypatch.setattr(actions, "decide", spy)
     rig.r.tick(now=NOW + 20)
-    assert seen["launch_attempt_streak"] == {"samples": {"d26": ["watchdog"], "d27": ["watchdog"]}}
+    assert seen["launch_attempt_streak"] == {
+        "samples": {"d26": ["watchdog"], "d27": ["watchdog"]}, "delivered": False}
 
 
 # ------------------------- the arc: the 2026-08-26 outage, replayed -------------------------
@@ -1660,8 +1662,8 @@ def test_the_2026_08_26_journal_shape_is_what_this_detector_actually_reads(rig):
                "refused before it started.\n[d29] this environment is not logged in to Claude "
                "(`loggedIn` is False, authMethod 'none')")
     streak = _streak(rig, NOW + 20)
-    assert streak == {"samples": {"d26": ["watchdog"], "d27": ["watchdog"],
-                                  "d28": ["watchdog"], "d29": ["operator"]}}, streak
+    assert streak["samples"] == {"d26": ["watchdog"], "d27": ["watchdog"],
+                                 "d28": ["watchdog"], "d29": ["operator"]}, streak
     out = decide(parsed_issues=[parsed(5)], usage=_dark_meter(),
                  dsk=disk(launch_anchor={"ok": True}, auth_probe=_AUTH_UNKNOWN,
                           launch_attempt_streak=streak))
@@ -1738,7 +1740,7 @@ def test_a_320_hold_lifting_via_RESTART_still_journals_its_own_recovery():
 def test_this_classs_own_streak_clearing_journals_a_recovery_of_its_own():
     """...and its own edge says what actually happened: a session started. It may make that claim —
     a verified delivery is the only thing that clears this streak."""
-    dsk = disk(launch_anchor={"ok": True}, launch_attempt_streak={"samples": {}},
+    dsk = disk(launch_anchor={"ok": True}, launch_attempt_streak={"samples": {}, "delivered": True},
                auth_probe=_AUTH_UNKNOWN,
                alert={"reasons": [AUTH_DEATH], "since": NOW - 600},
                issues_state={"version": 1, "issues": {}})
@@ -1754,8 +1756,7 @@ def test_a_SECOND_spawner_refusing_the_same_session_is_more_evidence_not_less(ri
     """The map keeps every spawner that read a refusal of a session, never just the last. The
     natural sequence makes the difference: the runner cannot relaunch a lane, so the owner hand-
     `resume`s it — two environments refusing the same id. Overwritten, that collapses two spawners
-    to one and the streak reads as CLEARED, which retracts a standing page, lands every launch-cap
-    park the hold was suppressing, and launches the queue back into the wall."""
+    to one, the streak drops below its own threshold, and a SECOND refusal quietly ends the hold."""
     import journal as journal_mod
     rig.r.tick(now=NOW)
     _oop(rig, "debug_launch", "launch_failed", "d26", ts=NOW + 1, rc=7)
@@ -1763,9 +1764,9 @@ def test_a_SECOND_spawner_refusing_the_same_session_is_more_evidence_not_less(ri
         "act": "recover", "id": "i5", "tier": "exited", "outcome": "relaunch rc=7",
         "evidence": {"kind": "launch", "rc": 7, "reason": "claude_identity_wrong",
                      "captured": "x"}}, NOW + 2)
-    assert _streak(rig) == {"samples": {"d26": ["operator"], "i5": ["runner"]}}
+    assert _streak(rig)["samples"] == {"d26": ["operator"], "i5": ["runner"]}
     _oop(rig, "resume", "resume_failed", "i5", ts=NOW + 3, rc=7, session_id="abc")
-    assert _streak(rig) == {"samples": {"d26": ["operator"], "i5": ["operator", "runner"]}}
+    assert _streak(rig)["samples"] == {"d26": ["operator"], "i5": ["operator", "runner"]}
     out = decide(parsed_issues=[parsed(5)], usage=_dark_meter(),
                  dsk=disk(launch_anchor={"ok": True}, auth_probe=_AUTH_UNKNOWN,
                           alert={"reasons": [AUTH_DEATH], "since": NOW},
@@ -1774,15 +1775,35 @@ def test_a_SECOND_spawner_refusing_the_same_session_is_more_evidence_not_less(ri
     assert AUTH_DEATH in _reasons(out), _reasons(out)
 
 
-def test_a_streak_that_merely_THINNED_is_not_a_delivery():
-    """The exit edge keys on the samples being GONE, never on the threshold falling. Only a verified
-    delivery empties the map; a predicate that drops because a sample was lost to a truncated read
-    is not that, and reading it as one retracts a standing page mid-outage, lands the suppressed
-    launch-cap parks and launches back into the wall. A thinned streak simply stops being named."""
+@pytest.mark.parametrize("streak,why", [
+    ({"samples": {"i5": ["runner"]}}, "a sample lost to a truncated read"),
+    ({"samples": {}}, "the whole window lost, or a journal that could not be read"),
+    ({"samples": {}, "delivered": False}, "a journal read that saw no delivery at all"),
+])
+def test_a_streak_that_merely_WENT_AWAY_is_not_a_delivery(streak, why):
+    """The exit edge keys on the runner having SEEN a session start, never on the streak merely
+    being gone. Every weaker reading has teeth: a lost sample drops the threshold, and an unreadable
+    or scrolled-past journal empties the map — read as a delivery, any of them retracts a standing
+    page mid-outage, lands the launch-cap parks the hold was suppressing and launches back into the
+    wall. Those parks and that relaunch still happen (the hold is gone either way); what must not
+    happen is the loop recording that a launch was verified when none was."""
     dsk = disk(launch_anchor={"ok": True}, auth_probe=_AUTH_UNKNOWN,
-               launch_attempt_streak={"samples": {"i5": ["runner"]}},   # d26 fell off the slice
+               launch_attempt_streak=streak,
                alert={"reasons": [AUTH_DEATH, "usage_stale"], "since": NOW - 600},
                issues_state={"version": 1, "issues": {
                    "i5": ist("ready", launch_failures=actions.LAUNCH_FAILURE_CAP)}})
     out = decide(parsed_issues=[parsed(5), parsed(6)], dsk=dsk, usage=_dark_meter())
-    assert only(out, "launch_recovered") == [], out
+    assert only(out, "launch_recovered") == [], why
+    # ...and the tick is not pretending otherwise: the hold really is gone, so the at-cap lane parks
+    # and the queue flies again. That is the honest consequence; the false RECORD is what is barred.
+    assert [a["id"] for a in only(out, "park")] == ["i5"], why
+
+
+def test_a_journal_the_runner_could_not_read_publishes_no_delivery(rig):
+    """...and the runner says so at the source. Its self-guard returns an empty map, which without
+    the flag beside it is indistinguishable from a session having started."""
+    rig.r.tick(now=NOW)
+    _oop(rig, "watchdog", "launch_failed", "d26", ts=NOW + 1, rc=5)
+    assert _streak(rig)["delivered"] is False
+    (rig.home / "journal.jsonl").unlink()
+    assert _streak(rig) == {"samples": {}, "delivered": False}, "an empty read is not a delivery"
