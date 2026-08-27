@@ -600,3 +600,28 @@ def test_the_operator_comes_from_the_record_never_the_dashboards_configured_name
 def test_a_non_launch_act_named_debug_never_hijacks_the_banner():
     out = fixer_mod.last_launch([{"act": "resume", "outcome": "resume_failed", "id": "i23"}])
     assert out["present"] is False
+
+
+def test_a_launched_fixer_whose_id_is_not_a_seat_offers_no_way_in():
+    # Fresh-agent review (P1). `id` is a JOURNAL string — a corrupt line, or a shape a newer engine
+    # invents, can put anything there. Gating the open-session affordance on "the record has an id"
+    # rendered a button that posts a target the route refuses at 400: a dead control, and a surface
+    # claiming a window it cannot reach. The gate is now the SAME fence the route uses.
+    out = fixer_mod.last_launch([_launch_rec(id="not-a-lane")])
+    assert out["outcome"] == fixer_mod.LAUNCHED     # the engine's word stands
+    assert out["id"] == "not-a-lane"                # and the record is reported as it reads
+    assert out["lane"] is None
+    assert out["session"] is False, "no seat this board can open ⇒ no button"
+    assert "no seat" in out["text"], "and the sentence must say why, not quietly drop it"
+
+
+def test_the_seat_the_affordance_targets_is_canonical_not_the_journals_bytes():
+    out = fixer_mod.last_launch([_launch_rec(id=" d04 ")])
+    assert out["lane"] == "d4", "the wire value is rebuilt from a parsed integer, never passed through"
+    assert out["id"] == "d04", "the record is still reported as it reads"
+    assert out["session"] is True
+
+
+def test_a_failed_launch_never_carries_a_seat_to_open():
+    out = fixer_mod.last_launch([_launch_rec(outcome="launch_failed", error="no pane")])
+    assert out["lane"] is None and out["session"] is False

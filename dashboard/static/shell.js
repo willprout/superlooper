@@ -390,11 +390,13 @@
     if (!f || !f.present) return "";     // no tap has ever been made here — the one honest silence
     // The affordance a launched fixer gets is the SAME verb the flight card already has, pointed at
     // the fixer's own d<N> seat. It rides `f.session`, which the server sets for exactly one state:
-    // a launch the engine confirmed AND named. A button onto a window that was never opened would
-    // be the same lie in a different costume.
+    // a launch the engine confirmed and named with a seat the endpoint behind this button will
+    // accept. The wire value is `f.lane` — the server's CANONICAL seat — never the journal's own
+    // `f.id`, which is whatever a record happened to carry. A button onto a window that was never
+    // opened, or one that 400s when tapped, is the same lie in a different costume.
     var open = f.session
       ? '<button class="tf-open" data-act="session-window" data-repo="' + esc(slug) + '"' +
-          ' data-fixer="' + esc(f.id) + '" title="Bring this fixer’s own session window to the' +
+          ' data-fixer="' + esc(f.lane) + '" title="Bring this fixer’s own session window to the' +
           ' front — the real terminal, so you can watch it and type into it.">' +
           '\u{1F5A5}\uFE0F Open session window</button>'
       : "";

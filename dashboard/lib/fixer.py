@@ -77,6 +77,7 @@ import time
 from pathlib import Path
 
 import flights
+import session_window
 
 # Per-call hard timeout (seconds) for the CLI, which opens a session window and VERIFIES delivery. A
 # module constant, not a literal, so a test can shrink it and trip the timeout path (mirrors
@@ -471,16 +472,23 @@ def launch_outcome(rec):
 def _blank_launch():
     """The absent block — every key present, so a caller never branches on a missing one (the shape
     ``lib/session_window`` holds for the same reason)."""
-    return {"present": False, "outcome": None, "id": None, "operator": None, "ts": None,
-            "reason": "", "recorded": "", "headline": "", "text": "", "session": False}
+    return {"present": False, "outcome": None, "id": None, "lane": None, "operator": None,
+            "ts": None, "reason": "", "recorded": "", "headline": "", "text": "", "session": False}
 
 
-def _launch_sentence(outcome, name, operator, reason, recorded):
+def _launch_sentence(outcome, name, operator, reason, recorded, lane):
     """The one plain sentence the surface binds, composed HERE so the wording is pinned by a test and
     the pixels carry no opinion about what a launch outcome means."""
     if outcome == LAUNCHED:
         by = (" by %s" % operator) if operator else ""
-        return "%s launched%s — it has its own session window." % (name, by)
+        if lane:
+            return "%s launched%s — it has its own session window." % (name, by)
+        # The engine's word stands — a session launched — but the record names no seat this board
+        # can point at, so there is no way in to offer. Saying so is the honest half of that: a
+        # sentence that promised a window while the button was missing would be the same over-claim
+        # this issue exists to kill (fresh-agent review, P1).
+        return ("%s launched%s — it has its own session window, but the journal records no seat "
+                "this board can open." % (name, by))
     if outcome == FAILED:
         return "%s did not launch — %s." % (name, reason)
     if recorded:
@@ -535,10 +543,16 @@ def last_launch(records):
     ts = ts if isinstance(ts, (int, float)) and not isinstance(ts, bool) and math.isfinite(ts) else None
 
     name = ("Fixer %s" % sid) if sid else "The fixer"
-    return {"present": True, "outcome": outcome, "id": sid, "operator": operator, "ts": ts,
-            "reason": reason, "recorded": recorded, "headline": _HEADLINES[outcome],
-            "text": _launch_sentence(outcome, name, operator, reason, recorded),
+    # The seat the open-session affordance may target, canonicalised by the SAME fence the route
+    # validates against (``lib/session_window.debugger_lane_id``) — one definition of what a fixer
+    # seat is, so the surface can never offer a button the endpoint behind it refuses. ``id`` stays
+    # the journal's own string (that is what the record says); ``lane`` is what may go on a wire.
+    lane = session_window.debugger_lane_id(sid) if outcome == LAUNCHED else None
+    return {"present": True, "outcome": outcome, "id": sid, "lane": lane, "operator": operator,
+            "ts": ts, "reason": reason, "recorded": recorded, "headline": _HEADLINES[outcome],
+            "text": _launch_sentence(outcome, name, operator, reason, recorded, lane),
             # The open-session affordance the flight card already has, offered for the fixer's own
-            # d<N> lane — but only on a launch the engine CONFIRMED and NAMED. Offering it on a
-            # failure would be a button pointed at a window that was never opened.
-            "session": outcome == LAUNCHED and sid is not None}
+            # d<N> lane — but only on a launch the engine CONFIRMED and named with a seat this board
+            # can actually open. On a failure it would point at a window that was never opened; on a
+            # corrupt id it would be a dead control that 400s when tapped.
+            "session": lane is not None}

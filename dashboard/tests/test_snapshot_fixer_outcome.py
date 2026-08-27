@@ -27,6 +27,7 @@ import shutil
 import pytest
 
 import fixer as fixer_mod
+import readers
 import server
 
 FIXTURE = os.path.join(os.path.dirname(__file__), "fixtures", "statehome")
@@ -159,6 +160,25 @@ def test_the_outcome_comes_from_the_published_view_not_a_new_read(home):
     tower = [r for r in snap["repos"][0]["tower_log"] if "Fixer" in r["text"]]
     assert tower, "the same record must still gloss into the tower log — one source, two renderings"
     assert "claude auth expired" in tower[0]["text"]
+
+
+def test_the_journal_is_read_exactly_once_for_the_whole_slice(home, monkeypatch):
+    # The sharper half of "no new server reads" (fresh-agent review nit): the guard below proves the
+    # dashboard's own fixer log is never opened, but it would have stayed green if the outcome came
+    # from a SECOND pass over journal.jsonl. It does not — the block is derived from the very list
+    # the tower log is glossed from, so one repo's assembly reads that file exactly once.
+    _journal(home, _launch(outcome="launch_failed", error="claude auth expired"))
+    real = readers.read_journal
+    calls = []
+
+    def counting(h):
+        calls.append(h)
+        return real(h)
+
+    monkeypatch.setattr(readers, "read_journal", counting)
+    snap = _snap(home)
+    assert snap["repos"][0]["fixer"]["outcome"] == fixer_mod.FAILED
+    assert len(calls) == 1, "the outcome must ride the journal read the tower log already makes"
 
 
 def test_the_assembler_never_opens_the_dashboards_own_fixer_log(home, monkeypatch, tmp_path):

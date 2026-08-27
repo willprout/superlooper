@@ -257,3 +257,14 @@ def test_the_outcome_has_a_style_of_its_own_in_all_three_states():
         assert re.search(r"\.trouble-fixer\.%s\b" % state, _CSS), (
             "the %r outcome must be visually distinct — three states that look identical are one "
             "state wearing three names" % state)
+
+
+def test_the_affordance_targets_the_servers_canonical_seat_not_the_journals_own_string():
+    # Fresh-agent review (P1). `id` is whatever the journal line carried; `lane` is the seat the
+    # server canonicalised through the SAME fence the endpoint validates against. Binding `id` here
+    # would ship a button that 400s the moment a record carries an id the route refuses.
+    body = _fixer_outcome_body()
+    assert re.search(r"data-fixer=\"'\s*\+\s*esc\(f\.lane\)", body), (
+        "the open-session button must carry f.lane — the server's canonical d<N> seat")
+    assert not re.search(r"data-fixer=\"'\s*\+\s*esc\(f\.id\)", body), (
+        "it must never put the journal's raw id on the wire")
