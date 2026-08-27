@@ -435,12 +435,15 @@ ALERT_MESSAGES = {
                                "ANTHROPIC_API_KEY / ANTHROPIC_BASE_URL / CLAUDE_CODE_* the launch "
                                "floor could not scrub — find it in a shell rc file, a LaunchAgent "
                                "or a wrapper. `superlooper doctor` checks all three. Launches are "
-                               "HELD: the hold itself parks nothing and moves no label, and a probe "
-                               "launch every few minutes lifts it the moment one flies — a lane "
-                               "that reached its OWN cap before the outage was proven may already "
-                               "have parked; re-approve that one. IF INSTEAD these were unrelated "
-                               "faults, that probe clears this within minutes and no re-approval "
-                               "is owed. This is NOT a cmux/App Nap fault.",
+                               "HELD: the hold itself parks nothing and moves no label, and it "
+                               "lifts by itself the moment ANY flight flies — a probe launch of an "
+                               "approved issue, a recovery relaunch of an in-flight lane, or a "
+                               "repair session. If nothing is approved and no lane is in flight "
+                               "there is nothing to fly, so the hold simply waits for the first "
+                               "one. A lane that reached its OWN cap before the outage was proven "
+                               "may already have parked; re-approve that one. IF INSTEAD these "
+                               "were unrelated faults, the first flight clears this and no "
+                               "re-approval is owed. This is NOT a cmux/App Nap fault.",
     "claude_identity_wrong_workers": "CLAUDE CODE is unusable in every WORKER environment (issue "
                                      "#320): several distinct lanes in a row refused their flight "
                                      "because, from inside the SESSION's own environment, `claude "
@@ -1718,6 +1721,17 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
         return ("agent-ready" in labels and "in-progress" not in labels
                 and _status_of(ist_of(iid)) in RELAUNCHABLE_STATUSES)
     has_pending_launch = any(_held_queue_member(iid, p) for iid, p in parsed_by_id.items())
+    # A recovery relaunch is spend demand too — a dead-auth reading with no fresh queue but an
+    # in-flight lane (an ORPHAN RESUME after a restart, a crash relaunch, a conflict resolve) must
+    # still surface and never hold SILENTLY (fresh-review P1 sub-note; i336 was a recovery scenario).
+    # `in-progress`-labelled == an in-flight lane that may relaunch this tick; the exited marker is a
+    # backstop for a lane whose label move hasn't landed. Loose by design: over-surfacing dead auth is
+    # fail-safe, it auto-clears on the next healthy probe, and a terminal lane's marker is cleaned.
+    has_relaunch_demand = (
+        any(isinstance(p, dict) and isinstance(p.get("labels"), list)
+            and "in-progress" in p["labels"]
+            for p in parsed_by_id.values())
+        or any(_iid_num(k) is not None for k in exited))
     # Account-level AUTH gate (issue #159 / forensics U3). The runner hands us a `claude auth status`
     # + credential-keychain snapshot when a spend is pending; a DEFINITIVE dead reading (valid is
     # literally False — the CLI is not-logged-in, or the keychain item is gone) means a fresh launch
@@ -1755,17 +1769,27 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     raw_attempts = dsk.get("launch_attempt_fail_ids")
     attempt_fail_ids = {x for x in raw_attempts if _is_session_id(x)} \
         if isinstance(raw_attempts, (list, set, tuple, frozenset)) else set()
-    # ...and at least one of them must be a flight the QUEUE DOES NOT OWN — a watchdog repair
-    # session, an owner's Debug tap. That is the discriminator, and it is what keeps the owner's own
-    # rule (2026-08-03, quoted at SYSTEMIC_ENV_FAILURE_CAP) intact: "two different environment
-    # faults with one lane each is the one-off case twice over, not an outage". Two lanes with two
-    # separately broken worktrees are exactly that, and this class must not escalate them — each
-    # parks with its own memo, as #320 decided. A d<N> flight is different in kind: it runs in the
-    # repo's own checkout, not in any lane's worktree, so a credential refusal there is a statement
-    # about the MACHINE that no per-lane accounting can explain away. It is also, precisely, the
-    # evidence #320 structurally cannot count: its streaks are made of issue lanes.
+    # ...and the samples must span BOTH SIDES: at least one queued issue's LANE, and at least one
+    # flight the queue does not own (a watchdog repair session, an owner's Debug tap, a resume).
+    # That two-sided requirement is the discriminator, and each half rules out a different way of
+    # being wrong about the same evidence:
+    #
+    #   * LANES ONLY is the owner's own case (2026-08-03, quoted at SYSTEMIC_ENV_FAILURE_CAP):
+    #     "two different environment faults with one lane each is the one-off case twice over, not
+    #     an outage". Two separately broken worktrees must park with their own memos, not freeze the
+    #     healthy queue behind them.
+    #   * NON-LANES ONLY is the mirror, and just as real: the watchdog mints a FRESH d<N> for every
+    #     retry of ONE episode (three per episode), and the refusals those flights carry — the
+    #     runner-env gh, the fleet config dir, a poisoned env — are read in the SPAWNER's own
+    #     environment. A watchdog started by launchd with a bare PATH refuses every flight
+    #     identically while the runner's own launches are demonstrably fine, and reading that as the
+    #     machine would freeze a healthy queue on a page saying nothing can start at all.
+    #
+    # Both together are the thing neither the lanes nor the spawner can explain away — and, exactly,
+    # the evidence #320 structurally cannot count: its streaks are made of issue lanes.
     attempt_streak = (len(attempt_fail_ids) >= AUTH_DEATH_LAUNCH_CAP
-                      and any(_iid_num(x) is None for x in attempt_fail_ids))
+                      and any(_iid_num(x) is None for x in attempt_fail_ids)
+                      and any(_iid_num(x) is not None for x in attempt_fail_ids))
     # Not affirmatively alive: `unknown` (the probe would not answer), absent (no probe was fed),
     # or a definitive dead reading. Only a positive `valid is True` clears this conjunct.
     auth_unconfirmed = not (isinstance(auth_probe, dict) and auth_probe.get("valid") is True)
@@ -1783,7 +1807,14 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     # more specific class. That page is an IMPROVEMENT (a vaguer cause replaced by a precise one
     # with a precise remedy), and it is bounded to once: the naming rule above already gives an
     # agreeing streak the same specific name, so the common case renames nothing.
-    already_named = anchor_down or systemic_launch or systemic_env or auth_invalid
+    # ...and it is muted by the reason a specific class actually RAISES, not by that class's
+    # detector flag. Two of them are demand-gated more narrowly than this one is (the anchor alert
+    # needs a FRESH launch pending; auth_dead and this class also count an in-flight lane), so
+    # muting on the flag produced a queue held with nothing said at all — the one outcome worse
+    # than a hold with a vague name.
+    anchor_named = anchor_down and has_pending_launch
+    auth_dead_named = auth_invalid and (has_pending_launch or has_relaunch_demand)
+    already_named = anchor_named or systemic_launch or systemic_env or auth_dead_named
     systemic_auth_death = attempt_streak and (episode_active or auth_unconfirmed) \
         and not already_named
     # ONE degraded mode for every detector above: hold every fresh launch and suppress the
@@ -1800,17 +1831,6 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     # anchor / auth detectors this raises NO alert and enters NO streak — a sleeping display is normal,
     # expected behavior (the owner's Mac overnight), not a fault to page on.
     display_asleep = dsk.get("display_asleep") is True
-    # A recovery relaunch is spend demand too — a dead-auth reading with no fresh queue but an
-    # in-flight lane (an ORPHAN RESUME after a restart, a crash relaunch, a conflict resolve) must
-    # still surface and never hold SILENTLY (fresh-review P1 sub-note; i336 was a recovery scenario).
-    # `in-progress`-labelled == an in-flight lane that may relaunch this tick; the exited marker is a
-    # backstop for a lane whose label move hasn't landed. Loose by design: over-surfacing dead auth is
-    # fail-safe, it auto-clears on the next healthy probe, and a terminal lane's marker is cleaned.
-    has_relaunch_demand = (
-        any(isinstance(p, dict) and isinstance(p.get("labels"), list)
-            and "in-progress" in p["labels"]
-            for p in parsed_by_id.values())
-        or any(_iid_num(k) is not None for k in exited))
     # launches_held folds auth AND a sleeping display (#124) into the same fresh-launch suppression the
     # anchor/systemic detectors use, so the queue is held intact (never parked) while either stands,
     # exactly as under a dead anchor. The recovery-relaunch and orphan-resume holds are applied

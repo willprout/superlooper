@@ -18,6 +18,7 @@ Executor <-> action contract: see actions.py's module docstring. Every action is
 with its outcome (journal.jsonl — the morning report and the ratchet read it).
 """
 import json
+import math
 import os
 import re
 import signal
@@ -134,6 +135,14 @@ LAUNCH_BASE_MISSING_RC = 3
 # queue on it. Six hours is generous next to the shapes this must catch (the watchdog's three
 # flights land inside ten minutes) and far short of letting last night's outage hold this morning.
 AUTH_DEATH_STREAK_WINDOW_SECONDS = 6 * 3600
+# How far BACK of its own watermark the absorb re-reads each tick (issue #457). This runner stamps
+# its journal records with the clock the TICK started on, while the other spawners stamp real wall
+# time — so a record written late in a long tick carries an EARLY timestamp and a strict watermark
+# would skip it. Skipping a refusal costs a sample; skipping a verified DELIVERY leaves a hold
+# standing over a machine that recovered, so the overlap is sized to the longest a launch may take.
+# Replaying a suffix in file order is idempotent (a re-added id is the same id, a repeated clear is
+# the same clear), which is what makes the overlap free.
+ABSORB_REPLAY_SECONDS = LAUNCH_TIMEOUT
 # The acts the OUT-OF-PROCESS spawners journal their launch outcomes under (issue #457). The
 # watchdog's check and `superlooper debug` each run in their own process against the SAME launcher,
 # so the journal — which all three already write — is the only place the runner can hear that a
@@ -143,10 +152,12 @@ AUTH_DEATH_STREAK_WINDOW_SECONDS = 6 * 3600
 # WHEN A FOURTH SPAWNER APPEARS, ITS ACT BELONGS HERE. The triage flight (#448) ships disabled and
 # journals no launch act yet; `actions._is_session_id` already admits its `t<N>` ids, so wiring it
 # is one row here and nothing else.
-OUT_OF_PROCESS_LAUNCH_ACTS = ("watchdog", "debug_launch", "resume")
-# Each of those verbs spells its own outcomes. One table, so a fourth spawner is a row and not a
-# branch — and so a verb whose success this runner cannot recognise can never leave a hold standing
-# over a machine that has demonstrably started a session (`resume` was exactly that miss).
+# Each verb spells its own outcomes, so this is a table and not a branch — and WHEN A FOURTH
+# SPAWNER APPEARS ITS ROW BELONGS HERE. The triage flight (#448) ships disabled and journals no
+# launch act yet; `actions._is_session_id` already admits its `t<N>` ids, so wiring it is one row.
+# A verb whose success this runner cannot recognise leaves a hold standing over a machine that has
+# demonstrably started a session (`resume` was exactly that miss), which is why the table is the
+# first place to look when one is added.
 OUT_OF_PROCESS_OUTCOMES = {
     "watchdog": ("launched", "launch_failed"),
     "debug_launch": ("launched", "launch_failed"),
@@ -167,8 +178,24 @@ OUT_OF_PROCESS_OUTCOMES = {
 # disarm this detector during exactly the outage it is for. The cost of the narrowness is a rare
 # missed clear on a restart (a recover-tier relaunch), which the 6h window and the recovery probe
 # both bound.
-RUNNER_LAUNCH_ACT = "launch"
-RUNNER_LAUNCH_OK = "ok"
+# This runner's OWN verified deliveries, as the journal records them. The absorb has to recognise
+# these to get the CHRONOLOGY right across a restart: the streak is "consecutive failures with no
+# success BETWEEN them", and a fresh process re-reads a bounded tail that may still contain
+# refusals which one of this runner's own launches has since answered. Live, `_delivery_cleared`
+# has already cleared them and this is a no-op; after a restart it is the only thing that knows.
+#
+# All three launch paths are here, and the recovery relaunch is the load-bearing one: the
+# machine-wide hold deliberately does NOT suppress it (see actions.py's note in the exited-recovery
+# ladder), which makes it the only flight an all-in-flight machine has left — so a reborn runner
+# that could not recognise its success would hold a machine that had visibly recovered.
+#
+# `recover` is keyed on the TIER as well as the outcome: it reads "ok" for a delivered NUDGE too,
+# and a nudge proves nothing about starting a session — an i336 lane whose auth died in-process
+# answers nudges all day. Only the `exited` tier relaunches.
+RUNNER_DELIVERY_OK = "ok"
+RUNNER_LAUNCH_ACTS = ("launch", "resolve_conflict")
+RUNNER_RELAUNCH_ACT = "recover"
+RUNNER_RELAUNCH_TIERS = ("exited",)
 # WHICH refusals are evidence about the MACHINE (issue #457). Not every failed launch is: a
 # worktree that would not create, a brief that could not be written, a missing base branch name
 # THIS issue's own state, and two of those in a row are two broken lanes, not a broken machine —
@@ -3272,19 +3299,34 @@ class Runner:
         except Exception:                              # pragma: no cover - defensive
             return
         cutoff = now - AUTH_DEATH_STREAK_WINDOW_SECONDS
-        seen = self._journal_watermark
-        fresh = [(r.get("ts"), r) for r in records
-                 if isinstance(r.get("ts"), (int, float)) and not isinstance(r.get("ts"), bool)
-                 and seen < r["ts"] and r["ts"] >= cutoff]
-        # BY TIMESTAMP, not file order. "Consecutive, with no success between them" is a claim about
-        # WHEN things happened, and file order is not that: this runner stamps its records with the
-        # clock the TICK started on while the other spawners stamp real wall time, and a launch may
-        # take up to LAUNCH_TIMEOUT — so a verified delivery can be written after, but happened
-        # before, a refusal another process recorded meanwhile.
-        for at, rec in sorted(fresh, key=lambda pair: pair[0]):
-            self._journal_watermark = max(self._journal_watermark, at)
+        # IN FILE ORDER, which is the true completion order: append() is one O_APPEND write per
+        # record, so every writer lands in the order things actually finished. The `ts` FIELD is the
+        # thing that can lie — this runner stamps its records with the clock the TICK started on
+        # while the other spawners stamp real wall time, and a launch may take up to LAUNCH_TIMEOUT,
+        # so sorting by ts would put a delivery BEFORE a refusal that really preceded it and keep a
+        # streak the delivery had already answered.
+        #
+        # The watermark is therefore a dedup, not an ordering: it skips what was consumed before.
+        # It is deliberately LAGGED by that same skew, so a record written late but stamped early is
+        # still seen. Re-reading an overlap costs nothing — replaying a suffix in file order lands
+        # on the same state it landed on the first time (a re-added id is the same id; a repeated
+        # clear is the same clear) — while missing a CLEAR would leave a hold standing.
+        seen = self._journal_watermark - ABSORB_REPLAY_SECONDS
+        for rec in records:
+            at = rec.get("ts")
+            if not isinstance(at, (int, float)) or isinstance(at, bool) or not math.isfinite(at):
+                continue
+            if at <= seen or at < cutoff:
+                continue
+            # CLAMPED to this tick's clock: a record stamped in the future — a clock step, a
+            # restored state home — would otherwise push the watermark past every record that
+            # follows it and silently deafen this absorb until wall time caught up.
+            self._journal_watermark = max(self._journal_watermark, min(at, now))
             act, outcome = rec.get("act"), rec.get("outcome")
-            if act == RUNNER_LAUNCH_ACT and outcome == RUNNER_LAUNCH_OK:
+            if outcome == RUNNER_DELIVERY_OK and (
+                    act in RUNNER_LAUNCH_ACTS
+                    or (act == RUNNER_RELAUNCH_ACT
+                        and rec.get("tier") in RUNNER_RELAUNCH_TIERS)):
                 self._launch_attempt_fails = {}        # this runner's own verified delivery
                 continue
             if act not in OUT_OF_PROCESS_OUTCOMES or not isinstance(outcome, str):
