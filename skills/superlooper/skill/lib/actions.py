@@ -429,26 +429,27 @@ ALERT_MESSAGES = {
     # construction has not settled on one. The queue lanes' own park memos and the journal carry the
     # per-flight classification for whoever wants it. It also says the alternative reading out loud:
     # this is the widest net the layer casts, so it is the one most able to be wrong.
-    "claude_auth_dead_machine": "NOTHING ON THIS MACHINE CAN START A SESSION (issue #457): several "
+    # The remedies lead, deliberately: this is the longest body the loop sends, and a push channel
+    # that truncates (Pushover caps at 1024 chars) must cut the explanation rather than the fix.
+    "claude_auth_dead_machine": "NOTHING ON THIS MACHINE CAN START A SESSION (issue #457). Every "
+                               "refusal was the launcher saying the IDENTITY or the ENVIRONMENT a "
+                               "session would run under is wrong, so the repair is one of three "
+                               "and the failing flights' own evidence in the journal says which: "
+                               "(1) `claude auth status` under the fleet's config dir is logged "
+                               "out or on the wrong account — log back in from a supervised "
+                               "window; (2) `gh auth login --hostname github.com` as the account "
+                               "that owns the loop repo; (3) an exported ANTHROPIC_API_KEY / "
+                               "ANTHROPIC_BASE_URL / CLAUDE_CODE_* the launch floor could not "
+                               "scrub — find it in a shell rc file, a LaunchAgent or a wrapper. "
+                               "`superlooper doctor --stack` checks the first two (nothing checks "
+                               "the third). WHAT WAS SEEN: several "
                                "flights in a row refused before they started, with no successful "
                                "launch between them — from at least TWO INDEPENDENT SPAWNERS (this "
                                "runner, the watchdog's own job, an owner-typed verb), and at least "
                                "one of them a session with no worktree of its own, so neither one "
                                "environment nor one lane explains it — while "
                                "the usage meter was unreadable and/or `claude auth status` would "
-                               "not confirm the account this machine assigns workers. Every one of "
-                               "those refusals was the launcher saying the IDENTITY or the "
-                               "ENVIRONMENT a session would run under is wrong, so the repair is "
-                               "one of three and the failing flights' own evidence in the journal "
-                               "says which: (1) `claude auth status` under the fleet's config dir "
-                               "is logged out or on the wrong account — log back in from a "
-                               "supervised window; (2) `gh auth login --hostname github.com` as "
-                               "the account that owns the loop repo; (3) an exported "
-                               "ANTHROPIC_API_KEY / ANTHROPIC_BASE_URL / CLAUDE_CODE_* the launch "
-                               "floor could not scrub — find it in a shell rc file, a LaunchAgent "
-                               "or a wrapper. `superlooper doctor --stack` checks the first two "
-                               "(nothing checks the third; the failing flights' stderr is what "
-                               "names it). Launches are "
+                               "not confirm the account this machine assigns workers. Launches are "
                                "HELD: the hold itself parks nothing and moves no label, and it "
                                "lifts by itself the moment ANY flight flies — a probe launch of an "
                                "approved issue, a recovery relaunch of an exited lane, or a repair "
@@ -1869,7 +1870,19 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     # feeding an auth probe the moment there is no spend pending, so a class that kept evaluating
     # its conjunct through that gap would read the probe's disappearance as the account coming back
     # — ending the hold, and journaling a lift, because the QUEUE emptied.
-    auth_death_demand = has_pending_launch or has_relaunch_demand
+    # ...and it asks for demand of its OWN rather than borrowing #159's, over one clause. That one
+    # counts a bare `state/exited/<id>` marker, which start-session.sh writes on EVERY session exit
+    # and only the relaunch paths remove — never a park, never a teardown — so the owner's live
+    # machine has carried one for a lane that merged on 2026-07-11. #159 is deliberately loose
+    # there and can afford to be: its reading auto-clears on the next healthy probe. This class
+    # HOLDS a queue and pages until a flight flies, and on an idle machine there is no flight to
+    # make — so a marker nobody will ever act on would page a quiet machine and never retract.
+    # A marker whose lane is NOT terminal still counts (its recovery ladder may yet relaunch it),
+    # and so does one the state file has forgotten entirely — fail-safe, exactly as #159 is.
+    auth_death_demand = has_pending_launch or any(
+        isinstance(p, dict) and isinstance(p.get("labels"), list) and "in-progress" in p["labels"]
+        for p in parsed_by_id.values()) or any(
+        _iid_num(k) is not None and _status_of(ist_of(k)) not in TERMINAL_STATUSES for k in exited)
     systemic_auth_death = (attempt_streak and auth_death_demand
                            and (episode_active or auth_unconfirmed) and not already_named)
     # ONE degraded mode for every detector above: hold every fresh launch and suppress the

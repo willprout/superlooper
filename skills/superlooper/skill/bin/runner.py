@@ -5326,10 +5326,15 @@ class Runner:
         return a.get("reason", "usage meter readable again — normal usage gating resumed")
 
     def _exec_launch_recovered(self, a, now):
-        """Issue #115: a verified delivery (a canary probe or a restart) cleared the systemic-launch
-        streak, so the #24 hold is lifting. Journal-only — normal launching resumes via the empty
-        streak and the systemic ALERT is retracted by decide's reasons diff; the outcome text records
-        the recovery. Emitted ONCE per episode by decide (deduped on the durable ALERT marker)."""
+        """Issue #115: a launch hold is LIFTING. Journal-only — normal launching resumes via the
+        empty streak and the ALERT is retracted by decide's reasons diff; the outcome text is the
+        record. Emitted ONCE per episode by decide (deduped on the durable ALERT marker).
+
+        Three holds write this act now and they do not all mean the same thing, so the REASON is
+        the record and this docstring must not paraphrase it: #24/#320's says a verified delivery
+        cleared the systemic-launch streak; #457's delivery edge says a session started again;
+        #457's other edge says its conjunct fell with the refusal streak UNCHANGED — a real lift,
+        but explicitly not a delivery, and it says so in as many words."""
         return a.get("reason", "launch delivery verified again — the systemic launch hold is cleared")
 
     def _exec_morning_report(self, a, now):

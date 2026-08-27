@@ -1678,6 +1678,12 @@ def test_the_streak_reason_registry_matches_the_classifier_it_mirrors():
     emitted = {r for r, _ in evidence_mod._LAUNCH_RC.values()}
     assert runner_mod.AUTH_DEATH_STREAK_REASONS <= emitted, \
         runner_mod.AUTH_DEATH_STREAK_REASONS - emitted
+    # ...and the other direction, which is #320's own promise: "adding a class is this frozenset
+    # plus one row in LAUNCH_ALERT_REASONS. Nothing about the detector, the hold, the recovery probe
+    # or the resume edge changes." A fourth escalatable reason added on those instructions must feed
+    # this streak too, or it silently would not.
+    assert evidence_mod.SYSTEMIC_ESCALATION_REASONS <= runner_mod.AUTH_DEATH_STREAK_REASONS, \
+        evidence_mod.SYSTEMIC_ESCALATION_REASONS - runner_mod.AUTH_DEATH_STREAK_REASONS
     # ...and none of them is a CHANNEL fault: those hold on their first entry under their own name.
     assert not (runner_mod.AUTH_DEATH_STREAK_REASONS & evidence_mod.CHANNEL_FAULT_REASONS
                 - {"gh_auth_dead_runner", "claude_identity_wrong_runner"})
@@ -1807,3 +1813,54 @@ def test_a_journal_the_runner_could_not_read_publishes_no_delivery(rig):
     assert _streak(rig)["delivered"] is False
     (rig.home / "journal.jsonl").unlink()
     assert _streak(rig) == {"samples": {}, "delivered": False}, "an empty read is not a delivery"
+
+
+def test_a_STALE_exited_marker_is_not_demand_this_class_can_page_on():
+    """#159's relaunch-demand reading counts a bare `state/exited/<id>` marker, and start-session.sh
+    writes one on EVERY session exit while only the relaunch paths remove it — never a park, never a
+    teardown. The owner's live machine has carried one for a lane that merged on 2026-07-11. #159
+    can afford that looseness (its reading auto-clears on the next healthy probe); this class holds
+    a queue and pages until a flight flies, and on an idle machine there is no flight to make — so
+    the page would stand forever on a marker nobody will ever act on."""
+    dsk = _attempts(["i5", "d26"], auth_probe=_AUTH_UNKNOWN,
+                    exited={"i40": "1783801109 rc=137"},
+                    issues_state={"version": 1, "issues": {"i40": ist("merged")}})
+    out = decide(parsed_issues=[], dsk=dsk, usage=_dark_meter())
+    assert AUTH_DEATH not in _reasons(out), _reasons(out)
+
+
+def test_an_exited_marker_for_a_LIVE_lane_is_demand_and_still_pages():
+    """...and the clause is kept, not dropped: a lane the recovery ladder may yet relaunch is a
+    flight about to be attempted, which is exactly what this hold denies. A lane the state file has
+    forgotten entirely counts too — fail-safe, the way #159 is."""
+    for ist_map in ({"i41": ist("exited")}, {}):
+        dsk = _attempts(["i5", "d26"], auth_probe=_AUTH_UNKNOWN, exited={"i41": "x"},
+                        issues_state={"version": 1, "issues": ist_map})
+        out = decide(parsed_issues=[], dsk=dsk, usage=_dark_meter())
+        assert AUTH_DEATH in _reasons(out), (ist_map, _reasons(out))
+
+
+def test_a_delivery_FOLLOWED_by_a_fresh_refusal_reports_no_delivery(rig):
+    """`delivered` is "the walk ended on a session having started", not "it saw one somewhere". A
+    refusal after the delivery re-seeds the streak, and reporting the delivery beside it would let
+    the exit edge fire on a machine that has started refusing again."""
+    rig.r.tick(now=NOW)
+    _oop(rig, "watchdog", "launch_failed", "d26", ts=NOW + 1, rc=5)
+    _oop(rig, "debug_launch", "launched", "d27", ts=NOW + 2)
+    assert _streak(rig) == {"samples": {}, "delivered": True}
+    _oop(rig, "watchdog", "launch_failed", "d28", ts=NOW + 3, rc=5)
+    streak = _streak(rig)
+    assert streak["samples"] == {"d28": ["watchdog"]} and streak["delivered"] is False
+
+
+def test_a_resolve_conflict_refusal_is_a_sample_like_any_other(rig):
+    """The one runner launch path the hold does not suppress besides the recovery relaunch, so it is
+    the one most likely to feed this streak while a hold already stands."""
+    import journal as journal_mod
+    rig.r.tick(now=NOW)
+    _oop(rig, "watchdog", "launch_failed", "d26", ts=NOW + 1, rc=5)
+    journal_mod.append(str(rig.home), {
+        "act": "resolve_conflict", "id": "i5", "outcome": "conflict-session launch rc=6",
+        "evidence": {"kind": "launch", "rc": 6, "reason": "env_poisoned", "captured": "x"}},
+        NOW + 2)
+    assert _streak(rig)["samples"] == {"d26": ["watchdog"], "i5": ["runner"]}

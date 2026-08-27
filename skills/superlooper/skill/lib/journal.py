@@ -150,8 +150,9 @@ def tail(state_home, max_bytes=TAIL_MAX_BYTES):
     consumed = blob.rfind(b"\n") + 1                    # 0 when no COMPLETE line is present
     # split("\n"), never splitlines(): str.splitlines also breaks on \x0b/\x0c/\x1c/\x85/\u2028,
     # which would cut ONE record into two unparseable halves. append() writes ensure_ascii JSON, so
-    # none of those can appear raw today — but _read_records splits on \n only, and two readers of
-    # one file that disagree about what a line is would be a defect nobody could reproduce.
+    # none of those can appear raw today. (_read_records is not the same reader — text-mode
+    # readlines() splits on \r and \r\n as well — so neither is a strict superset of the other;
+    # what matters here is that this one never splits INSIDE a record.)
     lines = blob[:consumed].decode("utf-8", "replace").split("\n")
     if not aligned and lines:
         lines = lines[1:]                               # the seek landed mid-record
