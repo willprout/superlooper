@@ -7,7 +7,8 @@
 # SL_RUN_ROOT (present for the whole family — start-session.sh launches issue workers AND the
 # watchdog's sl-debugger through it) and on Claude; lib/worker_pretooluse.py then makes the fine
 # decision, adapting the AskUserQuestion fallback to the session's own role (`i<N>` worker ->
-# blocked file, `d<N>` debugger -> memo + notify) and no-opping for ad-hoc and everything else.
+# blocked file, `d<N>` debugger -> memo + notify, `t<N>` triage flight -> run log + escalation
+# sheet) and no-opping for ad-hoc and everything else.
 # Safe to register globally: outside that family this exits before reading a byte.
 #
 # The deny makes three of the costliest session-instruction-drift incidents mechanically impossible

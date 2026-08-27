@@ -176,6 +176,55 @@ def test_an_approved_issue_never_summons_a_flight_however_long_it_sits(tmp_path)
     assert triage.due([approved, unapproved], home, "2026-08-29", cfg)[0] is True
 
 
+def test_a_live_lane_never_summons_a_flight_either(tmp_path):
+    """The half the first fix missed. The runner STRIPS `agent-ready` the moment it launches an
+    issue (`add=["in-progress"], remove=["agent-ready"]`), so for the whole life of a live lane the
+    issue carries neither — and an `agent-ready`-only exclusion read it as "unapproved with no
+    verdict", i.e. a cue every day forever. This repo almost always has something in progress, so
+    that was the common case, not the corner one."""
+    home = str(tmp_path)
+    cfg = {"triage": {"enabled": True}}
+    live = {"number": 500, "body": "approved, launched, and being built right now",
+            "labels": [{"name": "type:build"}, {"name": "in-progress"}]}
+    assert triage.changed([live], {}) == [], "a live lane is not the flight's to judge"
+    triage.mark_launched(home, "2026-08-25")
+    for day in ("2026-08-26", "2026-08-27", "2026-09-30"):
+        due, why = triage.due([live], home, day, cfg)
+        assert due is False, "%s: %s" % (day, why)
+
+
+def test_an_issue_mid_question_with_the_owner_never_summons_a_flight(tmp_path):
+    """The third state of the same hold: the runner swaps `in-progress` for `awaiting-answer` while
+    the owner decides, and swaps it back to `agent-ready` when he answers. The body is frozen owner
+    text throughout, so it is neither the flight's to judge nor its cue."""
+    waiting = {"number": 600, "body": "asked the owner a question",
+               "labels": [{"name": "type:build"}, {"name": "awaiting-answer"}]}
+    assert triage.changed([waiting], {}) == []
+
+
+def test_a_parked_issue_IS_the_flights_to_look_at(tmp_path):
+    """The line is "does the LOOP hold this", not "was it ever approved". A parked or needs-owner
+    issue has been handed back OUT of the loop — which is exactly the pile the standing rule points
+    a flight at — and it cannot cause the forever-cue, because a flight may judge one, record its
+    verdict, and end the cue. Pinned so a future widening of HELD_LABELS is a conscious change."""
+    home = str(tmp_path)
+    parked = {"number": 700, "body": "stalled work",
+              "labels": [{"name": "type:build"}, {"name": "parked"}]}
+    assert triage.changed([parked], {}) == [700]
+    triage.record_verdict(home, 700, parked["body"], triage.UNDERSPECIFIED, "2026-08-25")
+    assert triage.changed([parked], triage.load_verdicts(home)) == [], \
+        "and once judged it stops being a cue — which is why it needs no exclusion"
+
+
+def test_the_pretooluse_hook_and_this_module_agree_on_the_run_log_folder():
+    """`worker_pretooluse` spells the run-log path out rather than importing this module — an
+    import there would fail the WHOLE deny layer open on a half-published engine (that hook
+    swallows every exception), and would cost every tool call in every session the import of
+    `loopstate`. The literal is only safe if something fails when the folder is renamed."""
+    import worker_pretooluse
+    assert worker_pretooluse._triage_runs_dir("/runs/o__r") == triage.runs_dir("/runs/o__r")
+
+
 def test_a_wrong_typed_label_set_reads_as_unapproved(tmp_path):
     """`issues.label_names` yields [] for any malformed label set, and [] means unapproved — the
     direction that costs a second look rather than an issue silently never triaged."""

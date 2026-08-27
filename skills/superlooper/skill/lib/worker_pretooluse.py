@@ -128,11 +128,6 @@ import re
 import shlex
 import sys
 
-# A stdlib-only leaf (hashlib/os/re + `issues`, itself `re`-only), so importing it costs this hook
-# — which runs before EVERY tool call — nothing measurable. It is imported for the ONE thing the
-# triage fallback must not hardcode: where a flight's run log actually lives.
-import triage
-
 try:
     import queue_lint
 except Exception:          # a half-published engine must not take duties 1 and 2 down with it
@@ -230,7 +225,26 @@ def _triage_ask_reason(state_home, issue_id):
         "brief names, record it in this run's log under %s, and finish the run. Prioritisation "
         "and what to build next are the owner's, always — your job is to hand him the sheet, not "
         "to wait for an answer."
-        % triage.runs_dir(state_home))
+        % _triage_runs_dir(state_home))
+
+
+# The flight's run-log folder, spelled out rather than imported from `lib/triage.py`, and both
+# halves of that are deliberate (fresh-agent review, P1 + P2).
+#
+# NOT IMPORTED, because this module fails OPEN: `main()` swallows every exception, so a module that
+# raises at IMPORT time silently disables ALL SIX duties — the three bad-merge paths included, of
+# which this module's own docstring says "THE protection for all three paths, not one layer of
+# several". The engine publishes by rsync, so a window where this file has landed and `triage.py`
+# has not is real, and `queue_lint` twelve lines above is guarded for exactly that reason. An
+# import would also cost every tool call in every session ~7ms (`triage` pulls `loopstate` ->
+# `tempfile` -> `shutil` -> the compression modules), measured, for two path segments in a fallback
+# that is almost never taken.
+#
+# And a LITERAL is safe here in a way it would not be elsewhere: `test_triage.py` pins these two
+# segments against `triage.DIR` / `triage.RUNS_DIRNAME`, so a rename fails a test rather than
+# quietly sending a stranded flight to a folder that does not exist.
+def _triage_runs_dir(state_home):
+    return os.path.join(state_home, "triage", "runs")
 
 
 # The ONE place session id -> role -> fallback is decided. `i<N>`, `d<N>` and `t<N>` are exactly the
@@ -1114,7 +1128,7 @@ def decide(tool_name, tool_input, state_home, issue_id, ask_reason, attended=Fal
 def run(payload, env):
     """Decide the PreToolUse outcome for one loop session. Returns the deny-reason string, or None
     to ALLOW. No-ops (returns None) outside the session ids the loop's own launchers produce —
-    `i<N>`/`d<N>`, so an ad-hoc or owner's-own session is untouched — and for Codex, and for
+    `i<N>`/`d<N>`/`t<N>`, so an ad-hoc or owner's-own session is untouched — and for Codex, and for
     any non-PreToolUse payload, so the hook is safe to register globally."""
     if (env.get("SL_AGENT") or "claude").strip() == "codex":
         return None                      # Codex has no PreToolUse event; Claude-only (spike verdict)

@@ -77,11 +77,24 @@ CONFIG_KEY = "triage"               # .superlooper/config.json -> {"triage": {..
 RUNS = "runs"                       # <state_home>/triage/runs
 VERDICTS = "verdicts.json"          # <state_home>/triage/verdicts.json
 
-# The approval label, spelled as every other reader in this engine spells it (a bare literal —
-# `labels.py` registers it, and actions.py/issues.py compare against the same string). An APPROVED
-# issue is one the flight may never judge, so it never earns a verdict — which is exactly why
-# `changed()` has to exclude it rather than treat it as permanently unjudged.
-APPROVED_LABEL = "agent-ready"
+# The labels that mean THE LOOP HOLDS THIS ISSUE — and therefore that it is not the flight's to
+# judge, so it never earns a verdict, so it must not be a CUE (see `changed()` for why a
+# never-verdicted issue would otherwise summon a flight every day forever).
+#
+# `agent-ready` alone is not the predicate, and reading it as one was a real defect: the runner
+# STRIPS `agent-ready` the moment it launches (runner.py, `add=["in-progress"],
+# remove=["agent-ready"]`), so for the whole life of a live lane the issue carries neither. The
+# engine's own canonical "is this still approved?" test names both (actions.py: "the approval is
+# gone — the issue carries neither `agent-ready` nor the loop's own `in-progress` stamp"), and this
+# is the same question one seat over. `awaiting-answer` is the third state of the same hold: the
+# runner swaps `in-progress` for it while the owner decides, and swaps it back to `agent-ready`
+# when he answers — the body is frozen owner text throughout.
+#
+# `parked` / `needs-owner` are deliberately NOT here. Those are handed BACK out of the loop, which
+# is exactly the pile the standing rule wants a flight looking at — and they cannot cause the
+# forever-cue this list exists to prevent, because a flight may judge one, record its verdict, and
+# end the cue. Bare literals, as every other reader in this engine spells them.
+HELD_LABELS = ("agent-ready", "in-progress", "awaiting-answer")
 
 # The run log's name IS the local date, which is also the day stamp. Matched strictly rather than
 # trusted: this string becomes a path segment, and a caller handing over a date it read from
@@ -241,19 +254,25 @@ def changed(open_issues, verdicts):
     shape deliberately does not carry it — the open-issue view (``gh._ISSUE_FIELDS``) already
     fetches ``body`` AND ``labels``, so neither read below costs an extra GitHub call.
 
-    **APPROVED issues are excluded, and that is a correctness rule rather than a scope choice**
-    (fresh-agent review, P1). The standing rule forbids the flight from acting on an
-    ``agent-ready`` issue at all, so no verdict is ever recorded for one — which under a
-    "no verdict means changed" test makes every approved issue permanently changed, and the
-    trigger fires EVERY DAY FOREVER on a queue the flight is not allowed to touch. That directly
-    falsifies the bound this module exists to keep ("unchanged bodies since the last verdicts
-    update -> no launch"). A repo holding one approved issue and an otherwise quiet queue would
-    have launched an unattended session every day with nothing it was permitted to do.
+    **Issues the LOOP HOLDS are excluded** (``HELD_LABELS``), and that is a correctness rule rather
+    than a scope choice — two fresh-agent reviews in a row landed on it. The standing rule forbids
+    the flight from acting on an approved issue at all, so no verdict is ever recorded for one —
+    which under a "no verdict means changed" test makes it permanently changed, and the trigger
+    fires EVERY DAY FOREVER on a queue the flight is not allowed to touch. That directly falsifies
+    the bound this module exists to keep ("unchanged bodies since the last verdicts update -> no
+    launch"). A repo holding one such issue and an otherwise quiet queue would have launched an
+    unattended session every day with nothing it was permitted to do.
 
-    What is NOT lost by excluding them: a flight already in the air still SEES every approved
-    issue and may flag one — the rule allows lint to flag and escalate. What changes is only
-    whether an approved issue can, by itself, summon a flight. It cannot: an edit to approved text
-    is the owner editing his own frozen text, and the flight has nothing to say about it.
+    The SECOND review found the first fix was half of one: it excluded ``agent-ready`` alone, and
+    the runner strips exactly that label at launch — so every live lane, and this repo almost
+    always has one, read as "unapproved with no verdict" and was a daily cue. The predicate has to
+    be the engine's own (see ``HELD_LABELS``), not the one label that happens to name approval at
+    rest.
+
+    What is NOT lost by excluding them: a flight already in the air still SEES every held issue and
+    may flag one — the rule allows lint to flag and escalate. What changes is only whether one can,
+    by itself, summon a flight. It cannot: an edit to frozen text is the owner editing his own, and
+    the flight has nothing to say about it.
 
     Defensive like every other pure core here: a partial or wrong-typed view (a broken gh call, a
     half-written cache) yields fewer issues to triage, never an exception into a tick. An entry
@@ -276,8 +295,9 @@ def changed(open_issues, verdicts):
         # `issues._label_names` by its own (private-looking) name: it is already the cross-module
         # spelling — `queue_lint` calls exactly this — and renaming it would ripple into a
         # dashboard docstring for no gain. Its contract is what matters here: any malformed label
-        # set yields [], i.e. UNAPPROVED, which is the re-read direction.
-        if APPROVED_LABEL in issues._label_names(issue):
+        # set yields [], i.e. NOT HELD, which is the re-read direction.
+        names = issues._label_names(issue)
+        if any(held in names for held in HELD_LABELS):
             continue                     # never the flight's to judge -> never the flight's cue
         record = known.get(_key(num))
         if not isinstance(record, dict) or record.get("body_hash") != body_hash(issue.get("body")):
@@ -389,7 +409,12 @@ def home_kind(config):
     """
     block = config.get(CONFIG_KEY) if isinstance(config, dict) else None
     value = (block or {}).get("home") if isinstance(block, dict) else None
-    return value if value in HOMES else CHECKOUT
+    # `type(...) is str` before the membership test, symmetric with launch.py's reader of this same
+    # field (round-2 P0 hardened that one and left this one comparing by `==`): `in` compares by
+    # VALUE, so an object with a co-operative `__eq__` would answer yes to a tuple of strings, and
+    # one whose `__eq__` raises would take a runtime reader down instead of degrading. Two readers
+    # of one field must not disagree about what "unreadable" means.
+    return value if type(value) is str and value in HOMES else CHECKOUT
 
 
 # --------------------------------------------------------------------------- the trigger
@@ -422,7 +447,7 @@ def due(open_issues, state_home, date, config):
         len(fresh), named, ", ..." if len(fresh) > 10 else "")
 
 
-__all__ = ["DIR", "CONFIG_KEY", "RUNS", "VERDICTS", "APPROVED_LABEL",
+__all__ = ["DIR", "CONFIG_KEY", "RUNS", "VERDICTS", "HELD_LABELS",
            "CHECKOUT", "WORKTREE", "HOMES",
            "BUILDABLE", "UNDERSPECIFIED", "CONTAINS_OWNER_DECISION", "OVERTAKEN",
            "duplicate_of", "nit", "home", "runs_dir", "verdicts_path", "run_log_path",

@@ -478,9 +478,16 @@ def test_the_triage_flight_runs_in_the_repos_real_checkout(rig):
     """The RULED default home: the flight opens the checkout an orchestrator would open, so it
     sees the gitignored working files a fresh worktree by definition cannot show.
 
-    And it opens it READ-ONLY. That is the issue's own hard boundary — "nothing this issue builds
-    may itself write to the working tree" — so the tree is compared whole (every path, size and
-    mtime) across the launch, not merely spot-checked for a survivor."""
+    And THE LAUNCHER opens it read-only. That is the issue's own hard boundary — "nothing this
+    issue builds may itself write to the working tree" — so the tree is compared whole (every path,
+    size and mtime) across the launch, not merely spot-checked for a survivor.
+
+    Scoped to the launcher deliberately, because that is all this can honestly measure: the
+    launcher returns as soon as the in-pane floor stamps its start sentinel, which
+    `start-session.sh` does BEFORE the agent runs, so the floor and the stub are still alive when
+    the second snapshot is taken. What the floor and `pretrust.sh` write is their own contract
+    (the Claude config store, `$SL_RUN_ROOT/state/**`, `$HOME/.superlooper` — none of them in the
+    checkout), and the FLIGHT's own read-only discipline in that tree is the brief's (part 2)."""
     (rig["run_root"] / "briefs" / "t3.md").write_text("triage the queue")
     (rig["repo"] / "notes.local").write_text("a gitignored working file\n")
     before = _tree_snapshot(rig["repo"])

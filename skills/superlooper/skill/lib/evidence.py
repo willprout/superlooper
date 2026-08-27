@@ -217,10 +217,12 @@ _LAUNCH_TEXT = (
     # emit it, and it contains spaces, so no variable name or path can carry it by accident.
     (("triage launch refused",),
      ("triage_launch_refused",
-      "the triage flight could not be launched because this repo's triage configuration does not "
-      "describe a place to run it — an unreadable `triage.home`, or an SL_REPO naming a checkout "
-      "that is not there. No session was created, and no queued issue caused it: fix the repo's "
-      "`.superlooper/config.json` (or the checkout path) and the next day's flight goes out")),
+      "the triage flight could not be launched because nothing told it a place to run — an "
+      "unreadable `triage.home`, or an SL_REPO naming a checkout that is not there. No session was "
+      "created. Fix the repo's `.superlooper/config.json`, or the checkout path; note that a "
+      "MISSING CHECKOUT is a machine-level fault every worker launch is hitting too, and their own "
+      "refusals are what hold the queue for it — this reading only says the flight did not go "
+      "out, which is deliberately not a reason on its own to stop the approved queue")),
     # THEN (issue #301), ahead of the gh needles. A poisoned environment is causally
     # UPSTREAM of the auth death it can produce — an inherited XDG_CONFIG_HOME is exactly how `gh`
     # dies — so when the session's refusal names the environment, the environment is the honest
