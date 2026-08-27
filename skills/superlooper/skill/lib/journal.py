@@ -76,52 +76,54 @@ def read(state_home):
     return _read_records(_path(state_home))
 
 
-# The cold-start tail `follow()` reads when it has no offset to resume from. Big enough to carry
-# the recent past (a runner that just came up must still see the launch failures of the last few
-# minutes), small enough that a tick never pays for the whole hot window.
-FOLLOW_COLD_START_BYTES = 256 * 1024
+# How much of the hot journal a bounded tail read looks at. Big enough that a ~20 s tick can never
+# outrun it (a burst would have to write a quarter-megabyte of records between two ticks), small
+# enough that the read cost is a constant rather than a function of the retention window.
+TAIL_MAX_BYTES = 256 * 1024
 
 
-def follow(state_home, offset=None, max_bytes=FOLLOW_COLD_START_BYTES):
-    """Records appended to the hot journal SINCE `offset`, plus the offset to pass in next time.
+def tail(state_home, max_bytes=TAIL_MAX_BYTES):
+    """The last `max_bytes` of the hot journal, parsed — a bounded read for a per-tick reader.
 
-    The incremental read a per-tick absorb needs (issue #457): the runner learns about launches it
-    did not run — the watchdog's unattended sl-debugger, the owner's `superlooper debug` tap —
-    only from this file, and it may not re-parse a 14-day window every ~20 s to do it.
+    The runner learns about launches it did not run — the watchdog's unattended sl-debugger, the
+    owner's `superlooper debug` tap — only from this file (issue #457), and it may not re-parse a
+    14-day window every ~20 s to do it.
 
-    `offset` None is a COLD start: it reads at most the last `max_bytes` and DROPS the first line,
-    which the byte-seek may have landed in the middle of. A file that SHRANK since the last call
-    (rotate() moved the hot window to the archive) restarts from 0 rather than seeking past its end.
+    DELIBERATELY STATELESS: no byte offset is carried between calls, and the caller filters what it
+    has already seen by RECORD (its own `ts` watermark). An offset would be wrong here, because the
+    file this follows is not append-only over time — `rotate()` rewrites it WITHOUT its archived
+    prefix, and the runner rotates on its first tick and every few hours after. A saved offset then
+    indexes a different logical position: it either lands mid-record (silently dropping the record
+    it cut, which is exactly the record class this detector is built on) or past the end. Re-reading
+    a bounded tail every tick costs a constant few hundred KB and cannot be wrong about either.
 
-    Fails closed exactly like read(): an unreadable file yields ([], offset unchanged), a corrupt or
-    wrong-typed line is skipped, and a TRAILING PARTIAL line is left unconsumed — the returned
-    offset stops at the last newline, so the next call re-reads that record whole instead of
-    parsing half of one. (append() writes each record with a single write+flush+fsync, so a partial
-    tail is rare; being wrong about it once would mis-read a record, which is why it is handled.)
+    Fails closed exactly like read(): an unreadable file yields [], a corrupt or wrong-typed line is
+    skipped, the FIRST line is dropped when the byte seek may have landed inside it, and a TRAILING
+    partial line is left unparsed rather than parsed in halves. (append() writes each record with a
+    single write+flush+fsync, so a partial tail is rare; being wrong about it once would mis-read a
+    record, which is why it is handled.)
     """
     path = _path(state_home)
     try:
-        size = os.path.getsize(path)
-    except OSError:
-        return [], offset
-    trim_first = False
-    if offset is None:
-        start = max(0, size - int(max_bytes))
-        trim_first = start > 0
-    elif isinstance(offset, int) and not isinstance(offset, bool) and 0 <= offset <= size:
-        start = offset
-    else:
-        start = 0                       # rotated, truncated, or a wrong-typed offset: start over
-    try:
         with open(path, "rb") as f:
+            try:
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+            except OSError:                             # pragma: no cover - defensive
+                size = 0
+            start = max(0, size - int(max_bytes))
             f.seek(start)
             blob = f.read()
     except OSError:
-        return [], offset
-    consumed = blob.rfind(b"\n") + 1    # 0 when no COMPLETE line is present
-    lines = blob[:consumed].decode("utf-8", "replace").splitlines()
-    if trim_first and lines:
-        lines = lines[1:]
+        return []
+    consumed = blob.rfind(b"\n") + 1                    # 0 when no COMPLETE line is present
+    # split("\n"), never splitlines(): str.splitlines also breaks on \x0b/\x0c/\x1c/\x85/\u2028,
+    # which would cut ONE record into two unparseable halves. append() writes ensure_ascii JSON, so
+    # none of those can appear raw today — but _read_records splits on \n only, and two readers of
+    # one file that disagree about what a line is would be a defect nobody could reproduce.
+    lines = blob[:consumed].decode("utf-8", "replace").split("\n")
+    if start > 0 and lines:
+        lines = lines[1:]                               # the seek may have landed mid-record
     out = []
     for line in lines:
         if not line.strip():
@@ -132,7 +134,7 @@ def follow(state_home, offset=None, max_bytes=FOLLOW_COLD_START_BYTES):
             continue
         if isinstance(rec, dict):
             out.append(rec)
-    return out, start + consumed
+    return out
 
 
 def read_all(state_home):
@@ -171,12 +173,18 @@ def rotate(state_home, now, retain_seconds=HOT_RETAIN_SECONDS):
       * A corrupt line (no parseable ts — the tolerant reader already skips it) is KEPT hot, never
         archived and never dropped.
 
+    Caveat worth stating since #457: a record lost in the concurrency window below is no longer
+    audit-only — the runner's machine-wide launch-attempt streak reads this file back through
+    tail(). Losing one there costs at most one SAMPLE of an outage that is still refusing every
+    launch, so it fails OPEN (a hold arrives a tick later, never a hold that should not have).
+
     Concurrency caveat: unlike append() (lock-free, O_APPEND-atomic across processes), the read ->
     os.replace here is NOT atomic against a CONCURRENT appender in another process (watchdog / a
     stray CLI). A record appended between this call's readlines() and its os.replace() would be
     overwritten. The runner is the journal's dominant writer and the sole rotate caller (4x/day, a
-    ms-scale window), and the journal is audit-only — no runner decision replays from it — so this
-    is an accepted narrow window, not a safety risk; call rotate only from the runner tick.
+    ms-scale window), and the only runner decision that reads this file back fails OPEN on a lost
+    record (see the note above) — so this is an accepted narrow window, not a safety risk; call
+    rotate only from the runner tick.
 
     Records are partitioned by `ts`: ts < cutoff -> archived; everything else stays hot."""
     cutoff = now - retain_seconds

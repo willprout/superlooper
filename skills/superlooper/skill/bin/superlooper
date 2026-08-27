@@ -4559,7 +4559,12 @@ def cmd_debug(args):
         return 0
 
     error = _debug_error(rc, err, out)
-    _debug_journal(home, {"act": "debug_launch", "outcome": "launch_failed", "id": sid,
+    # The rc rides along beside the human text (issue #457). This verb runs in its OWN process, so
+    # the journal is the only thing the runner ever hears about a Debug tap that refused — and
+    # `lib/evidence` reads the launcher's EXIT CODE first (its `_RC_AUTHORITATIVE` set) and its
+    # stderr second. Recording only the prose left the runner able to see that a flight failed but
+    # not what refused it, which is the difference between a named hold and a guessed one.
+    _debug_journal(home, {"act": "debug_launch", "outcome": "launch_failed", "id": sid, "rc": rc,
                           "operator": operator, "source": source, "error": error})
     _emit_debug(args, {"ok": False, "verb": "debug", "id": sid, "live": False, "live_id": None,
                        "error": error})

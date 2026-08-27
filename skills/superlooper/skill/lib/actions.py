@@ -907,6 +907,16 @@ def _sorted_ids(ids):
     return sorted(ids, key=_iid_num)
 
 
+def _real_retries_left(retries, retry_cap):
+    """Whether this lane may be relaunched again on its OWN accounting (issue #457).
+
+    A wrong-typed counter reads as NO retries left — fail closed, the same direction the park branch
+    below it takes on one. The caller uses this only to decide whether a machine-wide hold should
+    hold the lane instead of parking it; the park itself is unchanged and re-derives the moment the
+    hold lifts."""
+    return type(retries) is int and retries < retry_cap
+
+
 def _is_session_id(sid):
     """True for any launch SESSION id: a queued issue's lane (i<N>), an sl-debugger flight (d<N>)
     or a triage flight (t<N>) — issue #457.
@@ -1747,9 +1757,10 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     # a repeated id. And it is the widest net this layer casts, so it is the one most able to be
     # WRONG — which is why the recovery probe below is not optional for it: a hold over two
     # coincidentally-broken lanes lifts itself the first time any flight flies.
-    raw_attempts = dsk.get("launch_attempt_fail_ids")
-    attempt_fail_ids = {x for x in raw_attempts if _is_session_id(x)} \
-        if isinstance(raw_attempts, (list, set, tuple, frozenset)) else set()
+    raw_attempts = dsk.get("launch_attempt_streak")
+    raw_attempts = raw_attempts if isinstance(raw_attempts, dict) else {}
+    attempt_fail_ids = {x for x in _dget(raw_attempts, "ids", list) if _is_session_id(x)}
+    attempt_reasons = {r for r in _dget(raw_attempts, "reasons", list) if isinstance(r, str)}
     # Not affirmatively alive: `unknown` (the probe would not answer), absent (no probe was fed),
     # or a definitive dead reading. Only a positive `valid is True` clears this conjunct.
     auth_unconfirmed = not (isinstance(auth_probe, dict) and auth_probe.get("valid") is True)
@@ -1757,13 +1768,34 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     # This is #320's own rule read the other way round: a hold that arrives wearing another class's
     # banner is the mis-blame that layer exists to end, and stapling a second, cruder name onto an
     # episode `claude_identity_wrong_workers` (or a dead anchor, or a definitive `auth_dead`
-    # reading) has already named precisely is the same harm — two names for one outage, and an
-    # owner told to check two different things. The specific classes hold when they can see the
+    # reading) has already named precisely is the same harm — two names AT ONCE for one outage, and
+    # an owner told to check two different things. The specific classes hold when they can see the
     # fault; this one speaks for the shape none of them could see.
+    #
+    # What that does NOT promise is one name forever. This detector sees a d<N> flight and a mixed
+    # streak, which #320 cannot count at all, so it often trips FIRST; if a second lane then refuses
+    # the same way and #320's cap is reached, the episode is re-named — and re-paged — under the
+    # more specific class. That page is an IMPROVEMENT (a vaguer cause replaced by a precise one
+    # with a precise remedy), and it is bounded to once: the naming rule above already gives an
+    # agreeing streak the same specific name, so the common case renames nothing.
     already_named = anchor_down or systemic_launch or systemic_env or auth_invalid
     systemic_auth_death = (len(attempt_fail_ids) >= AUTH_DEATH_LAUNCH_CAP
                            and (episode_active or auth_unconfirmed)
                            and not already_named)
+    # WHAT TO CALL IT. Every sample in this streak is a credential/environment refusal the runner
+    # classified through lib/evidence (it admits no other kind), so most of the time they agree —
+    # two flights refusing because `claude auth status` reported the wrong account is not a mystery
+    # needing a machine-wide banner, it is `claude_identity_wrong_workers` with its own remedy, and
+    # naming it that is what #320 spent a whole issue establishing. The machine-wide name is for
+    # the case that layer genuinely cannot express: a MIXED streak, where several different
+    # credential faults each refused a flight and not one of them reached a cap of its own. That is
+    # the 2026-08-26 shape (a runner-gh refusal and a session-Claude refusal in the same episode),
+    # and it is the only shape that earns the generic body.
+    attempt_named = sorted({LAUNCH_ALERT_REASONS[r] for r in attempt_reasons
+                            if r in LAUNCH_ALERT_REASONS})
+    auth_death_reason = (attempt_named[0] if len(attempt_named) == 1
+                         and not (attempt_reasons - set(LAUNCH_ALERT_REASONS))
+                         else AUTH_DEATH_ALERT_REASON)
     # ONE degraded mode for every detector above: hold every fresh launch and suppress the
     # per-issue launch-cap park (phases D+E), so the queue is left intact for when the cause clears.
     launch_degraded = anchor_down or systemic_launch or systemic_env or systemic_auth_death
@@ -2008,8 +2040,12 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     # fallback here and none wanted: this streak is keyed BY the reason, so a class that reached the
     # cap is a class this engine has a message for — the reader above drops any reason it does not.
     reasons.extend(LAUNCH_ALERT_REASONS[r] for r in systemic_env_reasons)
-    if systemic_auth_death:                            # (#457) the machine-wide Claude-auth-death
-        reasons.append(AUTH_DEATH_ALERT_REASON)        # class: one name, whatever the refusals said
+    # (#457) ...and the machine-wide credential/environment hold, under the name its own samples
+    # earn. Gated on real demand exactly as the anchor and auth_dead alerts are: an idle machine
+    # with no queue and no lane in flight is being denied nothing, and a page it cannot act on is a
+    # page that teaches the owner to ignore the next one.
+    if systemic_auth_death and (has_pending_launch or has_relaunch_demand):
+        reasons.append(auth_death_reason)
     if auth_invalid and (has_pending_launch or has_relaunch_demand):   # dead auth only matters with a
         reasons.append("auth_dead")                    # spend pending (idle -> quiet, like the anchor)
     # DEDUPE, not just sort (#299). Two independent detectors can now name the SAME reason:
@@ -2792,6 +2828,21 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                 launch_hold(iid, num, p, relaunch=True,
                             reason="the display is asleep — relaunch held; macOS will not boot the "
                                    "new tab's shell until wake, when it resumes automatically")
+            elif systemic_auth_death and not _real_retries_left(retries, retry_cap):
+                # (#457) A machine-wide credential hold stands and THIS lane has already spent its
+                # retry cap. Parking it would charge a per-issue re-approval for a fault it did not
+                # cause — the 2026-08-26 shape named "the in-flight lanes' dead sessions", and
+                # exactly the accounting the hold above suppresses for fresh launches. Held instead,
+                # like the auth_invalid sibling: no attempt, no park, and it resumes by itself.
+                #
+                # SCOPED to the at-cap lanes on purpose. A lane with retries LEFT still relaunches
+                # into the hold, and that is deliberate: a relaunch is the only flight an all-in-
+                # flight machine has left, so it is what can still clear the streak and lift this.
+                # Holding those too would be a hold with no way out.
+                launch_hold(iid, num, p, relaunch=True,
+                            reason="nothing on this machine is starting a session — relaunch held "
+                                   "at the retry cap rather than parked (see the queue-hold alert); "
+                                   "it resumes by itself when a launch flies again")
             elif type(retries) is not int:             # corrupt counter -> to William, not a loop
                 park(iid, num, "exited, and the retry counter is unreadable — parking" + stderr_memo,
                      cause="exited_cap")
