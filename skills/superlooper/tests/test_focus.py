@@ -136,6 +136,31 @@ def test_every_outcome_has_its_own_exit_code_and_only_focused_is_zero():
     assert all(focus_lib.EXIT_CODES[o] != 0 for o in focus_lib.OUTCOMES if o != focus_lib.FOCUSED)
 
 
+def test_a_caller_with_less_patience_than_the_default_gets_a_shorter_doorway(tmp_path, monkeypatch):
+    """`superlooper debug` reaches here having already spent most of its budget on the launch
+    (issue #459), and must be able to say so without building a doorway of its own — the one
+    construction stays in this module. Absent, the caller gets the default this verb documents."""
+    built = []
+
+    class _Door:
+        def __init__(self, **kw):
+            built.append(kw)
+
+        def focus(self, session):
+            return session_host.Focus(session_host.FOCUSED, "front")
+
+    monkeypatch.setattr(session_host, "SessionHost", _Door)
+    _record(tmp_path, "d4", "w1:p1", "w1")
+    assert focus_lib.focus_lane(tmp_path, "d4", call_seconds=3).outcome == focus_lib.FOCUSED
+    assert built[-1]["call_seconds"] == 3
+    focus_lib.focus_lane(tmp_path, "d4")
+    assert built[-1]["call_seconds"] == focus_lib.CALL_SECONDS
+    # It can only SHORTEN. The ceiling belongs to this verb — a caller that asked for a minute
+    # would be quietly re-deciding that a person watching for their window can wait at a spinner.
+    focus_lib.focus_lane(tmp_path, "d4", call_seconds=600)
+    assert built[-1]["call_seconds"] == focus_lib.CALL_SECONDS
+
+
 def test_a_recorded_window_that_cannot_address_anything_is_an_answer_not_a_traceback(tmp_path):
     """The doorway RAISES on a handle it cannot address — right for it, wrong to let out of here.
     `focus_lane` promises a UI four outcomes, and a traceback with rc=1 and no JSON is the exact

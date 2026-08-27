@@ -18,6 +18,8 @@ The two properties that could NOT be had from outside the engine, and that these
    including its launch subprocess. So a tap and a watchdog check can never both pass the
    "is a debugger already running?" test and launch two sessions onto one patient.
 """
+import importlib.machinery
+import importlib.util
 import json
 import os
 import shutil
@@ -29,6 +31,7 @@ from pathlib import Path
 
 import pytest
 
+import focus
 import journal
 
 _ROOT = Path(__file__).resolve().parent.parent
@@ -49,6 +52,16 @@ _FAKE_LAUNCH = """#!/bin/bash
   # advanced BEFORE anything could launch, not merely after the shim returned.
   printf 'STATE_AT_LAUNCH %s\\n' "$(cat "${SL_RUN_ROOT:-}/state/watchdog.json" 2>/dev/null | tr -d '\\n ')"
 } >> "$STUB_LOG"
+# What the REAL launcher does at delivery confirmation and nothing else does: record the session
+# handle under state/panes/ (lib/launch.py -> lib/panes.record). Opt-in via $STUB_WS so every test
+# that predates issue #459 sees the byte-identical state home it always did; the tests that care
+# about the window say which workspace the launcher came back with. Only on a launch that
+# CONFIRMS — a shim that failed recorded no handle, because there is no session to record.
+if [ -n "${STUB_WS:-}" ] && [ "${STUB_RC:-0}" = "0" ]; then
+  mkdir -p "${SL_RUN_ROOT:-}/state/panes"
+  printf '%s' "$STUB_WS"     > "${SL_RUN_ROOT:-}/state/panes/$3.ws"
+  printf '%s:p1' "$STUB_WS"  > "${SL_RUN_ROOT:-}/state/panes/$3"
+fi
 echo "${STUB_STDERR:-}" >&2
 exit "${STUB_RC:-0}"
 """
@@ -495,3 +508,241 @@ def test_an_unwritable_state_dir_is_a_json_refusal_not_a_traceback(rig):
     assert b["ok"] is False and b["error"]
     assert "Traceback" not in r.stderr
     assert rig.launch_calls() == []
+
+
+# --------------------------- the tap surfaces its terminal (issue #459) ---------------------------
+#
+# The owner tapped Deploy Fixer, so he is AT the dashboard watching for the fixer to appear. Once
+# the spawn confirms, the d<N> session's own window comes to the front through the engine's
+# `focus-session` mechanism (issue #339's doorway verb) so he can read it and type into it.
+#
+# Everything here is driven against `fakes/fake-sessionhost`, which speaks the real envelope and
+# REFUSES a workspace it never issued — so "the window was focused" is a fact about the host's own
+# log, never a mock's shrug. The `focused.jsonl`/`calls.jsonl` pair is the same evidence
+# tests/test_focus.py rests its own CLI cases on.
+#
+# The load-bearing half is the NEGATIVE: focus is garnish. A launch that confirmed is `ok` whatever
+# the window did, because a fixer that launched but did not surface must never read as a fixer that
+# did not launch.
+
+_FAKE_HOST = Path(__file__).resolve().parent / "fakes" / "fake-sessionhost"
+
+
+def host_env(rig, ws="w1", issued=True):
+    """Point the engine's doorway at the fake host, and (by default) mark `ws` LIVE on it — what a
+    real `workspace create` would have left behind for the session the launcher just recorded."""
+    hostdir = rig.tmp / "fakehost"
+    hostdir.mkdir(exist_ok=True)
+    if issued:
+        (hostdir / ("live.%s" % ws)).write_text("")
+    rig.hostdir = hostdir
+    return {"SL_HERDR": str(_FAKE_HOST), "FAKE_HOST_DIR": str(hostdir), "HOST_MODE": "hollow",
+            "STUB_WS": ws}
+
+
+def host_calls(rig):
+    path = rig.hostdir / "calls.jsonl"
+    return [json.loads(x) for x in path.read_text().splitlines()] if path.exists() else []
+
+
+def focused(rig):
+    path = rig.hostdir / "focused.jsonl"
+    return [json.loads(x)["workspace"] for x in path.read_text().splitlines()] \
+        if path.exists() else []
+
+
+def test_an_owner_tap_brings_the_new_fixers_window_to_the_front(rig):
+    rig.anchor()
+    rig.wstate(next_debugger=4)
+    r = run(rig, "debug", "--repo", str(rig.repo), "--json", "--note", "the gate is stuck",
+            "--operator", "William", "--source", "command-center",
+            env_over=host_env(rig, ws="w1"))
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert body(r)["id"] == "d4"
+    # The window the LAUNCHER recorded for d4 — not a name, not a guess.
+    assert focused(rig) == ["w1"]
+    assert body(r)["focus"] == "focused"
+
+
+def test_the_tap_asks_the_host_for_a_focus_and_nothing_else(rig):
+    """The whole added effect is one `workspace focus`. The tap must not grow a second window verb
+    on the way — no close, no kill, no send — and the fake answers every one of them happily, so a
+    stray call would succeed rather than raise and could not hide."""
+    rig.anchor()
+    rig.wstate(next_debugger=1)
+    r = run(rig, "debug", "--repo", str(rig.repo), "--json", "--note", "x",
+            env_over=host_env(rig, ws="w1"))
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert host_calls(rig) == [["workspace", "focus", "w1"]], host_calls(rig)
+
+
+def test_the_focus_outcome_is_journaled_beside_the_launch(rig):
+    rig.anchor()
+    rig.wstate(next_debugger=1)
+    r = run(rig, "debug", "--repo", str(rig.repo), "--json", "--note", "x",
+            env_over=host_env(rig, ws="w1"))
+    assert r.returncode == 0, r.stdout + r.stderr
+    recs = rig.djournal()
+    # ONE record for one tap, still `debug_launch` and still `launched`: the window is a field on
+    # the launch, never a second act. (The command center renders journal acts it knows by name;
+    # a new one would print as an unknown row beside the launch it belongs to.)
+    assert len(recs) == 1
+    assert recs[0]["act"] == "debug_launch" and recs[0]["outcome"] == "launched"
+    assert recs[0]["focus"] == "focused"
+
+
+def test_a_window_the_host_will_not_raise_is_journaled_and_the_launch_still_stands(rig):
+    """The DoD's third line. The session EXISTS — the shim verified delivery — and the host then
+    refuses the workspace the launcher recorded. That is a fact about a window, and a fixer that
+    launched but did not surface must never read as a fixer that did not launch."""
+    rig.anchor()
+    rig.wstate(next_debugger=4)
+    env = host_env(rig, ws="w9", issued=False)       # recorded, but never issued on this host
+    r = run(rig, "debug", "--repo", str(rig.repo), "--json", "--note", "x", env_over=env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    b = body(r)
+    assert b["ok"] is True and b["id"] == "d4" and b["live"] is True
+    assert b["focus"] == "no_window"
+    assert "Traceback" not in r.stderr
+    recs = rig.djournal()
+    assert [x["outcome"] for x in recs] == ["launched"]
+    assert recs[0]["focus"] == "no_window"
+
+
+def test_a_host_that_cannot_be_reached_at_all_never_fails_the_launch(rig):
+    """The other failure road: the doorway cannot reach the host — a wedged server, a binary that
+    is not there, a fenced host refusing a tokenless caller. Absence of signal about a window says
+    nothing about the session, and it must cost the launch nothing."""
+    rig.anchor()
+    rig.wstate(next_debugger=4)
+    env = {**host_env(rig, ws="w1"), "SL_HERDR": "/nonexistent/superlooper-i459-no-host"}
+    r = run(rig, "debug", "--repo", str(rig.repo), "--json", "--note", "x", env_over=env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    b = body(r)
+    assert b["ok"] is True and b["id"] == "d4"
+    assert b["focus"] == "host_unreachable"
+    assert rig.djournal()[0]["focus"] == "host_unreachable"
+    assert "Traceback" not in r.stderr
+
+
+def test_a_launch_that_never_confirmed_focuses_nothing(rig):
+    """AFTER spawn confirmation, and only then. A launch the shim refused has no session and no
+    window; reaching for one would be the engine asking the host about a lane that does not exist."""
+    rig.anchor()
+    rig.wstate(next_debugger=4)
+    env = {**host_env(rig, ws="w1"), "STUB_RC": "3", "STUB_STDERR": "no session was confirmed"}
+    r = run(rig, "debug", "--repo", str(rig.repo), "--json", "--note", "x", env_over=env)
+    assert r.returncode == 1
+    assert body(r)["ok"] is False
+    assert host_calls(rig) == [], "a failed launch must ask the host for nothing"
+    assert [x["outcome"] for x in rig.djournal()] == ["launch_failed"]
+
+
+def test_a_tap_that_was_refused_outright_focuses_nothing(rig):
+    """A refusal is not a launch. `--check`, a live debugger, a held lock: none of them spawned a
+    session, so none of them has a window to raise."""
+    rig.anchor()
+    rig.wstate(next_debugger=4)
+    env = host_env(rig, ws="w1")
+    (rig.home / "state" / "worker.d2.lock").write_text(str(os.getpid()))   # a LIVE debugger
+    r = run(rig, "debug", "--repo", str(rig.repo), "--json", "--note", "x", env_over=env)
+    assert r.returncode == 1 and body(r)["live"] is True
+    assert host_calls(rig) == []
+    assert run(rig, "debug", "--repo", str(rig.repo), "--json", "--check",
+               env_over=env).returncode == 0
+    assert host_calls(rig) == [], "the read-only preflight must touch no window"
+
+
+def test_the_human_line_says_what_became_of_the_window(rig):
+    """A person typing this in a terminal is told the truth about the window too — a launch that
+    landed and a window that did not come forward is one line, not a silent half."""
+    rig.anchor()
+    rig.wstate(next_debugger=1)
+    env = host_env(rig, ws="w9", issued=False)
+    r = run(rig, "debug", "--repo", str(rig.repo), "--note", "x", env_over=env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "d1" in r.stdout
+    assert "launched" in r.stdout, r.stdout
+    assert "window" in r.stdout.lower(), r.stdout
+
+
+# --------------------------- the window never costs the answer ---------------------------
+#
+# Fresh-agent review, P0. `superlooper debug` runs inside a budget its caller sized for the LAUNCH
+# alone: the command center kills it at the same 180s the launcher itself gets. A launch that
+# confirmed near the end of that window and was then killed mid-focus would print no JSON at all,
+# and the dashboard would render "no session was confirmed" about a live debugger — the exact
+# failure this issue forbids, and the one that invites a second tap onto one patient.
+#
+# The arithmetic that prevents it is pure and lives in `_debug_focus_budget`, so it can be driven
+# here without a three-minute launcher (which no suite can afford to run).
+
+
+@pytest.fixture
+def cli_module():
+    """The `superlooper` entry point loaded as a MODULE (it guards main() under
+    __name__ == '__main__', so importing runs no command) — the same trick test_watchdog_cli uses
+    to unit-test its file-lock helpers."""
+    loader = importlib.machinery.SourceFileLoader("superlooper_cli", str(CLI))
+    spec = importlib.util.spec_from_loader("superlooper_cli", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def test_a_prompt_launch_leaves_the_window_the_doorways_whole_budget(cli_module):
+    assert cli_module._debug_focus_budget(0) == focus.CALL_SECONDS
+    assert cli_module._debug_focus_budget(2.5) == focus.CALL_SECONDS
+
+
+def test_a_launch_that_ate_the_taps_patience_leaves_the_window_nothing(cli_module):
+    # The window is garnish and the answer is not: what is left over goes to the window, and when
+    # there is nothing left the window gets nothing. Nothing here shortens the LAUNCH's own timeout
+    # to make room — that would turn a slow-but-real launch into a killed one, the same forbidden
+    # failure wearing the other hat.
+    budget = cli_module.WATCHDOG_LAUNCH_TIMEOUT
+    assert cli_module._debug_focus_budget(budget) <= 0
+    assert cli_module._debug_focus_budget(budget - 1) <= 0
+    # ...and the last seconds before that shrink rather than jump: the doorway is asked for only
+    # what remains.
+    tight = cli_module._debug_focus_budget(budget - cli_module._DEBUG_FOCUS_RESERVE - 2)
+    assert 0 < tight < focus.CALL_SECONDS
+
+
+def test_no_budget_means_the_host_is_never_asked_and_the_launch_still_reports(cli_module, rig):
+    outcome, detail = cli_module._debug_focus(str(rig.home), "d4", 0)
+    assert outcome == cli_module._DEBUG_FOCUS_NOT_ASKED
+    assert "the session launched and is unaffected" in detail
+    assert "focus-session" in detail, "tell the owner how to raise the window himself"
+    # NOT one of lib/focus's four: those are answers ABOUT a window, and this is the verb saying it
+    # never asked for one. A fifth outcome word in lib/focus would reach the `focus-session` exit
+    # codes and the dashboard's rendering, neither of which this is about.
+    assert outcome not in focus.OUTCOMES
+
+
+def test_the_budget_is_what_the_doorway_is_actually_given(cli_module, rig, monkeypatch):
+    """The arithmetic above is only worth anything if it reaches the host call."""
+    seen = {}
+
+    def fake_focus_lane(home, iid, call_seconds=None, **kw):
+        seen["call_seconds"] = call_seconds
+        return focus.Result(focus.FOCUSED, iid, workspace="w1", detail="front")
+
+    monkeypatch.setattr(cli_module.focus_lib, "focus_lane", fake_focus_lane)
+    assert cli_module._debug_focus(str(rig.home), "d4", 3.5) == (focus.FOCUSED, "front")
+    assert seen["call_seconds"] == 3.5
+
+
+def test_a_focus_that_blows_up_inside_the_engine_is_never_a_verdict_on_the_host(cli_module, rig,
+                                                                                monkeypatch):
+    """`focus_lane` answers rather than raises, by contract — and that contract is a promise to a
+    UI. If it is ever broken, the launch's own JSON body must survive, and the detail must not read
+    as a diagnosis of the host or the window."""
+    def boom(*a, **kw):
+        raise RuntimeError("focus_lane broke its own contract")
+
+    monkeypatch.setattr(cli_module.focus_lib, "focus_lane", boom)
+    outcome, detail = cli_module._debug_focus(str(rig.home), "d4", 5)
+    assert outcome == focus.HOST_UNREACHABLE      # "we could not be told", never "it is gone"
+    assert "inside the engine itself" in detail and "RuntimeError" in detail
+    assert "says nothing about the host" in detail

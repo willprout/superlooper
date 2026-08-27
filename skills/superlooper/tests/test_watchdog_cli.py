@@ -36,6 +36,7 @@ def cli():
     return mod
 _FIXTURES = Path(__file__).resolve().parent / "fixtures" / "gh"
 _FAKE_GH = Path(__file__).resolve().parent / "fakes" / "fake-gh"
+_FAKE_HOST = Path(__file__).resolve().parent / "fakes" / "fake-sessionhost"
 
 _LOW_USAGE = json.dumps({"auth_status": "ok", "five_hour_pct": 5.0, "seven_day_pct": 5.0})
 _EXHAUSTED_USAGE = json.dumps({"auth_status": "ok", "five_hour_pct": 99.0, "seven_day_pct": 5.0})
@@ -49,6 +50,15 @@ _FAKE_LAUNCH = """#!/bin/bash
   printf 'VERIFY %s\\n' "${SL_LAUNCH_VERIFY_SECONDS:-unset}"
   printf 'ATTENDED [%s]\\n' "${SL_ATTENDED:-}"
 } >> "$STUB_LOG"
+# The session handle the REAL launcher records at delivery confirmation (lib/launch.py ->
+# lib/panes.record). Opt-in via $STUB_WS so every test that predates issue #459 sees the state home
+# it always did — and so the one test that asserts the unattended launch focuses NOTHING is proving
+# an absence with a window genuinely there to raise, rather than passing for want of a marker.
+if [ -n "${STUB_WS:-}" ] && [ "${STUB_RC:-0}" = "0" ]; then
+  mkdir -p "${SL_RUN_ROOT:-}/state/panes"
+  printf '%s' "$STUB_WS"     > "${SL_RUN_ROOT:-}/state/panes/$3.ws"
+  printf '%s:p1' "$STUB_WS"  > "${SL_RUN_ROOT:-}/state/panes/$3"
+fi
 exit "${STUB_RC:-0}"
 """
 
@@ -245,6 +255,38 @@ def test_the_watchdog_launch_is_never_marked_attended(tmp_path):
     r = rig.run(SL_ATTENDED="1")
     assert r.returncode == 0, r.stderr
     assert "ATTENDED []" in rig.stub_log.read_text(), rig.stub_log.read_text()
+
+
+def test_the_watchdog_launch_never_brings_the_debuggers_window_to_the_front(tmp_path):
+    """Issue #459: surfacing the fixer's terminal is the OWNER TAP's, and only the owner tap's.
+
+    The tap is attended by definition — a person is standing at the dashboard, so stealing his
+    screen is what he asked for. The watchdog's debugger is the archetypal unattended launch: it
+    fires off a timer, at any hour, onto whatever the owner happens to be doing. A repair that
+    yanked his focus mid-sentence would be the loop interrupting him to tell him it is handling
+    something without him.
+
+    Proven with a window genuinely THERE to raise: the launcher records the handle (STUB_WS) and
+    the fake host has the workspace live, so nothing but the engine's own restraint keeps the
+    focus call from happening.
+    """
+    rig = _Rig(tmp_path)
+    rig.heartbeat(3600)
+    rig.episode(age_seconds=3600)
+    rig.anchor()
+    hostdir = tmp_path / "fakehost"
+    hostdir.mkdir()
+    (hostdir / "live.w1").write_text("")
+    r = rig.run(SL_HERDR=str(_FAKE_HOST), FAKE_HOST_DIR=str(hostdir), HOST_MODE="hollow",
+                STUB_WS="w1")
+    assert r.returncode == 0, r.stderr
+    assert [x["outcome"] for x in rig.wjournal()] == ["launched"]
+    assert (rig.home / "state" / "panes" / "d1.ws").read_text() == "w1", \
+        "the window must exist, or this test proves nothing"
+    assert not (hostdir / "focused.jsonl").exists(), "an unattended repair must steal no screen"
+    calls = [json.loads(x) for x in (hostdir / "calls.jsonl").read_text().splitlines()] \
+        if (hostdir / "calls.jsonl").exists() else []
+    assert not [c for c in calls if c[:2] == ["workspace", "focus"]], calls
 
 
 def test_env_pane_overrides_the_anchor(tmp_path):
