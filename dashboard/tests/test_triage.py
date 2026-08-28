@@ -356,3 +356,13 @@ def test_the_launch_records_own_id_key_is_read_as_well_as_the_acts():
                        detail=FINISH_SUMMARY)])
     assert block["state"] == triage.FINISHED
     assert block["counts"] == FINISH_COUNTS
+
+
+def test_the_run_is_chosen_by_the_clock_not_by_file_order():
+    # (Fresh-agent review round 2.) The journal is append-ordered in practice, but every display
+    # reader here sorts by ts rather than trusting that — `server._tower_window` says so in as many
+    # words. A launch line that lands out of order must not make an OLDER launch the day's run.
+    older = _launch(ts_offset=-7200, flight="t6")
+    newer = _launch(ts_offset=-3600, flight="t7")
+    block = _run([newer, older])              # newer FIRST in file order
+    assert block["id"] == "t7"

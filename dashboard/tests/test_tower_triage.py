@@ -316,3 +316,39 @@ def test_a_fence_record_with_no_readable_outcome_claims_neither_way():
                                     required=True, refused=False)).lower()
     assert "no session was created" in _plain(_row("fence_preflight", id="t7", verdict="open",
                                                    required=True, refused=True))
+
+
+# =============================== an act with no flight is nobody's flight ===============================
+# (Fresh-agent review round 2.) `lib/triage` already refuses to attribute an unstamped record to the
+# latest `t<N>`; the FEED has to refuse the same thing, or the two surfaces disagree about the same
+# line. The engine's own words for the empty id: "a legitimate thing for an operator to do and is
+# recorded honestly as such rather than attributed to a flight that never ran."
+
+def test_a_hand_run_verb_is_never_narrated_as_a_flight():
+    for act, fields in (("triage_close", {"num": 452, "verdict": "overtaken", "commit": "abc1234"}),
+                        ("triage_merge", {"num": 452, "absorber": 440}),
+                        ("triage_fix", {"num": 455, "fixed": ["touches"]}),
+                        ("triage_keep", {"num": 440}),
+                        ("triage_escalate", {"num": 460, "finding": "x"}),
+                        ("triage_refused", {"num": 461, "detail": "held"})):
+        for missing in ({}, {"flight": ""}, {"flight": "  "}, {"flight": 7}, {"flight": "i7"}):
+            text = _plain(_row(act, **dict(fields, **missing)))
+            assert "hand-run" in text, (
+                "%s with flight=%r must not be narrated as a flight's act" % (act, missing))
+            assert "triage flight" not in text
+            assert "#%d" % fields["num"] in text
+
+
+def test_a_hand_run_finish_says_the_run_was_closed_by_hand():
+    text = _plain(_row("triage_finish", flight="", detail="judged 2 · 0 merged"))
+    assert "hand-run" in text
+    assert "judged 2" in text
+
+
+def test_a_launch_record_is_always_a_flights_even_when_it_names_none():
+    # A `triage_launch` IS a flight launch by definition — that is what the record MEANS — so an
+    # unreadable id there is a nameless flight, never a hand-run verb. (`triage-flight` is the only
+    # thing that writes one, and it stamps the id it just allocated.)
+    text = _plain(_row("triage_launch", outcome="launched", detail="3 issues changed"))
+    assert "triage flight" in text.lower()
+    assert "hand-run" not in text

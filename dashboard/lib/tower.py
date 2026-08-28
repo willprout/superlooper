@@ -402,9 +402,19 @@ TRIAGE_ACTS = ("triage_launch", "triage_keep", "triage_fix", "triage_merge", "tr
 # record would change the board of every repo that has never flown one.
 FENCE_ACT = "fence_preflight"
 
-# What a flight is called when its own record does not name it — a `t<N>` we cannot read is still a
-# real record of something that happened, and an honest stand-in beats the phantom.
-_A_FLIGHT = "the triage flight"
+# What a record is called when it names no `t<N>`, and there are TWO answers because the records
+# mean two different things (fresh-agent review round 2):
+#
+#   * a per-issue ACT with no flight id was run BY HAND, from the owner's own shell. The CLI records
+#     the empty id deliberately — `superlooper` ▸ `_triage_flight_id`: "a legitimate thing for an
+#     operator to do and is recorded honestly as such rather than attributed to a flight that never
+#     ran". Calling it "the triage flight" is the #253 phantom in a quieter voice, and it would put
+#     the feed at odds with `lib/triage`, which already refuses that attribution on the card.
+#   * a `triage_launch` IS a flight launch — that is what the record MEANS — so an unreadable id
+#     there is a nameless flight rather than a hand-run verb. `superlooper triage-flight` is the only
+#     thing that writes one, and it stamps the id it has just allocated.
+_HAND_RUN = "A hand-run triage verb"
+_A_FLIGHT = "A triage flight"
 
 
 def _flight_id(rec):
@@ -419,8 +429,8 @@ def _flight_id(rec):
     return None
 
 
-def _flight_who(rec):
-    return _flight_id(rec) or _A_FLIGHT
+def _flight_who(rec, unnamed=_HAND_RUN):
+    return _flight_id(rec) or unnamed
 
 
 def _issue_ref(rec):
@@ -461,6 +471,7 @@ def _triage_row(rec):
     ref = _issue_ref(rec)
 
     if act == "triage_launch":
+        who = _flight_who(rec, _A_FLIGHT)      # a launch record is a flight's, named or not
         if rec.get("outcome") == "launched":
             why = _first_line(rec.get("detail"))
             return {"radio": "Survey aircraft airborne.", "kind": "launch",
@@ -517,10 +528,13 @@ def _triage_row(rec):
                 "text": "%s was REFUSED on %s — %s." % (who, ref, why)}
 
     # triage_finish — the run's own tally, in the flight's own words wherever it wrote them, so the
-    # feed, the run log and the morning report all read the same about one night.
+    # feed, the run log and the morning report all read the same about one night. A finish with no
+    # flight id was written by hand, and "closed ITS run" would attribute a run to the operator's
+    # shell; it closed THE run.
     said = _first_line(rec.get("detail"), 120)
+    whose = "its" if _flight_id(rec) else "the"
     return {"radio": "Survey complete.", "kind": "triage",
-            "text": "%s closed its run%s." % (who, " — %s" % said if said else "")}
+            "text": "%s closed %s run%s." % (who, whose, " — %s" % said if said else "")}
 
 
 def _fence_row(rec, fid):

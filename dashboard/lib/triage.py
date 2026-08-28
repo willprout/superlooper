@@ -240,10 +240,16 @@ def run(records, now, activity=None, window_seconds=WINDOW_SECONDS,
             continue                      # a record with no usable clock joins no run
         mine.append((ts, rec))
 
+    # BY THE CLOCK, not by file order (fresh-agent review round 2). The journal is append-ordered in
+    # practice, but every display reader here sorts by ts rather than trusting that — `_tower_window`
+    # says so in as many words — and a launch line that lands out of order must not make an older
+    # launch the day's run. File position breaks the tie, so two records sharing a ts stay stable.
+    mine.sort(key=lambda pair: pair[0])
+
     launch = None
     for ts, rec in mine:
         if rec.get("act") == LAUNCH_ACT:
-            launch = (ts, rec)            # file order: the last launch in the window is this run's
+            launch = (ts, rec)            # the LATEST launch in the window is this run's
     if launch is None:
         # Acts with no launch behind them are a hand-run verb from the owner's own shell (the CLI
         # records an EMPTY flight id for one, deliberately). They are real, and the tower log shows
