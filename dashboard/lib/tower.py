@@ -46,16 +46,30 @@ import fixer as fixer_mod
 # revealable on demand, never dropped.
 ROUTINE_ACTS = frozenset({"relabel", "triage_keep"})
 
+# The launcher's own preflight record (`lib/launch.FENCE_ACT`). Not a triage act — it is written on
+# EVERY launch — but a flight's carries the flight's `t<N>` id, so it is the one non-triage record a
+# flight produces, and unglossed it read "the flight fence_preflight." A worker's is deliberately
+# left exactly as it renders today: this issue renders a TRIAGE flight, and glossing a worker's
+# record would change the board of every repo that has never flown one.
+FENCE_ACT = "fence_preflight"
+
 
 def tier(rec):
     """Which tower-log tier a journal record belongs to: ``"routine"`` for machine bookkeeping that
     should not be announced on the comms radio (issue #36), ``"comms"`` for everything a human reads
     as real traffic. Pure and server-side (B.1) so the classification is data, not a UI debate. A
     non-dict / act-less record is ``"comms"`` — fail toward VISIBLE, never silently swallow an
-    unrecognised record (costume rule 4 / honesty §7)."""
+    unrecognised record (costume rule 4 / honesty §7).
+
+    The ``isinstance`` guard on ``act`` is not decoration (fresh-agent review round 3): ``{"act": []}``
+    is VALID JSON, so ``readers._iter_records`` yields it intact, and ``[] in <frozenset>`` RAISES
+    (a list is unhashable) rather than answering False. That raise lands inside the 2-second snapshot
+    poll, where it blanks the whole board for every repo — the #139 defect class, reached through the
+    one door a per-line JSON check cannot close."""
     if not isinstance(rec, dict):
         return "comms"
-    return "routine" if rec.get("act") in ROUTINE_ACTS else "comms"
+    act = rec.get("act")
+    return "routine" if isinstance(act, str) and act in ROUTINE_ACTS else "comms"
 
 
 def _num(rec):
@@ -395,13 +409,6 @@ def _event_row(rec, num):
 TRIAGE_ACTS = ("triage_launch", "triage_keep", "triage_fix", "triage_merge", "triage_close",
                "triage_escalate", "triage_refused", "triage_finish")
 
-# The launcher's own preflight record (`lib/launch.FENCE_ACT`). Not a triage act — it is written on
-# EVERY launch — but a flight's carries the flight's `t<N>` id, so it is the one non-triage record a
-# flight produces, and unglossed it read "the flight fence_preflight." A worker's is deliberately
-# left exactly as it renders today: this issue renders a TRIAGE flight, and glossing a worker's
-# record would change the board of every repo that has never flown one.
-FENCE_ACT = "fence_preflight"
-
 # What a record is called when it names no `t<N>`, and there are TWO answers because the records
 # mean two different things (fresh-agent review round 2):
 #
@@ -417,16 +424,22 @@ _HAND_RUN = "A hand-run triage verb"
 _A_FLIGHT = "A triage flight"
 
 
+# Which key names the flight, per act — the engine writes ONE of them on each record, and reading
+# either on either is a superset of its contract rather than a match for it (fresh-agent review
+# round 3). `id`: the launch (`triage-flight`, with the id it just allocated) and the launcher's own
+# `fence_preflight`. `flight`: every per-issue act and `triage_finish` (`_triage_record`, from
+# `SL_ISSUE_ID` — assigned by the launcher, never self-asserted). A record carrying the other key is
+# not making the engine's claim, so it is not read as one.
+_FLIGHT_KEY_BY_ACT = {"triage_launch": "id", FENCE_ACT: "id"}
+
+
 def _flight_id(rec):
-    """The ``t<N>`` this record belongs to — ``flight`` (what every act carries) or ``id`` (what the
-    launch and the fence record carry). ``None`` when neither names one, which is what a hand-run
-    verb from the owner's own shell looks like: the CLI records an EMPTY flight id for one,
-    deliberately, so it is not attributed to whichever flight ran last."""
-    for key in ("flight", "id"):
-        v = rec.get(key)
-        if isinstance(v, str) and re.match(r"^t[0-9]+$", v):
-            return v
-    return None
+    """The ``t<N>`` this record belongs to, or ``None``.
+
+    ``None`` is what a hand-run verb from the owner's own shell looks like: the CLI records an EMPTY
+    flight id for one, deliberately, so it is not attributed to whichever flight ran last."""
+    v = rec.get(_FLIGHT_KEY_BY_ACT.get(rec.get("act"), "flight"))
+    return v if isinstance(v, str) and re.match(r"^t[0-9]+$", v) else None
 
 
 def _flight_who(rec, unnamed=_HAND_RUN):

@@ -352,3 +352,50 @@ def test_a_launch_record_is_always_a_flights_even_when_it_names_none():
     text = _plain(_row("triage_launch", outcome="launched", detail="3 issues changed"))
     assert "triage flight" in text.lower()
     assert "hand-run" not in text
+
+
+# =============================== each record is read the way the ENGINE writes it ===============================
+# (Fresh-agent review round 3.) The two keys are NOT interchangeable, and reading them as if they
+# were is a superset of the engine's contract rather than a match for it:
+#
+#   `id`      is what a LAUNCH (`triage-flight`) and the launcher's `fence_preflight` stamp.
+#   `flight`  is what every per-issue act and `triage_finish` stamp (`_triage_record`, from
+#             `SL_ISSUE_ID` — assigned by the launcher, never self-asserted).
+#
+# So a hand-run act carrying an empty `flight` beside some other `id` must stay a hand-run act.
+
+def test_a_hand_run_act_is_not_rescued_by_an_id_the_engine_never_writes_there():
+    for act in ("triage_close", "triage_merge", "triage_fix", "triage_keep", "triage_escalate",
+                "triage_refused", "triage_finish"):
+        text = _plain(_row(act, num=452, flight="", id="t7", verdict="overtaken",
+                           commit="abc1234", absorber=440, detail="x"))
+        assert "hand-run" in text, "%s must be attributed by `flight` alone" % act
+        assert "t7" not in text
+
+
+def test_a_launch_is_not_named_by_a_flight_key_the_engine_never_writes_there():
+    text = _plain(_row("triage_launch", flight="t7", outcome="launched", detail="x"))
+    assert "A triage flight departed" in text, "a launch is named by `id`, which this record lacks"
+
+
+def test_a_fence_record_with_no_id_is_not_a_flights():
+    # The launcher writes `{act, id, verdict, required, socket, refused}` — no `flight` key at all,
+    # so a `flight` here is not the engine's claim and the record falls through exactly as it did
+    # before this issue.
+    row = _row("fence_preflight", flight="t7", verdict="fenced", refused=False)
+    assert row["kind"] == "unknown"
+    assert "fence check" not in _plain(row)
+
+
+# =============================== one corrupt line may not blank the board ===============================
+
+def test_a_wrong_typed_act_never_raises_out_of_the_gloss():
+    # `{"act": []}` is VALID JSON, so `readers._iter_records` yields it intact — and `act in
+    # ROUTINE_ACTS` then raised TypeError (a list is unhashable) inside the 2-second snapshot poll,
+    # taking the whole board down for every repo. Found by the round-3 review; pre-existing, and in
+    # the classifier this issue extends, so it is fixed here rather than left as a landmine.
+    for act in ([], {}, {"a": 1}):
+        assert tower.tier({"act": act}) == "comms"
+        row = tower.comms_row({"act": act})
+        assert isinstance(row["text"], str) and row["text"].strip()
+        assert row["tier"] == "comms"

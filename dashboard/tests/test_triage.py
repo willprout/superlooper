@@ -348,14 +348,17 @@ def test_a_launch_that_names_no_flight_attributes_no_acts_to_it():
     assert "could not be attributed" in block["text"] or "did not name" in block["text"]
 
 
-def test_the_launch_records_own_id_key_is_read_as_well_as_the_acts():
-    # The launch stamps the flight under `id`; every act stamps it under `flight`. Both are the same
-    # claim, and a reader that knows only one of them attributes nothing (or everything).
-    block = _run([_rec("triage_launch", -3600, id="t7", num=None, outcome="launched", detail="x"),
-                  _rec("triage_finish", -120, id="t7", counts=dict(FINISH_COUNTS),
-                       detail=FINISH_SUMMARY)])
-    assert block["state"] == triage.FINISHED
-    assert block["counts"] == FINISH_COUNTS
+def test_each_record_is_attributed_by_the_key_the_engine_stamps_on_IT():
+    # The launch stamps the flight under `id`; every act and the finish stamp it under `flight`.
+    # These are NOT interchangeable (fresh-agent review round 3): reading either on either makes
+    # this reader a superset of the engine's contract rather than a match for it, and the superset
+    # is what lets a record the engine never wrote ground a working flight.
+    launch = _rec("triage_launch", -3600, id="t7", num=None, outcome="launched", detail="x")
+    assert _run([launch, _rec("triage_finish", -120, flight="t7", counts=dict(FINISH_COUNTS),
+                              detail=FINISH_SUMMARY)])["state"] == triage.FINISHED
+    # the same finish, stamped only under the LAUNCH's key: not this flight's close
+    assert _run([launch, _rec("triage_finish", -120, id="t7", counts=dict(FINISH_COUNTS),
+                              detail=FINISH_SUMMARY)])["state"] == triage.FLYING
 
 
 def test_the_run_is_chosen_by_the_clock_not_by_file_order():
@@ -366,3 +369,27 @@ def test_the_run_is_chosen_by_the_clock_not_by_file_order():
     newer = _launch(ts_offset=-3600, flight="t7")
     block = _run([newer, older])              # newer FIRST in file order
     assert block["id"] == "t7"
+
+
+def test_the_card_attributes_by_the_key_the_engine_actually_writes():
+    # (Fresh-agent review round 3.) `id` names a LAUNCH; `flight` names an act or a finish. Reading
+    # either on either record is a superset of the engine's contract: a hand-run finish carrying some
+    # other `id` would ground a working flight, and a hand-run act would be counted into its run.
+    block = _run([_launch(flight="t7"),
+                  _rec("triage_close", -2400, num=452, flight="", id="t7", verdict="overtaken",
+                       commit="abc1234"),
+                  _rec("triage_finish", -120, flight="", id="t7", counts=dict(FINISH_COUNTS),
+                       detail=FINISH_SUMMARY)])
+    assert block["state"] == triage.FLYING, "a hand-run finish does not close t7's run"
+    assert block["on_field"] is True
+    assert block["counts"] == {k: 0 for k in triage.COUNT_KEYS}
+
+
+def test_a_launch_carrying_only_a_flight_key_puts_no_plane_on_the_field():
+    # `triage-flight` stamps the id it just allocated under `id`. A record naming the flight only
+    # under `flight` is not that claim, and a plane is a claim that a session is running.
+    block = _run([_rec("triage_launch", -3600, flight="t7", num=None, outcome="launched",
+                       detail="x")])
+    assert block["present"] is True
+    assert block["id"] is None
+    assert block["on_field"] is False

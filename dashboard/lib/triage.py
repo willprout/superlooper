@@ -135,23 +135,26 @@ def _is_triage(rec):
 
 
 def _rec_flight(rec):
-    """The ``t<N>`` a record belongs to, or ``None``.
+    """The ``t<N>`` a record belongs to, or ``None`` — read from the key the ENGINE writes for THAT
+    act, and from no other (fresh-agent review round 3).
 
-    Two keys, because the engine stamps it under two: an act carries ``flight`` (``_triage_record``
-    reads ``SL_ISSUE_ID``, which the LAUNCHER assigns and no session can self-assert) and the launch
-    itself carries ``id``. Both are the same claim, and a reader that knows only one of them
-    attributes either nothing or everything.
+    The two keys are not interchangeable, and treating them as if they were makes this reader a
+    superset of the engine's contract rather than a match for it:
+
+      ``id``      a LAUNCH stamps it there (``triage-flight``, with the id it has just allocated).
+      ``flight``  every per-issue act and ``triage_finish`` stamp it there (``_triage_record``,
+                  reading ``SL_ISSUE_ID`` — assigned by the launcher, never self-asserted).
+
+    A record carrying the other key is not making the engine's claim, so it is not read as one.
 
     ``None`` is the load-bearing answer, and it is the engine's own (``triage.finished_flights``): a
     hand-run verb from the owner's shell journals an EMPTY flight id — the CLI reads it from the
     session's environment and a terminal has none — and that record belongs to NO flight rather than
     to whichever one ran last.
     """
-    for key in ("flight", "id"):
-        v = rec.get(key)
-        if is_flight_id(v):
-            return v
-    return None
+    key = "id" if rec.get("act") == LAUNCH_ACT else "flight"
+    v = rec.get(key)
+    return v if is_flight_id(v) else None
 
 
 def _one_line(text, limit=140):
