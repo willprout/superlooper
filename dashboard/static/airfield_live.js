@@ -20,7 +20,10 @@
              landmarks: [bool x4] (which painted landmark under the leg is lit — the SERVER's
                         verdict, one flag per sign west→east, issue #444),
              flights: [{num, label, stage, circuitStage, runway, contrail, spinning, trouble,
-                        tail}] }
+                        tail, kind}] }
+     `kind` is 'triage' for the loop's own survey aircraft (issue #451) and absent for a lane. It is
+     the ONLY thing that separates the two here: a flight's `t7` and a lane's `i7` carry the same
+     number, so a sprite is keyed by `keyOf()` and never by the bare number.
 
    The circuit (counterclockwise, from the prototype): leg E along the top (y 30) → descent arc
    at the east → landing roll W on the runway → climb arc at the west back to the leg. Runway 0
@@ -54,6 +57,35 @@
   var WANDER = { x: 4, y: 3 };
   var WANDER_STAGES = { downwind: 1 };
   var SEP_MIN = 38;
+
+  // The triage flight's survey track (issue #451). A `t<N>` is not in the circuit at all — it opens
+  // no branch, files no PR and owns no runway (#463: it has no lane record, by design) — so giving
+  // it a circuit anchor would be the one thing this render must never say. It flies its own track,
+  // which is also what the aircraft is actually doing: loitering over the queue, looking at
+  // everything, landing nothing.
+  //
+  // A FLAT racetrack rather than a wide circle, and the flatness is what makes it fit: it holds the
+  // survey in ONE altitude band for the whole lap, so the aircraft has one set of neighbours to
+  // clear instead of four. The band is the runway corridor — its hull spans y 61–139, which is empty
+  // of every circuit anchor: clear below the downwind leg (hull bottom 51) and the base turn, clear
+  // above the apron taxiway (154) and the stand, and at the east turn (x 350) clear of both the
+  // final-approach slot (x 370+) and the control tower. It crosses the two runway STRIPS, which is
+  // what an overflight does — and the `air: true` shadow offset, which no ground plane carries, is
+  // the sprite saying so.
+  var SURVEY = { cx: 200, cy: 100, rx: 150, ry: 18 };
+  // Its own clock, not the holders' (HOLD_RATE): a survey is not queueing to land, and one lazy lap
+  // a minute reads as patrol where the hold's brisk circuit reads as impatience.
+  var SURVEY_RATE = 0.10;                    // rad/s — ~63s per lap
+  // The survey's label. Pinned to the TRACK, not to the hull — a plane that never stops moving
+  // cannot carry a legible label on its back, so this is the holding tag's discipline (a caption
+  // over the pattern) one aircraft over. It hangs just below the track's southern edge, in the grass
+  // between the second runway and the apron taxiway, where the survey's own hull never reaches it.
+  var SURVEY_TAG = { x: 200, y: 148 };
+  // The survey's livery. A flight belongs to no airline — it is the LOOP's own aircraft, not the
+  // repo's — so it never wears the repo's tail colour, and it must not wear the default one either
+  // or it reads as an unbranded build flight. Its own cool slate-cyan, the same the `.fld-tag.survey`
+  // label is painted in, so the plane and its name are visibly one thing.
+  var SURVEY_TAIL = '#3E7F92';
 
   // The towed name banners (issue #204). EVERY plane on the downwind leg tows its own name cloth
   // (server-chosen list, repo.field_banners) so no in-flight plane is nameless. A single westward
@@ -93,6 +125,11 @@
       case 'holding':                        // the drawn holding pattern ("number 2 for landing")
         return { x: HOLD.cx + HOLD.rx + slot * 10, y: HOLD.cy, dir: 'S', air: true, small: false,
                  orbit: { cx: HOLD.cx, cy: HOLD.cy, rx: HOLD.rx + slot * 10, ry: HOLD.ry + slot * 5 } };
+      case 'survey':                         // the triage flight (issue #451) — never on the circuit
+        return { x: SURVEY.cx + SURVEY.rx, y: SURVEY.cy, dir: 'S', air: true, small: false,
+                 awacs: true,
+                 orbit: { cx: SURVEY.cx, cy: SURVEY.cy, rx: SURVEY.rx, ry: SURVEY.ry,
+                          rate: SURVEY_RATE, solo: true } };
       default:
         return air(170, 30, 'E');
     }
@@ -105,11 +142,35 @@
   // flight's UNDERLYING circuit position (§5 — the amber ring / grey hull / stranded plane render
   // in place, no magic fix). A stranded gate's circuitStage is 'final', so it sits ON the gate.
   function placementOf(f) {
+    if (f.stage === 'survey') return 'survey';        // the triage flight's own track (issue #451)
     if (f.stage === 'holding') return 'holding';
     if (f.stage === 'parked') return 'parked';
     if (f.stage === 'awaiting' || f.stage === 'session-frozen' ||
         f.stage === 'stranded') return f.circuitStage || 'downwind';
     return f.stage;
+  }
+
+  // A flight's sprite key. A LANE is keyed by its issue number, as it always has been; the triage
+  // flight is keyed by its own id, because `t7` and `i7` are DIFFERENT AIRCRAFT that carry the same
+  // number — keying either by the bare number would make one silently replace the other on the field.
+  function keyOf(f) { return f.kind === 'triage' ? 't' + f.num : String(f.num); }
+
+  // Draw/hit order: by flight number, then by key, so the ordering is stable across polls even when
+  // a lane and a flight share a number. (The old `Object.keys(...).map(Number)` cannot survive a
+  // non-numeric key — it yields NaN, and NaN sorts nowhere.)
+  function byFlight(sprites) {
+    return Object.keys(sprites).sort(function (a, b) {
+      return (sprites[a].flight.num - sprites[b].flight.num) || (a < b ? -1 : a > b ? 1 : 0);
+    });
+  }
+
+  // {key: position} for an already-ordered key list — the secondary sort key the hull and hit passes
+  // reuse, so "ascending flight number" survives being re-sorted by altitude. A map rather than an
+  // indexOf inside the comparator: the comparator runs O(n log n) times and indexOf is a scan.
+  function rankOf(keys) {
+    var rank = {};
+    for (var i = 0; i < keys.length; i++) rank[keys[i]] = i;
+    return rank;
   }
 
   function spriteBox(dir, small) {
@@ -161,7 +222,10 @@
 
       // Deterministic slot allocation: same flights → same slots, sorted by flight number.
       var byPlace = {};
-      var ordered = m.flights.slice().sort(function (a, b) { return a.num - b.num; });
+      var ordered = m.flights.slice().sort(function (a, b) {
+        var ka = keyOf(a), kb = keyOf(b);
+        return (a.num - b.num) || (ka < kb ? -1 : ka > kb ? 1 : 0);
+      });
       var layoutTags = [];
       var seen = {};
       var standXs = [];          // x of each plane at the stand — one marquee is placed over them
@@ -169,6 +233,7 @@
       // distributed evenly around it by phase (two opposite, three at thirds, …), so no two coincide
       // (issue #203, owner ruling #1). The slot is just an index; landing order lives in the tags.
       var holdCount = ordered.filter(function (f) { return placementOf(f) === 'holding'; }).length;
+      var surveyTag = null;
       ordered.forEach(function (f) {
         var place = placementOf(f);
         var groupKey = place + (place === 'taxi-out' || place === 'takeoff' ||
@@ -177,13 +242,18 @@
         var slot = byPlace[groupKey];
         var anchor = anchorFor(place, f.runway, slot);
         byPlace[groupKey]++;
-        if (anchor.orbit) anchor.orbit.phase = M.holdPhase(slot, holdCount);   // even holding spacing
-        seen[f.num] = true;
+        // The holders share one loop and are phase-spaced around it; the survey flies alone on its
+        // own track, so it takes no slot phase (`solo`) and keeps the angle it has.
+        if (anchor.orbit && !anchor.orbit.solo) {
+          anchor.orbit.phase = M.holdPhase(slot, holdCount);   // even holding spacing
+        }
+        var key = keyOf(f);
+        seen[key] = true;
 
-        var s = sprites[f.num];
+        var s = sprites[key];
         if (!s) {
-          s = sprites[f.num] = { cur: { x: anchor.x, y: anchor.y }, dir: anchor.dir,
-                                 trail: [], th: -1.2, dustUntil: 0, path: null };
+          s = sprites[key] = { cur: { x: anchor.x, y: anchor.y }, dir: anchor.dir,
+                               trail: [], th: -1.2, dustUntil: 0, path: null };
         }
         // A holder that STAYS a holder must never transit: when the holder count changes its slot
         // (and so its ring radius / east-point x) is reassigned, but routing that through the
@@ -251,7 +321,16 @@
           layoutTags.push({ kind: 'stranded', x: anchor.x, y: anchor.y - box.h / 2 - 6,
                             text: f.label + ' · STRANDED AT GATE' });
         }
+        // The survey's own label. Pinned UNDER its track rather than to the hull, the way the
+        // holding-pattern tag is pinned over its ellipse (issue #203): a plane that never stops
+        // moving cannot carry a legible label on its back, and a tag that chases an orbit is
+        // unreadable. Named in the flight's own id so the line stays journal-greppable (§3).
+        if (f.stage === 'survey') {
+          surveyTag = { kind: 'survey', x: SURVEY_TAG.x, y: SURVEY_TAG.y,
+                        text: f.label + ' · TRIAGE SURVEY' };
+        }
       });
+      if (surveyTag) layoutTags.push(surveyTag);
       Object.keys(sprites).forEach(function (k) { if (!seen[k]) delete sprites[k]; });
 
       // The queued planes get ONE calm marquee over the whole stand, not a colliding tag per plane
@@ -320,6 +399,17 @@
       }
       if (s.target.orbit) {                                    // holding: distributed around the loop
         var o = s.target.orbit;
+        if (o.solo) {
+          // The triage survey (issue #451) flies its track ALONE, so there is no slot to ease into
+          // and no shared base to stay in step with — just its own lazy angular rate. Reduced motion
+          // gets one honest still on its entry point, exactly as a holder does.
+          if (!reduced) s.th += dt * (o.rate || HOLD_RATE);
+          s.cur.x = o.cx + Math.cos(s.th) * o.rx;
+          s.cur.y = o.cy + Math.sin(s.th) * o.ry;
+          var svx = -Math.sin(s.th) * o.rx, svy = Math.cos(s.th) * o.ry;
+          s.dir = Math.abs(svx) > Math.abs(svy) ? (svx > 0 ? 'E' : 'W') : (svy > 0 ? 'S' : 'N');
+          return;
+        }
         var desired = holdBase + (o.phase || 0);               // this holder's evenly-spaced slot
         if (reduced) {
           s.th = desired;                                      // honest still, but still phase-separated
@@ -356,7 +446,7 @@
     function bannerLayout() {
       var planes = [];
       (model.banners || []).forEach(function (b) {
-        var s = sprites[b.num];
+        var s = sprites[String(b.num)];      // banners are the server's LANE list — never a flight
         if (!s || s.path || placementOf(s.flight) !== 'downwind') return;
         planes.push({ num: b.num, x: s.target.x, halfW: spriteBox(s.target.dir, s.target.small).w / 2 });
       });
@@ -555,7 +645,7 @@
       ctx.drawImage(base, 0, 0);
       ctx.setTransform(S, 0, 0, S, 0, 0);
 
-      var nums = Object.keys(sprites).map(Number).sort(function (a, b) { return a - b; });
+      var nums = byFlight(sprites);
       var spotlit = [];
 
       // motion + trails first (trails render under every hull)
@@ -566,11 +656,15 @@
       });
       if (!reduced) separateWanderers(nums);   // nudge so no wanderer overlaps a plane or a banner
 
-      // the holding pattern racetrack, under its plane
+      // the holding pattern racetrack, under its plane. A SOLO orbit is the triage survey's (issue
+      // #451) and is deliberately never painted: this ring means "aircraft are stacked here waiting
+      // to land", and a second one five times its size drawn over the whole field would say exactly
+      // that about the one aircraft that is not landing at all. The survey is read from its own
+      // airframe, its contrail and its label — not from a pattern it is not flying.
       var holdDrawn = false;
       nums.forEach(function (n) {
         var s = sprites[n];
-        if (!s.target.orbit || holdDrawn) return;
+        if (!s.target.orbit || s.target.orbit.solo || holdDrawn) return;
         holdDrawn = true;
         var o = s.target.orbit;
         ctx.fillStyle = 'rgba(250,246,228,0.95)';
@@ -583,9 +677,10 @@
       nums.forEach(function (n) { drawTrail(sprites[n], now); });
 
       // hulls — ground planes first (an air hull always overlaps a ground hull, never under it)
+      var rank = rankOf(nums);
       var order = nums.slice().sort(function (a, b) {
         var A2 = sprites[a].target.air ? 1 : 0, B2 = sprites[b].target.air ? 1 : 0;
-        return A2 - B2 || a - b;
+        return A2 - B2 || rank[a] - rank[b];
       });
       order.forEach(function (n) {
         var s = sprites[n], f = s.flight;
@@ -596,7 +691,13 @@
         var o = { air: inAir, dim: dim, chocks: f.stage === 'parked',
                   tint: (!dim && model.time !== 'day') ? model.time : null,
                   tail: f.tail };
-        var drawFn = s.target.small ? A.live.planeSmall : A.live.plane;
+        // The survey aircraft is its OWN airframe (issue #451): the rotodome hull the sprite sheet
+        // already carries, so a triage flight is a different aeroplane at a glance and not merely a
+        // differently-coloured build flight. Its livery is its own too — it flies for the loop, not
+        // for this repo's airline, so SURVEY_TAIL replaces `f.tail` rather than reading it.
+        var drawFn = s.target.awacs ? A.live.planeAwacs
+                   : s.target.small ? A.live.planeSmall : A.live.plane;
+        if (s.target.awacs) o.tail = SURVEY_TAIL;
         drawFn(ctx, px, py, s.dir, o);
         if (model.time !== 'day' && !dim && (reduced || frame % 22 < 13)) {
           A.live.navLights(ctx, px, py, s.dir, !s.target.small);
@@ -621,7 +722,7 @@
       // another cloth; a leader flexes from the wandering hull's tail down to the cloth. The text is
       // an HTML overlay (field.js) pinned to the same anchor, so cloth and label never separate.
       bannerCache.forEach(function (r) {
-        var s = sprites[r.num];
+        var s = sprites[String(r.num)];
         if (!s) return;
         var box = spriteBox(s.dir, s.target.small);
         var tp = tailPoint(s.cur.x, s.cur.y, s.dir, box);      // wandering hull's tail
@@ -652,15 +753,21 @@
     function hitTest(lx, ly) {
       // Mirror the hull draw order (ground first, then air, ascending num) REVERSED, so the tap
       // always lands on the visually topmost plane (review fix 2026-07-07).
-      var order = Object.keys(sprites).map(Number).sort(function (a, b) {
+      var keys = byFlight(sprites), rank = rankOf(keys);
+      var order = keys.slice().sort(function (a, b) {
         var A2 = sprites[a].target.air ? 1 : 0, B2 = sprites[b].target.air ? 1 : 0;
-        return A2 - B2 || a - b;
+        return A2 - B2 || rank[a] - rank[b];
       });
       for (var i = order.length - 1; i >= 0; i--) {
         var s = sprites[order[i]];
+        // A survey plane opens no flight card — it has no lane, no branch, no PR and no drawer to
+        // open (#463), and a tap that opened one for issue #7 because the flight is called `t7`
+        // would be the same phantom the tower's own chips refuse. It is skipped rather than
+        // returning null, so a lane plane UNDER it stays tappable.
+        if (s.flight.kind === 'triage') continue;
         var box = spriteBox(s.dir, s.target.small);
         if (Math.abs(lx - s.cur.x) <= box.w / 2 + 4 && Math.abs(ly - s.cur.y) <= box.h / 2 + 4) {
-          return order[i];
+          return s.flight.num;
         }
       }
       return null;

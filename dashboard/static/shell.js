@@ -461,7 +461,33 @@
         '<span class="in-air">● ' + inAir + ' IN THE AIR</span>' +
         '<span>' + esc(queue) + '</span>' +
         '<span class="look">' + (s.needs_you ? s.needs_you.length : 0) + ' WAITING ON YOU</span>' +
-      '</div></div>';
+      '</div>' + triageHTML(r) + '</div>';
+  }
+
+  // The triage flight's card (issue #451) — the day's `t<N>` survey and what its run did, under the
+  // field the survey aircraft is flying over. Tap-where-you-read (§0.3): the plane and the account of
+  // what it closed belong in one glance, and this is the only surface that ever names an ISSUE the
+  // loop closed without anyone watching, so it renders where the owner is already looking.
+  //
+  // Every semantic is the server's (`lib/triage.run`): the headline, the sentence, the run's tally in
+  // the FLIGHT's own words wherever it wrote them, and whether the numbers are the flight's or ours.
+  // This binds them and derives nothing (design B.1). No flight ⇒ NO CARD, which is the whole of what
+  // a repo that has not opted in ever sees — the same honest silence the morning report keeps.
+  function triageHTML(r) {
+    var t = r && r.triage;
+    if (!t || !t.present) return "";
+    var esc2 = esc;
+    var loud = t.escalated > 0
+      ? '<span class="tri-esc" title="findings the flight was NOT authorised to act on — ' +
+        'prioritisation stays yours">' + t.escalated + ' FOR YOU</span>'
+      : "";
+    var note = t.counts_note
+      ? '<span class="tri-note">' + esc2(t.counts_note) + '</span>'
+      : "";
+    return '<div class="triage-card is-' + esc2(t.state) + '">' +
+             '<span class="tri-head">' + esc2(t.headline) + '</span>' +
+             '<span class="tri-text">' + esc2(t.text) + '</span>' + loud + note +
+           '</div>';
   }
 
   function towerHTML(r) {

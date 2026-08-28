@@ -192,6 +192,19 @@
                runway: 0, contrail: 'none', spinning: false, trouble: false, tail: tail };
     });
 
+    // The triage flight (issue #451) — the loop's OWN survey aircraft, not one of this repo's lanes.
+    // Everything semantic is the server's (`lib/triage.run`): whether a plane belongs on the field at
+    // all, which flight it is, and what its contrail says about the session's liveness. This file
+    // carries that to one more plane and derives nothing — the same binding the stand gets above.
+    // It rides its own list rather than `repo.flights` because it is not a lane: it has no loopstate
+    // record, no branch and no PR (#463), and a bare `7` in the lane list would be issue #7's plane.
+    var tri = repo.triage;
+    var surveyFlights = (tri && tri.on_field)
+      ? [{ num: tri.num, label: tri.label, stage: 'survey', circuitStage: 'survey', kind: 'triage',
+           runway: 0, contrail: tri.contrail || 'none', spinning: false, trouble: false,
+           tail: null }]
+      : [];
+
     // Which planes tow a name cloth and what each says are CHOSEN server-side (repo.field_banners,
     // squint test — issue #204 generalised the single pick to a list) — this file only carries them
     // to the cloths; the engine staggers the placement occlusion-free.
@@ -220,7 +233,7 @@
       link: linkLost ? 'lost' : 'ok',
       banners: banners,
       landmarks: landmarks,
-      flights: flights.concat(standFlights)
+      flights: flights.concat(standFlights, surveyFlights)
     });
 
     var ctxState = { snapshot: snapshot, repo: repo, banners: banners, fun: fun };
