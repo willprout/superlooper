@@ -223,6 +223,49 @@ def test_a_malformed_lane_id_is_refused_before_anything_is_written(rig):
     assert rig.launch_calls() == []
 
 
+# --------------------------- the triage flight (issue #463) ---------------------------
+
+def test_a_triage_flight_is_refused_with_its_own_reason_not_as_a_bad_id(rig):
+    """`resume` says NO to a `t<N>`, and the whole value of the answer is that it is a sentence.
+
+    Before #463 a flight fell off the end of the `[id]` character class and got the malformed-id
+    refusal — which reads as "you typed that wrong", for an id the launcher itself minted. The
+    flight is recognised now and refused on its own grounds: the one-a-day lease is spent BEFORE
+    the session exists precisely so a dead flight is not relaunched an hour later."""
+    rig.record_session(iid="t7")
+    (rig.home / "triage").mkdir(parents=True, exist_ok=True)
+    r = run(rig, "resume", "t7", "--json")
+    assert r.returncode == 1
+    out = jbody(r)
+    assert out["ok"] is False
+    err = out["error"]
+    assert "triage flight" in err
+    assert "lease" in err or "one flight per day" in err
+    assert "not a lane id" not in err, "a flight is a recognised class, not a typo"
+    # and it says where the flight's memory actually IS, so the refusal is actionable
+    assert "verdict" in err
+    assert rig.launch_calls() == [], "nothing may be launched on the refusal path"
+
+
+def test_a_triage_flight_is_refused_by_the_read_only_preflight_too(rig):
+    # --check must give the same answer as the act; a UI that showed "resumable" and then failed
+    # would be the shape every --check in this engine exists to avoid.
+    rig.record_session(iid="t7")
+    r = run(rig, "resume", "t7", "--check", "--json")
+    assert r.returncode == 1
+    assert jbody(r)["ok"] is False
+    assert rig.launch_calls() == []
+
+
+def test_an_unknown_id_shape_is_still_refused_as_a_bad_id(rig):
+    # The widening added a CLASS; it did not open the pattern.
+    for junk in ("t", "x7", "tt7", "t7x", "7"):
+        r = run(rig, "resume", junk, "--json")
+        assert r.returncode == 1, junk
+        assert "not a lane id" in jbody(r)["error"], junk
+    assert rig.launch_calls() == []
+
+
 def test_a_failed_launch_is_reported_as_failed_not_as_success(rig):
     rig.seed_lane()
     rig.record_session()

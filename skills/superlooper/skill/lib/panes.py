@@ -119,7 +119,12 @@ def forget(state, iid):
 
 
 def recorded_ids(state):
-    """The lanes with a recorded session window. Missing/unreadable directory -> empty set."""
+    """The sessions with a recorded session window. Missing/unreadable directory -> empty set.
+
+    ALL THREE classes the launcher spawns — `i<N>` worker, `d<N>` debugger, `t<N>` triage flight —
+    because this lists what is on disk and the launcher records all three here. Narrowing to a class
+    is the CALLER's, stated at each caller (issue #463): `superlooper tidy` selects lanes and
+    flights by two different rules and leaves the debugger seat to the owner."""
     out = set()
     try:
         names = os.listdir(_dir(state))

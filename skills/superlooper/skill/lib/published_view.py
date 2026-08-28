@@ -158,7 +158,12 @@ def build(gh_view, raw_by_id, tracked_ids, now, polled_at=None, carry_titles=Non
     ``gh_view``     the runner's in-memory view (``stale``, ``consecutive_failures``,
                     ``closed_nums``, ``prs``, ``dev_checks``).
     ``raw_by_id``   ``{iid: raw gh issue dict}`` for the issues polled this window.
-    ``tracked_ids`` the iids loopstate still tracks — what bounds both carries.
+    ``tracked_ids`` the iids loopstate still tracks — what bounds both carries, and therefore what
+                    keeps a `t<N>` TRIAGE FLIGHT out of this document entirely (issue #463). A
+                    flight has no loopstate record by design, so it is never tracked, never carried
+                    and never given a phase — the answer is settled upstream rather than by a test
+                    here. #451 owns how a flight renders; until then it renders as nothing, which is
+                    honest, rather than as a lane with every column empty.
     ``now``         this tick's wall clock (stamped as ``published_at``).
     ``polled_at``   the last SUCCESSFUL GitHub poll's clock, or ``None`` if never reached. A
                     DIFFERENT clock from ``published_at`` on purpose: the dashboard shows how old

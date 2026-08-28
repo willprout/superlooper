@@ -120,6 +120,26 @@ NOT_SUBJECT_LABELS = (limitations.LEDGER_LABEL,)
 # somewhere else must not be able to write outside the runs folder.
 _DATE_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
 
+# --------------------------------------------------------------------------- the flight's own id
+
+# THE one spelling of the `t<N>` shape (issue #463). It was written out three times before this —
+# in the CLI's `_triage_flight_id`, in the launcher's mode guard, in the upkeep census — and the
+# engine's lane verbs and state readers had it written out nowhere, which is the whole of what #463
+# is about: a session class the launcher spawns, that every reader silently declined to match.
+# Living here, beside the rest of what a flight IS, is what lets a verb ASK rather than re-spell.
+FLIGHT_ID_RE = re.compile(r"^t[0-9]+$")
+
+
+def is_flight_id(value):
+    """Is ``value`` the id of a triage flight?
+
+    A total predicate on ANY input, deliberately: its callers are id-shape guards standing in front
+    of path joins and set lookups, and a guard that raised on a wrong-typed id would be a guard the
+    caller has to guard. Anything that is not a `t<N>` string — a lane id, a bare ``t``, a
+    ``t7.ws`` sidecar, a number, None — is simply not one.
+    """
+    return isinstance(value, str) and FLIGHT_ID_RE.match(value) is not None
+
 # --------------------------------------------------------------------------- the two homes
 
 # Where a flight runs. The RULED default is the repo's real checkout, so the flight sees what an
@@ -504,6 +524,43 @@ def recent_run_logs(state_home, limit=3):
     return out
 
 
+# --------------------------------------------------------------------------- what a flight IS
+
+# The one act that means A FLIGHT CLOSED ITS RUN. `superlooper triage-finish` is the flight's own
+# last move — it writes the sitting sheet and the run's tally into the day's log — and it journals
+# this act stamped with the flight's id (`SL_ISSUE_ID`, assigned by the launcher, never
+# self-asserted).
+FINISH_ACT = "triage_finish"
+
+
+def finished_flights(records):
+    """The flight ids whose RUN IS CLOSED, read from journal records — ``{"t7", "t9"}``.
+
+    This is the ONE positive "that flight is done" signal the engine has, and `superlooper tidy`
+    needs it for a reason nothing else supplies: a finished claude session idles at its prompt
+    forever and never self-exits (D4), so a flight that has written its sitting sheet still holds a
+    live pid and a live window. Liveness alone therefore cannot tell a finished flight from one
+    still working through the queue; this can.
+
+    What it deliberately does NOT do is decide the other half. A flight that died mid-run journals
+    no finish at all, and is recognised instead by its session being GONE — see
+    ``tidy.closable_flights``, which takes both readings and states which scope each falls in.
+
+    A hand-run ``triage-finish`` outside a flight journals an EMPTY ``flight`` (the CLI records the
+    id from the session's own environment, and an operator's shell has none). That record is
+    skipped rather than attributed to whichever flight ran last: it says honestly that it belongs
+    to none.
+
+    Pure and total. A records view that is not a list, a record that is not a dict, a ``flight``
+    that is not a ``t<N>`` string — every one of them is skipped, because the cost of a wrong
+    reading here is a window closed on a flight that is still flying.
+    """
+    if not isinstance(records, (list, tuple)):
+        return set()
+    return {r["flight"] for r in records
+            if isinstance(r, dict) and r.get("act") == FINISH_ACT and is_flight_id(r.get("flight"))}
+
+
 # --------------------------------------------------------------------------- the config reads
 
 def enabled(config):
@@ -573,7 +630,8 @@ def due(open_issues, state_home, date, config):
 
 
 __all__ = ["DIR", "CONFIG_KEY", "RUNS", "VERDICTS", "HELD_LABELS", "NOT_SUBJECT_LABELS",
-           "CHECKOUT", "WORKTREE", "HOMES",
+           "CHECKOUT", "WORKTREE", "HOMES", "FLIGHT_ID_RE", "is_flight_id",
+           "FINISH_ACT", "finished_flights",
            "BUILDABLE", "UNDERSPECIFIED", "CONTAINS_OWNER_DECISION", "OVERTAKEN",
            "duplicate_of", "nit", "home", "runs_dir", "verdicts_path", "run_log_path",
            "body_hash", "load_verdicts", "record_verdict", "changed", "ran_on",

@@ -2100,6 +2100,120 @@ def test_tidy_never_hands_a_recorded_handle_to_cmux(rig):
     assert not cmux_log.exists(), cmux_log.read_text()
 
 
+# --------------------------- tidy and the triage flight (issue #463) ---------------------------
+# A `t<N>` flight has NO lane record in issues.json by design, so the status-based selector cannot
+# see it. Its window and its singleton lock are recorded under the same directories tidy walks, and
+# before #463 nothing in the engine owned them. Its two readings: its RUN IS CLOSED (a triage_finish
+# in the journal — the default scope, as `merged` is), or its SESSION IS GONE (no live lock — the
+# --all scope, as the park family is).
+
+def _seed_flight(rig, tid, *, pane=("wt:p1", "wt"), finished=False, live=False):
+    home = _tidy_home(rig)
+    (home / "state" / "panes").mkdir(parents=True, exist_ok=True)
+    (home / "state" / "panes" / tid).write_text(pane[0])
+    (home / "state" / "panes" / (tid + ".ws")).write_text(pane[1])
+    # os.getpid() is alive by definition; pid 1 is alive but not ours, so a DEAD lock has to be a
+    # pid nothing holds — the CLI reads liveness with kill(pid, 0), so use an unallocatable one.
+    (home / "state" / ("worker.%s.lock" % tid)).write_text(str(os.getpid()) if live else "2147483646")
+    if finished:
+        import journal as journal_lib
+        journal_lib.append(str(home), {"act": "triage_finish", "date": "2026-08-25", "flight": tid})
+    return home
+
+
+def test_tidy_closes_a_flight_that_closed_its_run(rig):
+    home = _seed_flight(rig, "t7", finished=True, live=True)   # finished but idling (D4)
+    _seed_tidy_state(rig, {"i5": "running"}, {"i5": ("w5:p1", "w5")})
+    log, host = _recording_host(rig)
+    r = cli(rig, "tidy", "--yes", "--repo", str(rig.repo), env_over={"SL_HERDR": host})
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert _closed_workspaces(log) == ["wt"]
+    # a flight id is never reused (a monotonic counter mints it), so its markers are cleaned
+    assert not (home / "state" / "panes" / "t7").exists()
+    assert not (home / "state" / "worker.t7.lock").exists()
+
+
+def test_tidy_leaves_a_flight_that_is_still_working_the_queue(rig):
+    _seed_flight(rig, "t7", finished=False, live=True)
+    _seed_tidy_state(rig, {}, {})
+    log, host = _recording_host(rig)
+    r = cli(rig, "tidy", "--all", "--yes", "--repo", str(rig.repo), env_over={"SL_HERDR": host})
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert not log.exists(), "a live, unfinished flight is never closed, in either scope"
+
+
+def test_a_flight_whose_session_died_needs_all_scope_like_a_parked_lane(rig):
+    _seed_flight(rig, "t7", finished=False, live=False)
+    _seed_tidy_state(rig, {}, {})
+    log, host = _recording_host(rig)
+    r = cli(rig, "tidy", "--dry-run", "--repo", str(rig.repo), env_over={"SL_HERDR": host})
+    assert "t7" not in r.stdout, r.stdout
+    r = cli(rig, "tidy", "--all", "--dry-run", "--repo", str(rig.repo), env_over={"SL_HERDR": host})
+    assert "t7" in r.stdout and "flight:ended" in r.stdout, r.stdout
+    assert not log.exists()
+
+
+def test_tidy_lists_a_flight_beside_the_lanes_it_would_close(rig):
+    _seed_flight(rig, "t7", finished=True, live=True)
+    _seed_tidy_state(rig, {"i1": "merged"}, {"i1": ("w1:p1", "w1")})
+    _log, host = _recording_host(rig)
+    r = cli(rig, "tidy", "--dry-run", "--repo", str(rig.repo), env_over={"SL_HERDR": host})
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "i1" in r.stdout and "t7" in r.stdout
+    assert "flight:done" in r.stdout, r.stdout
+    # ...and the scope word says what was actually selected: a flight is not a merged lane.
+    assert "merged + flights that closed their run" in r.stdout, r.stdout
+
+
+def test_an_unverified_flight_close_leaves_the_lock_for_the_runner(rig):
+    """The lock is the ONLY handle the runner's flight-checkout sweep has on "is a process still
+    standing in that directory". Clearing it after a close the host would not confirm would let the
+    next tick prune a live CLI's cwd — the D14 shape, self-inflicted. So a flight's markers are
+    cleared only on a VERIFIED teardown; an unverified one leaves them and tidy can be re-run."""
+    home = _seed_flight(rig, "t7", finished=True, live=True)
+    _seed_tidy_state(rig, {}, {})
+    log, host = _recording_host(rig, gone=False)     # the workspace keeps answering: unverified
+    r = cli(rig, "tidy", "--yes", "--repo", str(rig.repo), env_over={"SL_HERDR": host})
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert _closed_workspaces(log) == ["wt"], "it still TRIED"
+    assert "closed 0 window(s)" in r.stdout, r.stdout
+    assert (home / "state" / "worker.t7.lock").exists()
+    assert (home / "state" / "panes" / "t7").exists()
+
+
+def test_tidy_never_reads_a_corrupt_flight_lock_as_a_dead_session(rig):
+    """(fresh-agent review round 2, P0) A lock that exists but names no readable pid is corruption,
+    not evidence of an ended session — and under `--all` that reading would escalate to a `kill`
+    against a flight still working the queue."""
+    home = _seed_flight(rig, "t7", finished=False, live=False)
+    _seed_tidy_state(rig, {}, {})
+    log, host = _recording_host(rig)
+    # "9" * 30 is the shape a bare `isdigit()` gets wrong: it parses, and `os.kill` then raises
+    # OverflowError — neither a live pid nor evidence of a dead one (round 3).
+    for garbage in ("not-a-pid", "", "-1", "9" * 30, "1" * 5000):
+        (home / "state" / "worker.t7.lock").write_text(garbage)
+        r = cli(rig, "tidy", "--all", "--yes", "--repo", str(rig.repo), env_over={"SL_HERDR": host})
+        assert r.returncode == 0, garbage + "\n" + r.stdout + r.stderr
+        assert not log.exists(), "escalated a teardown on a lock we could not parse: %r" % garbage
+        assert (home / "state" / "worker.t7.lock").exists()
+
+
+def test_tidy_never_closes_a_window_recorded_under_an_unknown_id_shape(rig):
+    """The widening added a CLASS, it did not open the pattern: `r3` (a runner resurrection) and a
+    bare `t` are windows tidy has no rule for, and no rule means no close."""
+    home = _tidy_home(rig)
+    (home / "state" / "panes").mkdir(parents=True, exist_ok=True)
+    for junk in ("r3", "t", "flight7"):
+        (home / "state" / "panes" / junk).write_text("wx:p1")
+        (home / "state" / "panes" / (junk + ".ws")).write_text("wx")
+    _seed_tidy_state(rig, {}, {})
+    log, host = _recording_host(rig)
+    r = cli(rig, "tidy", "--all", "--yes", "--repo", str(rig.repo), env_over={"SL_HERDR": host})
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert not log.exists(), "nothing outside the three known id shapes is ever closed"
+    assert (home / "state" / "panes" / "r3").exists()
+
+
 def test_tidy_ignores_a_close_the_host_refuses(rig):
     # best-effort: a host that will not confirm the teardown must not wedge tidy, and the lane's
     # markers are still cleared so nothing outlives the session it identified.

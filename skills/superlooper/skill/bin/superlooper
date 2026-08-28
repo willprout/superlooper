@@ -44,7 +44,9 @@
                   it refuses and names the manual start. A local ops UI over the loop shells this
   tidy            close the session windows of FINISHED sessions (merged by default; --all extends
                   to parked/needs-william/bounced) — manual, never automatic; never touches an
-                  in-flight or mid-gate lane, so it is safe to run while the runner is live
+                  in-flight or mid-gate lane, so it is safe to run while the runner is live. A
+                  t<N> triage flight is a subject too (#463): one that closed its own run by
+                  default, one whose session merely died under --all
   focus-session   bring ONE lane's session window to the front so you can watch it — and type into
                   it — with your own eyes (issue #339). Read-only about the FLEET: it never spawns,
                   sends, exits or kills, and it is not a viewer (the window it surfaces is the real
@@ -2621,7 +2623,10 @@ def _triage_flight_id():
     to do and is recorded honestly as such rather than attributed to a flight that never ran.
     """
     ident = (os.environ.get("SL_ISSUE_ID") or "").strip()
-    return ident if re.fullmatch(r"t[0-9]+", ident) else ""
+    # `triage.is_flight_id`, not a fourth copy of the pattern: #463 made that shape the flight
+    # module's to spell, so the verbs and readers that now ask about a `t<N>` all ask the same
+    # question.
+    return ident if triage.is_flight_id(ident) else ""
 
 
 def _triage_journal(home, record):
@@ -3715,6 +3720,12 @@ def cmd_accept_failure(args):
 # its prompt forever after finishing (D4) and never self-closes, so windows pile up. Safe to run
 # while the runner is live — the pure selector (tidy.closable) never picks an in-flight or
 # in-between-gate lane, so a close can only ever land on a finished, idle session.
+#
+# It closes two KINDS of session, by two different rules, and both rules live in lib/tidy: an issue
+# lane, selected by its loopstate status, and a `t<N>` TRIAGE FLIGHT (#448), selected by whether it
+# closed its own run and whether its session is still alive — because a flight has no lane record
+# to carry a status. Before issue #463 the flight was selected by neither: its recorded window and
+# its singleton lock sat under these very directories with no verb that would look at them.
 
 def _recorded_windows(home):
     """The iids that have a recorded session window (state/panes/<iid>), narrowed to worker lanes.
@@ -3723,6 +3734,50 @@ def _recorded_windows(home):
     William's to close himself. Missing dir / unreadable -> empty set."""
     return {iid for iid in panes.recorded_ids(os.path.join(home, "state"))
             if re.fullmatch(r"i\d+", iid)}
+
+
+def _recorded_flights(home):
+    """The `t<N>` TRIAGE FLIGHTS that have a recorded session window (issue #463).
+
+    A second reader over the same directory rather than a widened `_recorded_windows`, because the
+    two feed DIFFERENT selectors: a lane is chosen by its loopstate status, a flight by whether it
+    closed its run and whether its session is still alive (`lib/tidy`). Merging them into one set
+    would hand a flight to `tidy.closable`, which would look up a status a flight never has and
+    find nothing — the silent not-matching this issue exists to end, one layer down.
+
+    The debugger seat stays out of both, unchanged: closing it is William's own to do."""
+    return {tid for tid in panes.recorded_ids(os.path.join(home, "state"))
+            if triage.is_flight_id(tid)}
+
+
+def _live_flights(home, tids):
+    """Which of `tids` may still have a session — everything not PROVEN GONE.
+
+    Deliberately NOT `_live_lock` (fresh-agent review round 2, P0). That helper reads an empty or
+    unparseable lock as dead, which is right where it is used — a stale lock must never block a
+    lane's relaunch forever — and wrong here, where the answer licenses closing a window and, under
+    `--all`, escalating to a `kill`. `start-session.sh` writes this file atomically WITH its pid (an
+    `ln` of a fully-written temp, its own codex P1-a lesson), so a lock that exists yet names no
+    readable pid is not an ordinary state at all: it is corruption, and corruption must fail toward
+    leaving the session alone. Two states are positive evidence and nothing else is — no lock file,
+    or a lock naming a pid the OS says is dead.
+
+    (`tidy.closable_flights` refuses the whole question if this set cannot be built at all; this is
+    the narrower fail-closed direction inside it, per element.)"""
+    out = set()
+    for tid in tids:
+        path = os.path.join(home, "state", "worker.%s.lock" % tid)
+        try:
+            # Guarded rather than trusted: `str.isdigit` accepts forms `int()` refuses, and `int()`
+            # itself refuses a literal past 4300 digits — the hazard `actions.py` caps the same way.
+            pid = int((_read(path) or "").strip())
+        except (TypeError, ValueError):
+            if os.path.exists(path):
+                out.add(tid)                 # a lock we cannot read at all: corruption, hands off
+            continue
+        if not _pid_proven_dead(pid):
+            out.add(tid)                     # live, or unprobeable — either way, not proven gone
+    return out
 
 
 def _snapshot(home, iid):
@@ -3736,7 +3791,7 @@ def _snapshot(home, iid):
     return panes.read(os.path.join(home, "state"), iid)
 
 
-def _close_window(home, iid, handle, *, cleanup):
+def _close_window(home, iid, handle, *, cleanup, cleanup_needs_verified=False):
     """Best-effort close of the SNAPSHOTTED session, THROUGH THE DOORWAY (issue #334).
 
     Returns whether the teardown was VERIFIED — which is what the caller counts. A close the host
@@ -3804,11 +3859,20 @@ def _close_window(home, iid, handle, *, cleanup):
                 print(f"  {iid}: could not be closed ({e}).")
         except session_host.HostError as e:
             print(f"  {iid}: could not be closed ({e}).")
-    if cleanup:
+    if cleanup and (verified or not cleanup_needs_verified):
         # Cleared even on an UNVERIFIED close, and deliberately: `cleanup` is set only for a status
         # that can never relaunch, so nothing will ever write these again and leaving them behind
         # would strand markers for a session nobody will look at. What must not happen is claiming
         # the WINDOW went — that is what `verified` carries out to the count.
+        #
+        # ...EXCEPT for a TRIAGE FLIGHT, which sets `cleanup_needs_verified` (issue #463). The
+        # reasoning above turns on "nothing will ever write these again", and for a flight that is
+        # true of the pane markers but not of the singleton lock: the runner's flight-checkout sweep
+        # READS that lock, and it is the only handle anything has on "is a process still standing in
+        # that checkout". Clearing it after a close the host would not confirm would let the next
+        # tick prune a live CLI's cwd — the D14 shape, self-inflicted, by this verb. A verified
+        # teardown has PROVEN the process gone (`SessionHost.kill` raises rather than claim it), so
+        # on that path the removal is safe; on the other, the markers stay and tidy can be re-run.
         panes.forget(os.path.join(home, "state"), iid)
         try:
             os.remove(os.path.join(home, "state", f"worker.{iid}.lock"))
@@ -3829,10 +3893,26 @@ def cmd_tidy(args):
     st = st if isinstance(st, dict) else {}
     issues = st.get("issues") if isinstance(st.get("issues"), dict) else {}
     targets = tidy_lib.closable(issues, _recorded_windows(home), scope_all=args.all)
+    # ...and the TRIAGE FLIGHTS (issue #463), selected by their own rule beside the lanes rather
+    # than through one. A flight has no lane record to carry a status, so its two readings are read
+    # here: whether it closed its own run (the journal's `triage_finish`), and whether its session
+    # is still alive. Both are cheap; the journal read is the same one the morning report makes.
+    flights = _recorded_flights(home)
+    if flights:
+        targets = targets + tidy_lib.closable_flights(
+            flights, finished=triage.finished_flights(journal.read(home)),
+            live=_live_flights(home, flights), scope_all=args.all)
     scope = "terminal" if args.all else "merged"
     if not targets:
         print(f"tidy: no finished ({scope}) session windows to close.")
         return 0
+    # The scope WORD names what was actually selected, so it must not say "merged" over a row that
+    # is a flight (fresh-agent review, P2): a flight is never a merged lane, and its own two scopes
+    # ride alongside the lane statuses rather than inside them. Named only when a flight is on the
+    # list — the ordinary lanes-only listing is unchanged.
+    if any(triage.is_flight_id(t["id"]) for t in targets):
+        scope += (" + flights whose session ended" if args.all
+                  else " + flights that closed their run")
 
     # Snapshot each target's surface/ws NOW, before the y/N wait, so the close targets exactly the
     # windows listed here — a relaunch during the wait can't redirect a close onto a live window.
@@ -3858,8 +3938,22 @@ def cmd_tidy(args):
         # cleanup (remove markers+lock) ONLY for a status that can never relaunch — merged. A
         # re-approvable session's markers/lock stay the runner's to reconcile (race-free by
         # construction; see _close_window).
-        cleanup = s["status"] not in tidy_lib.REAPPROVABLE
-        if not _close_window(home, s["id"], s["handle"], cleanup=cleanup):
+        #
+        # A FLIGHT IS ALWAYS IN SCOPE FOR CLEANUP, for the same reason merged is: there is no
+        # concurrent RELAUNCH to race, because there can never be a second session under this id.
+        # Flight ids come from a monotonic counter in the flight's own state folder
+        # (`_triage_next_id`), which exists precisely so an id is never reused — "a reused id would
+        # collide with a previous flight's pane record and its brief" — so leaving the markers would
+        # strand them for a session nothing will ever launch again.
+        #
+        # It carries ONE extra condition a lane does not (`cleanup_needs_verified`), and it is about
+        # a different concurrent reader rather than a relaunch: the runner's flight-checkout sweep
+        # reads this lane's lock to decide whether anything is still standing in that checkout. See
+        # _close_window for why an unverified close must therefore leave it.
+        is_flight = triage.is_flight_id(s["id"])
+        cleanup = is_flight or s["status"] not in tidy_lib.REAPPROVABLE
+        if not _close_window(home, s["id"], s["handle"], cleanup=cleanup,
+                             cleanup_needs_verified=is_flight):
             continue           # skipped: the lane relaunched while the owner was deciding
         closed += 1
         if not cleanup:
@@ -4389,20 +4483,33 @@ def _upkeep_janitor_view(home, cfg, dev):
 
 
 def _upkeep_worktrees(home):
-    """(worktree ids on disk, {iid: reclaim-block reason or None}).
+    """(worktree ids on disk, {iid: reclaim-block reason or None}, the LIVE flights, the LAUNCHING).
 
     The block reason comes from gitops.worktree_reclaim_block — read-only and network-free by
     construction (a `git status` plus a local rev-list against refs already on disk), which is why
     a weekly report may call it. It is what turns "5 checkouts on disk" into the one fact worth
-    acting on: which of them hold work that exists nowhere else (issue #190)."""
+    acting on: which of them hold work that exists nowhere else (issue #190).
+
+    The last two are the flight arm's two vetoes (issue #463) — the same `worker.<id>.lock` reading
+    and the same checkout-age reading the runner's own sweep makes, so this page can never propose a
+    checkout the reaper would refuse. Read here, so `upkeep_lib.worktree_census` stays pure like
+    everything else on this page."""
     wdir = os.path.join(home, "worktrees")
     try:
         names = sorted(os.listdir(wdir))
     except OSError:
-        return [], {}
+        return [], {}, set(), set()
     ids = [n for n in names if _UPKEEP_WORKTREE_RE.fullmatch(n)
            and os.path.isdir(os.path.join(wdir, n))]
-    return ids, {i: gitops.worktree_reclaim_block(os.path.join(wdir, i)) for i in ids}
+    flights = [i for i in ids if triage.is_flight_id(i)]
+    # `_live_flights`, the same not-PROVEN-GONE reading `tidy` and the runner's sweep make — so this
+    # page never proposes a checkout the reaper would refuse, corrupt lock included.
+    live = _live_flights(home, flights)
+    now = time.time()
+    launching = {i for i in flights if gitops.checkout_age(os.path.join(wdir, i), now)
+                 < tidy_lib.FLIGHT_LAUNCH_GRACE_SECONDS}
+    return (ids, {i: gitops.worktree_reclaim_block(os.path.join(wdir, i)) for i in ids},
+            live, launching)
 
 
 def cmd_upkeep(args):
@@ -4453,7 +4560,7 @@ def cmd_upkeep(args):
         st = {}
     st = st if isinstance(st, dict) else {}
     issues = st.get("issues") if isinstance(st.get("issues"), dict) else {}
-    wt_ids, wt_blocks = _upkeep_worktrees(home)
+    wt_ids, wt_blocks, wt_live_flights, wt_launching_flights = _upkeep_worktrees(home)
 
     view = {
         "repo": cfg.get("repo"),
@@ -4469,7 +4576,9 @@ def cmd_upkeep(args):
         # verdict — the same posture engine_drift takes with no source checkout.
         "doc_lint": doc_lint.lint(args.repo),
         "branches": branches_view,
-        "worktrees": upkeep_lib.worktree_census(wt_ids, issues, wt_blocks),
+        "worktrees": upkeep_lib.worktree_census(wt_ids, issues, wt_blocks,
+                                                live_flights=wt_live_flights,
+                                                launching_flights=wt_launching_flights),
         "notify": notify_view,
         "week": upkeep_lib.week_counts(records, now),
     }
@@ -4505,13 +4614,41 @@ def _launcher():
 
 
 def _pid_alive(pid):
+    """Is this pid a running process? PermissionError means it exists and is somebody else's.
+
+    OverflowError is caught with the rest and NOT by accident: `os.kill` raises it — not an
+    OSError — for a decimal too large for its C int conversion, so a corrupt lock holding one
+    escaped this helper entirely and took the whole verb down with a traceback (fresh-agent review
+    round 3, reproduced through `superlooper tidy`). Every caller here is a probe that wants an
+    answer; `runner._probe_pid` states the same hazard for the tick.
+    """
     try:
         os.kill(pid, 0)
         return True
-    except (ProcessLookupError, ValueError, TypeError):
+    except (ProcessLookupError, ValueError, TypeError, OverflowError):
         return False
     except PermissionError:
         return True
+
+
+def _pid_proven_dead(pid):
+    """Did the OS DEFINITIVELY say nothing is at this pid? The narrower half of `_pid_alive`.
+
+    `not _pid_alive(pid)` is not this question and must not stand in for it where the answer
+    authorises a teardown: that expression is also True for every reading the probe could not make
+    — a pid too large for `os.kill`, a wrong-typed value, `pid <= 0` (which `os.kill` would apply to
+    a whole process group). Only `ProcessLookupError` is evidence of death. Mirrors
+    `runner._probe_pid`'s three states, which state the same reasoning at length.
+    """
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True                          # probed, and nothing is there: the only definitive no
+    except (OSError, ValueError, TypeError, OverflowError):
+        return False                         # PermissionError (it exists), or the probe never ran
+    return False                             # it answered: the process is alive
 
 
 def _live_lock(path):
@@ -5552,7 +5689,11 @@ def cmd_debug(args):
 # worker singleton and the pane/activity records are one contract with one implementation. A
 # revive that re-implemented any of them would be a second launch stack with no tests.
 
-_LANE_ID_RE = re.compile(r"^[id][0-9]+$")
+# Every id shape the LAUNCHER can mint, so that each one gets an ANSWER here rather than falling
+# off the end of a character class (issue #463). `t<N>` is recognised and then refused on its own
+# grounds a few lines into `cmd_resume` — see there for why. The narrow `[id]` class this replaced
+# was not a decision about flights; it simply predated them.
+_LANE_ID_RE = re.compile(r"^[idt][0-9]+$")
 # The recorded id is disk state, and disk state is never trusted on shape (the fail-closed rule the
 # rest of the engine applies to a wrong-typed status or a numberless PR). claude REFUSES a
 # non-UUID, so a corrupt record must be caught here — where the operator gets a sentence — rather
@@ -5699,6 +5840,38 @@ def cmd_resume(args):
     if not _LANE_ID_RE.match(iid):
         return refuse("'%s' is not a lane id — expected i<N> (an issue worker) or d<N> "
                       "(a debugger session)" % iid)
+
+    # A TRIAGE FLIGHT IS RECOGNISED AND REFUSED, on its own grounds (issue #463). Three of them,
+    # and the first is the one that decides it:
+    #
+    #  * THE DAY'S LEASE IS ALREADY SPENT, and spending it early is the flight class's own design.
+    #    `triage.mark_launched` takes the day BEFORE the session is created, with the stated
+    #    intent that "a flight killed hard enough to write nothing has still consumed its day, so
+    #    nothing re-launches it an hour later". A revive typed at a shell IS that relaunch, past a
+    #    bound the trigger deliberately put out of its own reach.
+    #  * THE FLIGHT'S MEMORY IS NOT IN ITS TRANSCRIPT. Every verdict it reached is durable in
+    #    `triage/verdicts.json` keyed by issue and body-hash, and the standing rule is that an
+    #    unchanged body is never re-litigated — so tomorrow's flight starts where this one stopped,
+    #    without the conversation. `resume` exists for a lane whose in-flight REASONING is
+    #    unrecoverable; a flight's is banked as it goes.
+    #  * THE RE-ORIENTATION PREAMBLE IS A WORKER'S VOCABULARY — your branch, your PR, your working
+    #    tree, your lane status. A flight has none of those, and in the RULED default `checkout`
+    #    home it stands in the owner's real working tree, so the preamble would report that tree's
+    #    dirt as "some may be yours from before the interruption, mid-edit" — the exact belief the
+    #    flight's brief spends a paragraph destroying ("read-only to you, and not evidence").
+    #
+    # Refused HERE rather than by silence, and before `--check`, so the read-only preflight gives
+    # the same answer as the act: a UI that rendered "resumable" and then failed is the shape every
+    # --check in this engine exists to avoid.
+    if triage.is_flight_id(iid):
+        return refuse("%s is a triage flight, and a flight is never resumed. Its day's lease was "
+                      "taken before its session existed — one flight per day, so that a flight "
+                      "killed mid-run is not relaunched an hour later — and its memory is not in "
+                      "its transcript: every verdict it reached is already durable in "
+                      "triage/verdicts.json by body-hash, so the next flight starts where this one "
+                      "stopped. Watch it instead with `superlooper focus-session --id %s`, and "
+                      "read what it did in its run log under the state home's triage/runs/."
+                      % (iid, iid))
 
     # Resume is a Claude Code capability (`--session-id`/`--resume`). Codex has its own
     # `codex resume`, which this engine does not drive, and start-session.sh deliberately does not
@@ -6071,8 +6244,10 @@ def main(argv=None):
            "--note": dict(default=None, help="why this failure is non-blocking (audit note)")})
     add("tidy", cmd_tidy,
         **{"--all": dict(action="store_true",
-                         help="also close parked / needs-william / bounced session windows "
-                              "(default: only merged — the truly-done sessions)"),
+                         help="also close parked / needs-william / bounced session windows, and "
+                              "a t<N> triage flight whose session died without closing its run "
+                              "(default: only merged, and a flight that DID close its run — the "
+                              "truly-done sessions)"),
            "--yes": dict(action="store_true", help="skip the y/N confirmation"),
            "--dry-run": dict(action="store_true",
                              help="list the windows tidy would close, then close nothing")})
@@ -6083,7 +6258,10 @@ def main(argv=None):
             "spawns, sends to, exits or kills a session, and it is not a viewer.\n"
             "\n"
             "The lane id selects a window recorded for THIS repo and no other, so an i<N> from one\n"
-            "repo can never focus another repo's session.\n"
+            "repo can never focus another repo's session. All three session classes the launcher\n"
+            "spawns are subjects: i<N> an issue worker, d<N> a debugger seat, t<N> a triage\n"
+            "flight — the unattended session judging the queue, and the one you most want to\n"
+            "watch while it runs.\n"
             "\n"
             "`focused` means the HOST moved its focus to that window; a screen shows it wherever a\n"
             "viewer is attached to the session (see `superlooper fleet`).\n"
@@ -6096,13 +6274,13 @@ def main(argv=None):
             "  host_unreachable  4  the session host could not be reached, or answered in words\n"
             "                       that say nothing about the window (never read as 'the\n"
             "                       session is gone')\n"
-            "  unknown_lane      5  that repo is not one we know, or that is not a lane id\n"
+            "  unknown_lane      5  that repo is not one we know, or that is not a session id\n"
             "\n"
             "2 is left to argparse (a usage error, and what an engine too old for this verb exits\n"
             "with) so it can never be mistaken for one of the four above."),
         **{"--id": dict(default=None, metavar="i<N>",
-                        help="the lane whose window to raise: i<N> (an issue worker) or d<N> "
-                             "(a debugger session)"),
+                        help="the session whose window to raise: i<N> (an issue worker), d<N> "
+                             "(a debugger session) or t<N> (a triage flight)"),
            "--json": dict(action="store_true",
                           help="emit a single JSON object (for a UI over the loop to parse) — "
                                "branch on its `outcome` field, which carries all four answers")})
@@ -6136,7 +6314,10 @@ def main(argv=None):
            "--source": dict(default=None,
                             help="what asked (audit only; default 'cli')")})
     add("resume", cmd_resume,
-        **{"id": dict(help="the lane to revive: i<N> (an issue worker) or d<N> (a debugger)"),
+        **{"id": dict(help="the lane to revive: i<N> (an issue worker) or d<N> (a debugger). A "
+                           "t<N> triage flight is recognised and REFUSED with its reason (#463): "
+                           "its day's lease is already spent and its verdicts are durable, so the "
+                           "next flight starts where it stopped"),
            "--note": dict(default=None,
                           help="a new instruction, placed AFTER the re-orientation so the session "
                                "re-reads the world before acting on it"),

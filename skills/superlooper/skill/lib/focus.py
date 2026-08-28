@@ -13,6 +13,13 @@ about the third: it hands no token to the host and holds none in this code — `
 runs the binary in the engine process's OWN environment, so whether a fenced host serves a given
 invocation is a property of who ran the engine, never something a caller can supply.
 
+**Three id shapes, and the flight is one of them (issue #463).** ``i<N>`` an issue worker, ``d<N>``
+a debugger seat, ``t<N>`` a triage flight. The flight was left out when #448 shipped it — not by a
+decision, but by a character class in :data:`LANE_ID_RE` that nobody revisited — and the effect was
+that the one session the owner most wants to watch, the unattended one judging his queue, was the
+one session he had no verb to bring forward. Nothing about a flight makes it a worse subject here:
+this verb opens nothing, sends nothing and closes nothing.
+
 **How a lane id becomes a window, and why it is not the lane's NAME.** The doorway addresses agents
 by name everywhere else, and refuses to here. A lane id is unique inside ONE repo's state home and
 nowhere else: on a multi-repo install two adopted repos both have an ``i310``, and the host clears
@@ -71,14 +78,23 @@ UNKNOWN_LANE = "unknown_lane"
 
 OUTCOMES = (FOCUSED, NO_WINDOW, HOST_UNREACHABLE, UNKNOWN_LANE)
 
-# A lane id, and the same shape `superlooper resume` enforces on its own argument: i<N> is an issue
-# worker, d<N> a debugger seat. Both are lanes the loop records a window for, and focusing is
-# read-only — so unlike `tidy` (which CLOSES, and deliberately leaves a debugger seat to the owner)
-# there is nothing here that a d<N> lane needs protecting from.
+# A session id, and the same shape `superlooper resume` enforces on its own argument: i<N> is an
+# issue worker, d<N> a debugger seat, t<N> a triage flight (#448). All three are sessions the loop
+# records a window for, and focusing is read-only — so unlike `tidy` (which CLOSES, and deliberately
+# leaves a debugger seat to the owner) there is nothing here that any of them needs protecting from.
+#
+# THE `t<N>` IS AN ANSWER, NOT AN INHERITANCE (issue #463). #448 made the flight a third class the
+# launcher spawns, and `lib/launch.py` records `state/panes/t<N>` for it exactly as it does for a
+# lane — so the file this verb selects on is already there, and the only thing standing between an
+# owner and the window of the session judging his queue was a two-letter character class nobody had
+# revisited. Widening it is deliberate and it is the WHOLE change here: focusing opens nothing,
+# sends nothing and closes nothing, so there is no property of a flight that makes it a worse
+# subject than a lane. The refusal below names all three, so an id shape the engine does not know
+# is still refused by name rather than by silence.
 #
 # Checked before the id reaches a path join: it is about to select a file under state/panes/, and
 # "i339/../../../etc" is not a lane.
-LANE_ID_RE = re.compile(r"^[id][0-9]+$")
+LANE_ID_RE = re.compile(r"^[idt][0-9]+$")
 
 # What this verb exits with, one code per outcome, so a SHELL caller can tell the four apart
 # without parsing JSON. `no_window` is deliberately not 0 — nothing was focused, and a script that
@@ -163,8 +179,8 @@ def focus_lane(home, iid, host=None, call_seconds=None):
     iid = (iid or "").strip() if isinstance(iid, str) else ""
     if not LANE_ID_RE.match(iid):
         return Result(UNKNOWN_LANE, iid,
-                      detail="%r is not a lane id — expected i<N> (an issue worker) or d<N> "
-                             "(a debugger session)" % iid)
+                      detail="%r is not a session id — expected i<N> (an issue worker), d<N> "
+                             "(a debugger session) or t<N> (a triage flight)" % iid)
     if not isinstance(home, (str, os.PathLike)) or not str(home).strip():
         # The house "fail-open on wrong-typed input" class, closed here rather than downstream: a
         # None home would join to "None/state" against the process's CWD and answer NO_WINDOW —
