@@ -46,6 +46,7 @@ import runner_source
 import replay as replay_mod
 import session_window as session_window_mod
 import tower as tower_mod
+import triage as triage_mod
 import truth
 import version as version_mod
 
@@ -1732,6 +1733,18 @@ def _assemble_repo(repo, config, now, gh_mod, diff_reader, last_seen=None, concl
         # reload or a superseding open threw it away: on 2026-08-26 a tap during an auth
         # outage was consumed, attempted, failed and journaled, and the board said nothing.
         "fixer": _fixer_block(journal, now),
+        # The triage flight (issue #451): the day's `t<N>` survey, its run's counts, and whether a
+        # plane belongs on the field. Derived from the journal the tower log is already glossed from
+        # and the `state/activity` scan every lane's liveness already comes out of — no new read of
+        # any kind, and deliberately NOT from the runner's published view, which #463 settled a
+        # flight is structurally absent from ("#451 owns how a flight renders"). Always present as a
+        # BLOCK: `present: False` is the honest silence on a day with no flight, and an absent key is
+        # how a surface starts throwing at 3am. A flight has no loopstate record, so it is never
+        # folded into `flights` — a lane list entry would put it through every derivation that
+        # assumes an issue number (titles, arrivals, the stand, the repo's own state).
+        "triage": triage_mod.run(journal, now, activity=facts["activity"],
+                                 idle_seconds=flight_repo["idle_seconds"],
+                                 freeze_seconds=flight_repo["freeze_seconds"]),
         "shipped": flights.corner_stats(journal, now=now),
         "incident": flights.incident_stats(journal),
         "state": state,

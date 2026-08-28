@@ -37,7 +37,21 @@ import fixer as fixer_mod
 # journal firehose stays complete. The set is the extension point: a future noisy-but-honest act joins
 # ``ROUTINE_ACTS`` and inherits the classified-as-data, hidden-by-default behavior — no per-type UI
 # debate (owner ruling 2026-07-07).
-ROUTINE_ACTS = frozenset({"relabel"})
+#
+# ``triage_keep`` joins it for the same reason, one delegation over (issue #451): a flight judges the
+# whole unapproved pile and KEEPS most of it, and the morning report leaves every one of those out on
+# the stated ground that "silence means kept — an issue a flight looked at and left alone is not
+# news, and listing every one would bury the four that are" (``report._TRIAGE_ACTS``). Routine is
+# exactly that classification with the record still on record: hidden from the feed by default,
+# revealable on demand, never dropped.
+ROUTINE_ACTS = frozenset({"relabel", "triage_keep"})
+
+# The launcher's own preflight record (`lib/launch.FENCE_ACT`). Not a triage act — it is written on
+# EVERY launch — but a flight's carries the flight's `t<N>` id, so it is the one non-triage record a
+# flight produces, and unglossed it read "the flight fence_preflight." A worker's is deliberately
+# left exactly as it renders today: this issue renders a TRIAGE flight, and glossing a worker's
+# record would change the board of every repo that has never flown one.
+FENCE_ACT = "fence_preflight"
 
 
 def tier(rec):
@@ -45,10 +59,17 @@ def tier(rec):
     should not be announced on the comms radio (issue #36), ``"comms"`` for everything a human reads
     as real traffic. Pure and server-side (B.1) so the classification is data, not a UI debate. A
     non-dict / act-less record is ``"comms"`` — fail toward VISIBLE, never silently swallow an
-    unrecognised record (costume rule 4 / honesty §7)."""
+    unrecognised record (costume rule 4 / honesty §7).
+
+    The ``isinstance`` guard on ``act`` is not decoration (fresh-agent review round 3): ``{"act": []}``
+    is VALID JSON, so ``readers._iter_records`` yields it intact, and ``[] in <frozenset>`` RAISES
+    (a list is unhashable) rather than answering False. That raise lands inside the 2-second snapshot
+    poll, where it blanks the whole board for every repo — the #139 defect class, reached through the
+    one door a per-line JSON check cannot close."""
     if not isinstance(rec, dict):
         return "comms"
-    return "routine" if rec.get("act") in ROUTINE_ACTS else "comms"
+    act = rec.get("act")
+    return "routine" if isinstance(act, str) and act in ROUTINE_ACTS else "comms"
 
 
 def _num(rec):
@@ -368,6 +389,192 @@ def _event_row(rec, num):
 
 # The one-line gloss for the acts with no special sub-cases. Each is (radio, kind, sentence-tail);
 # the tail is prefixed with the flight tag by comms_row. A ``None`` radio means "no flavor".
+# =============================== the triage flight (issue #451) ===============================
+# The queue-hygiene delegation the owner made by standing rule: once a day one unattended `t<N>`
+# session judges the unapproved pile and may close, merge, fix or escalate on its own word. #449 gave
+# it an act vocabulary; every one of those acts fell through to the generic gloss at the bottom of
+# `comms_row`, and — because a flight names no lane — reached the owner as a sentence about an
+# aircraft that does not exist:
+#
+#     the flight triage_close.        the flight triage_escalate.        the flight triage_refused.
+#
+# That is the #253 defect class, which this repo has now paid for four times (`debug_launch` in #144,
+# then `watchdog` / `runner_resurrect` / `runner_restart`), and it is at its worst here: these are the
+# lines that say an ISSUE WAS CLOSED by something nobody was watching. The authority is only safe if
+# its exercise is legible, so each act gets the words for what it actually did.
+#
+# The vocabulary is the ENGINE's (`report._TRIAGE_ACTS` plus the two that bracket a run), spelled as
+# bare literals exactly as every other reader here spells it. `tests/test_tower_triage.py` pins one
+# rendering per act against this tuple, so an act the engine grows and the tower does not goes red.
+TRIAGE_ACTS = ("triage_launch", "triage_keep", "triage_fix", "triage_merge", "triage_close",
+               "triage_escalate", "triage_refused", "triage_finish")
+
+# What a record is called when it names no `t<N>`, and there are TWO answers because the records
+# mean two different things (fresh-agent review round 2):
+#
+#   * a per-issue ACT with no flight id was run BY HAND, from the owner's own shell. The CLI records
+#     the empty id deliberately — `superlooper` ▸ `_triage_flight_id`: "a legitimate thing for an
+#     operator to do and is recorded honestly as such rather than attributed to a flight that never
+#     ran". Calling it "the triage flight" is the #253 phantom in a quieter voice, and it would put
+#     the feed at odds with `lib/triage`, which already refuses that attribution on the card.
+#   * a `triage_launch` IS a flight launch — that is what the record MEANS — so an unreadable id
+#     there is a nameless flight rather than a hand-run verb. `superlooper triage-flight` is the only
+#     thing that writes one, and it stamps the id it has just allocated.
+_HAND_RUN = "A hand-run triage verb"
+_A_FLIGHT = "A triage flight"
+
+
+# Which key names the flight, per act — the engine writes ONE of them on each record, and reading
+# either on either is a superset of its contract rather than a match for it (fresh-agent review
+# round 3). `id`: the launch (`triage-flight`, with the id it just allocated) and the launcher's own
+# `fence_preflight`. `flight`: every per-issue act and `triage_finish` (`_triage_record`, from
+# `SL_ISSUE_ID` — assigned by the launcher, never self-asserted). A record carrying the other key is
+# not making the engine's claim, so it is not read as one.
+_FLIGHT_KEY_BY_ACT = {"triage_launch": "id", FENCE_ACT: "id"}
+
+
+def _flight_id(rec):
+    """The ``t<N>`` this record belongs to, or ``None``.
+
+    ``None`` is what a hand-run verb from the owner's own shell looks like: the CLI records an EMPTY
+    flight id for one, deliberately, so it is not attributed to whichever flight ran last."""
+    v = rec.get(_FLIGHT_KEY_BY_ACT.get(rec.get("act"), "flight"))
+    return v if isinstance(v, str) and re.match(r"^t[0-9]+$", v) else None
+
+
+def _flight_who(rec, unnamed=_HAND_RUN):
+    return _flight_id(rec) or unnamed
+
+
+def _issue_ref(rec):
+    """``#452`` for the issue an act was about, or ``#?`` when the record does not say. Never
+    ``#None``: a sentence that prints a missing value is how a reader learns to distrust the feed."""
+    n = rec.get("num")
+    return "#%d" % n if isinstance(n, int) and not isinstance(n, bool) else "#?"
+
+
+def _triage_close_row(rec, who, ref):
+    """A close is TWO different acts wearing one name, and the difference is the whole justification:
+    a NIT is closed against a rubric line with a limitation filed in the ledger, an OVERTAKEN issue
+    is closed citing a commit proven to be an ancestor of the dev branch. Told apart by the VERDICT,
+    not by the presence of a ledger number — the same rule `report._triage_line` uses, and for the
+    same reason: a nit whose ledger id went unrecorded is still a nit, and rendering it as "overtaken
+    by (commit unrecorded)" would state a reason the flight never gave."""
+    verdict = rec.get("verdict")
+    ledger = rec.get("ledger")
+    ledger = ledger if isinstance(ledger, int) and not isinstance(ledger, bool) else None
+    if (isinstance(verdict, str) and verdict.startswith("nit(")) or ledger is not None:
+        rubric = _first_line(rec.get("rubric")) or "unrecorded"
+        where = " and filed in the ledger as #%d" % ledger if ledger is not None \
+            else " — the ledger entry is unrecorded"
+        return {"radio": "", "kind": "triage",
+                "text": "%s closed %s as a nit under the rubric line “%s”%s."
+                        % (who, ref, rubric, where)}
+    commit = _first_line(rec.get("commit"))
+    cited = "`%s`" % commit if commit else "a commit left unrecorded"
+    return {"radio": "", "kind": "triage",
+            "text": "%s closed %s as overtaken by %s." % (who, ref, cited)}
+
+
+def _triage_row(rec):
+    """One triage act → its comms sentence. Every branch names the ISSUE inside the sentence rather
+    than through the row's flight chip — see `comms_row`, which strips ``num`` from a triage row."""
+    act = rec.get("act")
+    who = _flight_who(rec)
+    ref = _issue_ref(rec)
+
+    if act == "triage_launch":
+        who = _flight_who(rec, _A_FLIGHT)      # a launch record is a flight's, named or not
+        if rec.get("outcome") == "launched":
+            why = _first_line(rec.get("detail"))
+            return {"radio": "Survey aircraft airborne.", "kind": "launch",
+                    "text": "%s departed — a triage survey over the unapproved queue%s."
+                            % (who, " — %s" % why if why else "")}
+        # No flourish for a dishonest state (§7): nothing took off, and the consequence — a whole
+        # day with nothing triaged — is the part the owner needs, in the report's own words.
+        said = _plain(rec.get("outcome")) or "the launcher confirmed no session"
+        return {"radio": "", "kind": "alert",
+                "text": "%s did not launch — %s. Nothing was triaged today." % (who, said)}
+
+    if act == "triage_keep":
+        why = _first_line(rec.get("detail"))
+        return {"radio": "", "kind": "triage",
+                "text": "%s kept %s — looked at and left alone%s."
+                        % (who, ref, " (%s)" % why if why else "")}
+
+    if act == "triage_fix":
+        fixed = rec.get("fixed")
+        what = ", ".join(x for x in fixed if isinstance(x, str) and x.strip()) \
+            if isinstance(fixed, list) else ""
+        return {"radio": "", "kind": "triage",
+                "text": "%s fixed %s — %s." % (who, ref, what or "its metadata")}
+
+    if act == "triage_merge":
+        other = rec.get("absorber")
+        other = "#%d" % other if isinstance(other, int) and not isinstance(other, bool) else "#?"
+        return {"radio": "", "kind": "triage",
+                "text": "%s merged %s into %s — its content was absorbed there." % (who, ref, other)}
+
+    if act == "triage_close":
+        return _triage_close_row(rec, who, ref)
+
+    if act == "triage_escalate":
+        # An approved / in-flight / awaiting-answer issue is escalated but never TOUCHED, and the
+        # sentence has to say which of the two happened — "escalated" alone would read as an action
+        # taken on frozen owner text.
+        finding = _first_line(rec.get("finding")) or _first_line(rec.get("detail"))
+        # `is True`, not truthiness (fresh-agent review): "untouched" is a claim about what did NOT
+        # happen to frozen owner text, and only the engine's own boolean may make it. A hand-edited
+        # or half-written `"false"` is truthy, and would forge exactly that claim. Anything else
+        # still renders as the escalation it is — the weaker, always-true half of the sentence.
+        how = "flagged for you, untouched" if rec.get("held") is True else "escalated for you"
+        return {"radio": "Tower, one for the owner.", "kind": "escalate",
+                "text": "%s %s %s%s." % (who, how, ref,
+                                         " — %s" % finding if finding else "")}
+
+    if act == "triage_refused":
+        # The delegation's own edges doing their job. The audit trail of an autonomous seat is not
+        # only what it did — it is also what it was stopped from doing, which is the evidence the
+        # edges are load-bearing at all.
+        why = _first_line(rec.get("detail"), 120) or "the reason is unrecorded"
+        return {"radio": "", "kind": "alert",
+                "text": "%s was REFUSED on %s — %s." % (who, ref, why)}
+
+    # triage_finish — the run's own tally, in the flight's own words wherever it wrote them, so the
+    # feed, the run log and the morning report all read the same about one night. A finish with no
+    # flight id was written by hand, and "closed ITS run" would attribute a run to the operator's
+    # shell; it closed THE run.
+    said = _first_line(rec.get("detail"), 120)
+    whose = "its" if _flight_id(rec) else "the"
+    return {"radio": "Survey complete.", "kind": "triage",
+            "text": "%s closed %s run%s." % (who, whose, " — %s" % said if said else "")}
+
+
+def _fence_row(rec, fid):
+    """A flight's launch-time fence check. The verdict only — never the socket path: what a session
+    host is and where its door is are not this board's business (issue #310), and a path on screen is
+    a machine's detail rather than an owner's fact.
+
+    Three-way on ``refused``, exactly as ``fixer.launch_outcome`` is on a launch, and for the sharper
+    version of the same reason: this is the one gate standing between an unattended, issue-closing
+    session and an unfenced machine, so "cleared" must be an explicit ``False`` and never the default
+    a missing or wrong-typed field falls into. "Refused" is not the safe default either — it would
+    report a launch nobody has resolved as a failure. A record that does not say, says so.
+    """
+    verdict = _plain(rec.get("verdict")) or "unrecorded"
+    refused = rec.get("refused")
+    if refused is True:
+        return {"radio": "", "kind": "alert",
+                "text": "%s was refused at the pre-flight fence check (%s) — no session was created."
+                        % (fid, verdict)}
+    if refused is False:
+        return {"radio": "", "kind": "gate",
+                "text": "%s cleared its pre-flight fence check (%s)." % (fid, verdict)}
+    return {"radio": "", "kind": "unknown",
+            "text": "%s has a pre-flight fence check on record (%s) that records no outcome — "
+                    "nothing here says whether it was let through." % (fid, verdict)}
+
+
 def comms_row(rec, operator="the owner"):
     """One journal record → ``{radio, text, kind, num, tier}``. ``text`` is the real, plain, flight-
     numbered sentence (always non-empty); ``radio`` is optional flavor shown beside it; ``kind`` is
@@ -381,6 +588,26 @@ def comms_row(rec, operator="the owner"):
     act = rec.get("act")
     num = _num(rec)
     who = _who(num)
+
+    # The triage flight's own vocabulary (issue #451), taken BEFORE the lane acts because the row it
+    # produces is shaped differently: it carries no flight chip. `row["num"]` draws tower.js's
+    # clickable `SL-<n>`, which opens that number's FLIGHT CARD — and an issue a flight judged has no
+    # lane, no branch and no card. The number rides inside the sentence instead (`#452`, exactly as
+    # the morning report writes it); a chip onto a flight that does not exist is the same lie as a
+    # sentence about one.
+    if act in TRIAGE_ACTS:
+        row = _triage_row(rec)
+        row["num"] = None
+        row["tier"] = tier(rec)
+        return row
+    # The one non-triage record a flight makes. Gated on the id being a flight's, so a WORKER's
+    # fence record renders exactly as it does today (issue #451 DoD: with no triage flight in state,
+    # the board is unchanged).
+    if act == FENCE_ACT and _flight_id(rec) is not None:
+        row = _fence_row(rec, _flight_id(rec))
+        row["num"] = None
+        row["tier"] = tier(rec)
+        return row
 
     if act == "merge":
         row = _merge_row(rec, num)

@@ -439,6 +439,13 @@ html, body {
 .fld-tag.stand {
   border-color: #2F8A4C; color: #9FD8B0; font-size: 9px; padding: 1px 6px; letter-spacing: 0.5px;
 }
+/* the triage survey (issue #451) — the loop's own aircraft, loitering over the queue. Its own cool
+   slate-cyan, deliberately in NO other tag's family: it is neither a lane in trouble (ochre/red) nor
+   a lane doing well (green), because it is not a lane at all. */
+.fld-tag.survey {
+  border-color: #3E7F92; color: #A8DCEA; font-size: 9px; padding: 1px 6px; letter-spacing: 0.5px;
+  transform: translate(-50%, 0);   /* hangs BELOW its track, clear of the survey's own hull */
+}
 .fld-tag.frozen { border-color: #4A5661; color: #C9D2DC; }
 /* the stranded gate — a FINISHED flight the runner never landed. Gold, solid, "look at the gate":
    deliberately NOT the muted grey of the .frozen (dead session) tag, so the eye separates them. */
@@ -655,6 +662,36 @@ html, body {
 }
 .field-legend .in-air { color: var(--green); }
 .field-legend .look { margin-left: auto; color: var(--amber); }
+
+/* ---- The triage flight's card (issue #451) ----
+   Under the field, because the survey aircraft is what it is about. Its own cool slate-cyan, in no
+   other surface's family on purpose: the trouble banner is red/ochre and the boards are gold, and a
+   run that judged the queue is neither an emergency nor a landing. It renders ONLY on a day a flight
+   flew — a heading that appears every day stops being read on the day it matters. */
+.triage-card {
+  display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin-top: 8px;
+  padding: 7px 10px; border: 1px solid #BFD6DE; border-left: 3px solid #3E7F92;
+  border-radius: 5px; background: #F1F8FA;
+}
+.triage-card .tri-head {
+  font: 700 10px var(--mono); letter-spacing: 0.7px; color: #2C6272; white-space: nowrap;
+}
+/* The sentence takes the room; the chip keeps its place at the right of the same row wherever the
+   panel is wide enough, and drops below it rather than squeezing the words when it is not. */
+.triage-card .tri-text { flex: 1 1 340px; font: 400 12.5px/1.45 var(--sans); color: var(--ink-2); }
+/* Escalations are the ONE number that is a call on the owner's attention: a finding the flight was
+   not authorised to act on. Amber, and never shown at zero — a standing "0 FOR YOU" is furniture. */
+.triage-card .tri-esc {
+  margin-left: auto; font: 700 10px var(--mono); letter-spacing: 0.5px; white-space: nowrap;
+  color: var(--amber-ink); background: var(--amber-bg); border: 1px solid var(--amber-border);
+  border-radius: 3px; padding: 1px 6px;
+}
+.triage-card .tri-note { font: 400 11px var(--sans); color: var(--muted); font-style: italic; }
+/* A launch that never landed a session: no survey happened, so the card drops its cyan and states
+   the gap. Not the red of an ALERT — nothing is broken, a day simply went untriaged. */
+.triage-card.is-no-flight { border-left-color: #8A5B10; background: var(--amber-bg);
+                            border-color: var(--amber-border); }
+.triage-card.is-no-flight .tri-head { color: var(--amber-ink); }
 
 /* ---- Tower log ---- */
 .tower { min-height: 0; }
