@@ -21,6 +21,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -32,6 +33,7 @@ import issues
 import journal
 import loopstate
 import runner as runner_mod
+import tidy
 
 _FIXTURES = Path(__file__).resolve().parent / "fixtures" / "gh"
 _FAKE_GH = Path(__file__).resolve().parent / "fakes" / "fake-gh"
@@ -5342,6 +5344,181 @@ def test_reclaim_terminal_worktrees_routes_through_the_one_teardown(rig, monkeyp
     assert [c for c in rig.calls if "end-session" in c["args"]], "expected the session to be ended"
     assert not (rig.home / "state" / "panes" / "i7").exists()
     assert not (rig.home / "state" / "worker.i7.lock").exists()
+
+
+# --------------- the triage flight's own checkout (issue #463, on #41's bound) ---------------
+# A repo that sets `triage.home: worktree` gets each flight a detached checkout at
+# <run root>/worktrees/<t-id>. The park-family reaper walks issues.json and a flight has no record
+# there, so nothing reclaimed one and every day's checkout accumulated forever.
+
+def _settled_checkout(monkeypatch):
+    """Age every checkout past the launch grace — i.e. "no launch is reaching this any more".
+
+    Stubbed the way `_pid_alive` is stubbed throughout this file: the real probe is pinned
+    separately (test_checkout_age_reads_the_real_filesystem_and_fails_closed) and cannot be driven
+    from a test, since `os.utime` moves ctime to now and the probe takes the newer stamp."""
+    monkeypatch.setattr(runner_mod.gitops, "checkout_age",
+                        lambda path, now: tidy.FLIGHT_LAUNCH_GRACE_SECONDS + 60)
+
+
+def test_a_dead_flights_checkout_is_reclaimed(rig, monkeypatch):
+    removed = []
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove",
+                        lambda repo, path: removed.append(str(path)) or True)
+    monkeypatch.setattr(runner_mod.gitops, "worktree_reclaim_block", lambda path: None)
+    monkeypatch.setattr(runner_mod, "_pid_alive", lambda pid: False)
+    _settled_checkout(monkeypatch)
+    (rig.home / "worktrees" / "t7").mkdir(parents=True, exist_ok=True)
+    _teardown_rig(rig, "t7")
+
+    rig.r._reclaim_flight_worktrees()
+    assert removed == [str(rig.home / "worktrees" / "t7")]
+    # D9: no marker outlives its session — the ordered teardown clears them with the checkout.
+    assert not (rig.home / "state" / "panes" / "t7").exists()
+    assert not (rig.home / "state" / "worker.t7.lock").exists()
+
+
+def test_a_live_flights_checkout_is_never_pruned_under_it(rig, monkeypatch):
+    """The D14 shape: prune a live CLI's cwd and its next hook spawn dies in posix_spawn. A flight
+    that has finished but still idles at its prompt holds this directory as its cwd."""
+    removed = []
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove",
+                        lambda repo, path: removed.append(str(path)) or True)
+    monkeypatch.setattr(runner_mod, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(runner_mod.time, "sleep",
+                        lambda s: pytest.fail("the flight sweep must not sleep on a live pid"))
+    _settled_checkout(monkeypatch)
+    (rig.home / "worktrees" / "t7").mkdir(parents=True, exist_ok=True)
+    _teardown_rig(rig, "t7")
+
+    rig.r._reclaim_flight_worktrees()
+    assert removed == []
+    assert (rig.home / "worktrees" / "t7").exists()
+    assert (rig.home / "state" / "worker.t7.lock").exists()
+
+
+def test_a_flight_checkout_being_launched_into_is_never_pruned(rig, monkeypatch):
+    """(fresh-agent review, P0) `lib/launch.py` creates `<run root>/worktrees/<t-id>` and only THEN
+    opens the pane; `start-session.sh` takes `worker.<id>.lock` inside that new pane, a whole
+    delivery-verify window later. A tick landing in between sees a checkout with no lock — which is
+    not "dead", it is "being born" — and pruning it would unlink the cwd of a session that is
+    starting. A brand-new checkout is therefore never taken, whatever the lock says."""
+    removed = []
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove",
+                        lambda repo, path: removed.append(str(path)) or True)
+    monkeypatch.setattr(runner_mod.gitops, "worktree_reclaim_block", lambda path: None)
+    monkeypatch.setattr(runner_mod, "_pid_alive", lambda pid: False)
+    (rig.home / "worktrees" / "t7").mkdir(parents=True, exist_ok=True)   # just created; no lock yet
+    assert not (rig.home / "state" / "worker.t7.lock").exists()
+
+    rig.r._reclaim_flight_worktrees()                    # the REAL age read: a brand-new directory
+    assert removed == [], "pruned a checkout a launch may still be reaching"
+    assert (rig.home / "worktrees" / "t7").exists()
+
+    # ...and once it is older than the launch grace, with still no live session, it is taken.
+    monkeypatch.setattr(runner_mod.gitops, "checkout_age",
+                        lambda path, now: tidy.FLIGHT_LAUNCH_GRACE_SECONDS + 60)
+    rig.r._reclaim_flight_worktrees()
+    assert removed == [str(rig.home / "worktrees" / "t7")]
+
+
+def test_checkout_age_reads_the_real_filesystem_and_fails_closed(tmp_path):
+    """The age probe gates a prune, so pin it against a real directory rather than a stub — the
+    same discipline `_pid_alive` gets. Zero for anything it cannot read: an unreadable stat must
+    read as "brand new, a launch may be reaching it", never as "old enough to prune"."""
+    d = tmp_path / "fresh"
+    d.mkdir()
+    now = time.time()
+    assert runner_mod.gitops.checkout_age(str(d), now) < 5              # just made: brand new
+    # An hour of clock later, the same directory reads an hour old — the ordinary settled case.
+    assert runner_mod.gitops.checkout_age(str(d), now + 3600) > 3000
+    # Backdating mtime alone does NOT age it, and that is the `max(mtime, ctime)` direction working:
+    # the newer stamp wins, so a touched-back tree still reads as recently changed.
+    os.utime(d, (now - 86400, now - 86400))
+    assert runner_mod.gitops.checkout_age(str(d), now) < 5
+    assert runner_mod.gitops.checkout_age(str(tmp_path / "nope"), now) == 0
+    assert runner_mod.gitops.checkout_age(None, now) == 0
+
+
+def test_a_corrupt_flight_lock_is_never_read_as_a_dead_session(rig, monkeypatch):
+    """(fresh-agent review round 2, P0) `start-session.sh` writes `worker.<id>.lock` ATOMICALLY with
+    its pid — an `ln` of a fully-written temp — so a lock that EXISTS yet names no readable pid is
+    not an ordinary state, it is corruption. Reading it as "dead" would license unlinking a live
+    CLI's cwd on the strength of a file we could not parse: the fail-OPEN-on-wrong-typed defect
+    class, on the most destructive path this branch adds. Hands off, and the checkout stays visible
+    on the weekly `upkeep` page instead."""
+    removed = []
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove",
+                        lambda repo, path: removed.append(str(path)) or True)
+    monkeypatch.setattr(runner_mod.gitops, "worktree_reclaim_block", lambda path: None)
+    monkeypatch.setattr(runner_mod, "_pid_alive", lambda pid: False)
+    _settled_checkout(monkeypatch)
+    (rig.home / "worktrees" / "t7").mkdir(parents=True, exist_ok=True)
+    # "9" * 30 and "1" * 5000 are the two shapes `_pid_alive` alone gets wrong: `str.isdigit` says
+    # yes, and the probe then answers "unknown" (os.kill's OverflowError) or refuses to parse at all
+    # — neither of which is evidence of death (fresh-agent review round 3).
+    for garbage in ("", "   ", "not-a-pid", "12x", "-1", "0", "9" * 30, "1" * 5000):
+        (rig.home / "state" / f"worker.t7.lock").write_text(garbage)
+        rig.r._reclaim_flight_worktrees()
+        assert removed == [], "pruned on a lock we could not parse: %r" % garbage
+        assert (rig.home / "worktrees" / "t7").exists()
+    # ...and an ABSENT lock is still an honest "the session is gone" — the ordinary case.
+    (rig.home / "state" / "worker.t7.lock").unlink()
+    rig.r._reclaim_flight_worktrees()
+    assert removed == [str(rig.home / "worktrees" / "t7")]
+
+
+def test_the_flight_sweep_touches_no_lane_and_no_unknown_shape(rig, monkeypatch):
+    """The widening added a CLASS. A lane checkout keeps its own rules (and its own opt-in gate);
+    a directory whose name is neither is left where it is."""
+    removed = []
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove",
+                        lambda repo, path: removed.append(str(path)) or True)
+    monkeypatch.setattr(runner_mod.gitops, "worktree_reclaim_block", lambda path: None)
+    monkeypatch.setattr(runner_mod, "_pid_alive", lambda pid: False)
+    _settled_checkout(monkeypatch)
+    seed_issue(rig, "i7", status="parked", num=7)
+    for name in ("i7", "d3", "t", "scratch"):
+        (rig.home / "worktrees" / name).mkdir(parents=True, exist_ok=True)
+
+    rig.r._reclaim_flight_worktrees()
+    assert removed == []
+
+
+def test_a_flight_checkout_holding_work_is_kept_not_dropped(rig, monkeypatch):
+    """A flight commits nothing and pushes nothing, so this should never fire — which is exactly
+    why the prune still goes through the #190 guard: if it DOES fire, something wrote in there and
+    the checkout is the only copy."""
+    removed = []
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove",
+                        lambda repo, path: removed.append(str(path)) or True)
+    monkeypatch.setattr(runner_mod.gitops, "worktree_reclaim_block", lambda path: "dirty")
+    monkeypatch.setattr(runner_mod, "_pid_alive", lambda pid: False)
+    _settled_checkout(monkeypatch)
+    (rig.home / "worktrees" / "t7").mkdir(parents=True, exist_ok=True)
+    _teardown_rig(rig, "t7")
+
+    rig.r._reclaim_flight_worktrees()
+    assert removed == []
+    assert (rig.home / "worktrees" / "t7").exists()
+
+
+def test_the_flight_sweep_is_not_gated_by_the_park_family_knob(rig, monkeypatch):
+    """`cleanup_parked_worktrees` defaults off for a stated reason (#168): the owner must be able to
+    open STALLED WORK and look at the session. A finished flight's checkout holds no work — that is
+    a ruling about something else, and inheriting it is what this issue is about."""
+    removed = []
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove",
+                        lambda repo, path: removed.append(str(path)) or True)
+    monkeypatch.setattr(runner_mod.gitops, "worktree_reclaim_block", lambda path: None)
+    monkeypatch.setattr(runner_mod, "_pid_alive", lambda pid: False)
+    rig.r.config = make_config(cleanup_parked_worktrees=False)
+    _settled_checkout(monkeypatch)
+    (rig.home / "worktrees" / "t7").mkdir(parents=True, exist_ok=True)
+    _teardown_rig(rig, "t7")
+
+    rig.r._reclaim_flight_worktrees()
+    assert removed == [str(rig.home / "worktrees" / "t7")]
 
 
 def test_a_declined_prune_is_recorded_and_retried_on_a_later_tick(rig, monkeypatch):

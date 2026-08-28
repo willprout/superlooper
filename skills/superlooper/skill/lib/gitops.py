@@ -185,6 +185,31 @@ def worktree_remove(repo, path):
     return not os.path.exists(p) and rc == 0
 
 
+def checkout_age(worktree, now):
+    """How many seconds this checkout has existed on disk — or 0 (BRAND NEW) when that cannot be
+    read. No git, no network: one ``stat``. Lives beside ``worktree_reclaim_block`` because it is
+    the other question a reclaim sweep asks of a directory, and because both of its callers — the
+    runner's flight sweep and the `upkeep` census — already come here for the first one.
+
+    THE ZERO IS THE CONTRACT (issue #463, fresh-agent review). Its callers read a YOUNG checkout as
+    "a launch may still be reaching this": ``lib/launch.py`` creates a flight's checkout and only
+    then opens the pane, so between the two there is an interval in which the directory exists and
+    the session's singleton lock does not. A stat that could not be taken must therefore land on
+    "brand new", never on "old enough to prune". A probe result, never a raise — including for a
+    wrong-typed path, which ``os.stat`` answers with TypeError rather than OSError.
+
+    ``max(mtime, ctime)``, taking the MORE RECENT of the two, for the same direction: either alone
+    is a usable lower bound on age, and the newer one yields the SMALLER age. `git worktree add`
+    stamps both at creation; anything that later writes into the directory moves mtime, which is
+    what makes the re-point of a reused flight checkout read as recent activity rather than as an
+    old, abandoned tree."""
+    try:
+        st = os.stat(os.fspath(worktree))
+    except (OSError, ValueError, TypeError):
+        return 0
+    return max(0.0, now - max(st.st_mtime, st.st_ctime))
+
+
 def worktree_reclaim_block(worktree):
     """Would pruning this worktree destroy the only copy of its work? Returns a short reason string
     when it WOULD (so the reclaim must refuse), or None when the checkout is safe to drop (issue

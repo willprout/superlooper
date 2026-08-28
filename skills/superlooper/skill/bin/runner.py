@@ -2260,6 +2260,113 @@ class Runner:
             # dirty/unpushed checkout; reclaim it once the work is committed AND pushed.
             self._teardown_session(iid, remove_worktree=True, exit_timeout=0, guard_worktree=True)
 
+    def _reclaim_flight_worktrees(self):
+        """Bound the disk a `t<N>` TRIAGE FLIGHT costs (issue #463, on #41's bound).
+
+        A repo that sets `triage.home: worktree` (#448) gets each flight a detached checkout at
+        `<run root>/worktrees/<t-id>`. Nothing reclaimed one, and nothing COULD: the sibling reaper
+        above walks `issues.json`, and a flight deliberately has no record there — it belongs to no
+        issue. So on exactly the repos that chose that home for privacy reasons, one checkout
+        accumulated per day, forever. That is the growth #41 exists to bound, reproduced one session
+        class over, and the readers not knowing what a `t<N>` is is what hid it.
+
+        TWO GATES, AND THE SECOND IS THE ONE "IS IT ALIVE" CANNOT GIVE. A flight's checkout is
+        reclaimed once its session is gone — however it went: it exited, the machine restarted, or
+        the owner closed its window with `superlooper tidy`. It is never touched while the CLI is
+        alive, because that directory is that CLI's cwd and pruning it is the D14 shape the ordered
+        teardown exists to prevent (the next hook spawn dies in posix_spawn before it can run a
+        line). `exit_timeout=0` for the same reason the park reaper uses it: this runs every tick
+        and must never pay a per-flight wait — a live flight simply defers to a later sweep.
+
+        But `lib/launch.py` CREATES the checkout and only then opens the pane, and the lock is taken
+        by `start-session.sh` inside that new pane a whole delivery-verify window later — so during
+        a launch there is a real interval in which the directory exists and no lock does. Reading
+        that as "dead" would prune a checkout a session was still being launched into: the same D14
+        shape, arriving through the one door the liveness veto does not cover (fresh-agent review,
+        P0). So a checkout younger than `tidy.FLIGHT_LAUNCH_GRACE_SECONDS` is held off too, and an
+        age that cannot be read fails the same way — see that constant for the bound it covers.
+
+        NEITHER EXISTING KNOB GATES IT, and that is a decision rather than an omission:
+
+          * NOT `cleanup_parked_worktrees` (default off). What that default encodes is the owner's
+            2026-07-16 ruling about STALLED WORK — "the owner must be able to open that stalled work
+            and look at the session", so a park-family lane's window and worktree persist until an
+            owner verb resolves it. A flight's checkout holds no work to open: it commits nothing,
+            pushes nothing and writes nothing there. Riding that gate would be inheriting a ruling
+            made about something else, which is precisely the failure #463 is about.
+          * NOT `auto_close_merged_windows`. That key names merged LANES; putting a flight's disk
+            bound at the mercy of a switch about something else would be the same mistake spelled
+            differently. And nothing here closes a live window anyway — the sweep only ever acts
+            once the session is already gone.
+
+        Still pruned through the GUARDED teardown (`guard_worktree=True`). By the argument above the
+        #190 guard should never fire for a flight; the point of leaving it in is the case where it
+        does — something wrote in that checkout, and then it is the only copy, and the refusal keeps
+        it and surfaces it on the weekly `upkeep` page.
+
+        Best-effort by the CONTRACT of every step it calls, exactly like the park reaper beside it
+        rather than by a blanket `except`: `_lock_pid`/`_pid_alive` are probes that answer rather
+        than raise, `_teardown_session` bounds its own host calls and swallows their failures, and
+        `worktree_remove` returns False instead of raising. The one raise this function could take
+        on its own — an unreadable worktrees dir — is caught above. Disk hygiene must never crash a
+        tick or delay the heartbeat stamped after it."""
+        wdir = os.path.join(self.home, "worktrees")
+        try:
+            on_disk = [n for n in os.listdir(wdir) if os.path.isdir(os.path.join(wdir, n))]
+        except OSError:
+            return                                     # no worktrees dir -> nothing to sweep
+        # The liveness view the pure selector needs, built here because it is the impure half — and
+        # it asks "is this session PROVEN GONE?", which is deliberately not the same question as
+        # `_lock_pid`'s "does a live pid hold this lane?" (fresh-agent review round 2, P0).
+        #
+        # The difference is the corrupt lock. `_lock_pid` answers None for a lock that is empty or
+        # unparseable, and reads that as no veto — correct where it is used, because a stale lock
+        # must never block a lane's relaunch forever. Here the answer licenses UNLINKING A
+        # DIRECTORY, and start-session.sh writes this file atomically WITH its pid (an `ln` of a
+        # fully-written temp, its own codex P1-a lesson), so a lock that exists yet names no
+        # readable pid is not an ordinary state at all — it is corruption. Pruning on it would be
+        # the fail-OPEN-on-wrong-typed defect class on the most destructive path here. Hands off;
+        # the checkout stays, and `upkeep`'s weekly census is where it becomes visible.
+        #
+        # The teardown re-checks liveness under its own bound, so the narrow race between this read
+        # and the prune ends in a DEFERRAL rather than a prune under a live CLI; that deferral's
+        # marker is retried by this sweep on the next tick (the shared drain fails closed on an id
+        # it cannot find in issues.json, which a flight never is).
+        live = {n for n in on_disk if not self._session_proven_gone(n)}
+        now = time.time()
+        launching = {n for n in on_disk
+                     if gitops.checkout_age(os.path.join(wdir, n), now)
+                     < tidy.FLIGHT_LAUNCH_GRACE_SECONDS}
+        for tid in tidy.reclaimable_flight_worktrees(on_disk, live=live, launching=launching):
+            self._teardown_session(tid, remove_worktree=True, exit_timeout=0, guard_worktree=True)
+
+    def _session_proven_gone(self, iid):
+        """Is this session's singleton lock POSITIVE evidence that nothing is running under `iid`?
+
+        Only two states say so: no lock file at all (the EXIT trap freed it, or none was ever
+        taken), and a lock naming a pid the OS DEFINITIVELY reports dead. A lock that exists but
+        holds anything else — empty, whitespace, `not-a-pid`, a negative number, or a decimal too
+        large for `os.kill` — is corruption rather than a reading, and answers False. See
+        `_reclaim_flight_worktrees` for why that direction is the safe one here and why it is NOT
+        `_lock_pid`'s direction.
+
+        `_probe_pid`, never `_pid_alive` (fresh-agent review round 3). The tri-state exists exactly
+        because "dead" is the answer that AUTHORISES a prune, and `_pid_alive` collapses its third
+        state — a pid too large for `os.kill`'s C int, an unexpected errno — into False. Under that
+        collapse a lock reading `"9" * 30` would have read as a dead session and licensed unlinking
+        a live CLI's cwd: the same fail-open one shape further in.
+
+        The parse is guarded rather than trusted for the neighbouring hazard `actions.py` and
+        `gate.py` cap the same way: `str.isdigit` accepts forms `int()` refuses, and `int()` itself
+        refuses a literal past 4300 digits — a raise here would wedge the tick before its heartbeat.
+        """
+        path = self._lock_path(iid)
+        try:
+            pid = int((_read(path) or "").strip())
+        except (TypeError, ValueError):
+            return not os.path.exists(path)
+        return _probe_pid(pid) == "dead"
+
     # ------------------------- the tick -------------------------
 
     def tick(self, now=None):
@@ -2404,6 +2511,7 @@ class Runner:
         # read genuinely holds nothing, both maps are empty and the fallback changes nothing.
         publish_ist_map = fresh_ist_map or ist_map
         self._reclaim_terminal_worktrees(fresh)        # opt-in only (#168): OFF by default, park-family persists
+        self._reclaim_flight_worktrees()               # (#463) a dead triage flight's checkout — never gated
         self._drain_pending_teardowns(fresh)           # (#149) retry prunes declined under a live CLI
         if now - self._last_journal_rotate >= JOURNAL_ROTATE_SECONDS:
             try:

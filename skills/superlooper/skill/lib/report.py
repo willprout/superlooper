@@ -696,7 +696,14 @@ def _since(v):
 
 
 def _iid_num(iid):
-    """``i405`` -> ``405``; anything else -> None (sorts last, still rendered by its id)."""
+    """``i405`` -> ``405``; anything else -> None (sorts last, still rendered by its id).
+
+    A `t<N>` triage flight is "anything else" DELIBERATELY (issue #463): a flight is not an issue,
+    so it has no number to sort by and no lane row to sit in. The morning report already renders a
+    flight — as its triage ACTS (`_triage` below, from the journal), which is what a flight actually
+    produces — and #451 owns anything further. What must never happen is a flight arriving in the
+    lane sections through a widened id test, where every column (branch, PR, hold reason) would be
+    empty by construction."""
     if isinstance(iid, str) and iid.startswith("i") and iid[1:].isdigit():
         return int(iid[1:])
     return None

@@ -938,7 +938,12 @@ def next_generation(ist):
 
 
 def _iid_num(iid):
-    """i<N> -> N, else None (a loopstate key that isn't an issue id is corruption, skipped)."""
+    """i<N> -> N, else None (a loopstate key that isn't an issue id is corruption, skipped).
+
+    The `d<N>` and `t<N>` session ids are "else" on purpose, and the split is the point: this module
+    accounts for ISSUES, and neither a debugger seat nor a triage flight is one. `_is_session_id`
+    below is the deliberately wider test, used only where the question is about LAUNCHES rather than
+    about issues (issue #457; #463 pinned that the two stay apart)."""
     if isinstance(iid, str) and iid.startswith("i") and iid[1:].isdigit():
         return int(iid[1:])
     return None

@@ -204,6 +204,30 @@ def test_an_orphan_checkout_holding_work_is_still_a_finding():
     assert c["held"] == [{"id": "i42", "status": "(no lane record)", "block": "unpushed"}]
 
 
+def test_the_census_counts_a_dead_flights_checkout_as_reclaimable():
+    """(#463) The census's whole promise is that it never drifts from what the reaper would take.
+    The runner reclaims a dead flight's checkout now, so the weekly page has to say so — otherwise
+    it reports N checkouts and 0 reclaimable on a repo whose disk is about to shrink anyway."""
+    c = upkeep.worktree_census(["t7", "i7"], {"i7": {"status": "parked"}},
+                               {"t7": None, "i7": None}, live_flights=set())
+    assert c["reclaimable"] == ["i7", "t7"]
+    assert c["total"] == 2
+
+
+def test_a_live_flights_checkout_is_neither_reclaimable_nor_a_finding():
+    # The same reasoning as a live lane's dirty worktree: a session is standing in it right now.
+    c = upkeep.worktree_census(["t7"], {}, {"t7": "dirty"}, live_flights={"t7"})
+    assert c["reclaimable"] == [] and c["held"] == []
+
+
+def test_a_dead_flights_checkout_holding_work_is_still_a_finding():
+    # A flight writes nothing there, so this should never happen — which is exactly why it must be
+    # visible if it does, rather than silently reclaimed.
+    c = upkeep.worktree_census(["t7"], {}, {"t7": "dirty"}, live_flights=set())
+    assert c["reclaimable"] == []
+    assert c["held"] == [{"id": "t7", "status": "(a triage flight)", "block": "dirty"}]
+
+
 def test_worktree_census_fails_closed_on_wrong_typed_input():
     c = upkeep.worktree_census(None, None, None)
     assert c["total"] == 0 and c["reclaimable"] == [] and c["held"] == []
@@ -439,9 +463,12 @@ def test_upkeep_reads_the_journal_for_the_weeks_counts_and_the_notify_canary(upk
 def test_the_census_counts_a_leftover_triage_checkout(upkeep_rig):
     r"""`_UPKEEP_WORKTREE_RE` was `i\d+`, so a `t<N>` checkout appeared on no page at all: the
     reapers walk loopstate (which a flight is deliberately absent from) and this was the only
-    directory walk. Both other columns must stay quiet for a clean one, though — `tidy` can never
-    select it (no lane record) and a clean detached tree carries no reclaim block — so a leftover
-    flight checkout is COUNTED, never proposed for removal and never reported as unsaved work."""
+    directory walk.
+
+    Counting it was only half an answer, and issue #463 supplied the other half: a dead flight's
+    checkout is now RECLAIMABLE — the runner takes it on a later tick — so this page must say so.
+    Reporting a checkout that is about to be reclaimed as merely present is the drift this census
+    promises never to have."""
     rig = upkeep_rig
     home = Path(rig.env["SL_HOME"]) / "o__r"
     assert (home / "worktrees" / "t3").is_dir(), "the rig must actually seed one"
@@ -450,9 +477,9 @@ def test_the_census_counts_a_leftover_triage_checkout(upkeep_rig):
     census = upkeep.worktree_census(
         ["i7", "t3"],
         {"i7": {"status": "parked"}, "i9": {"status": "merged"}},
-        {"i7": None, "t3": None})
+        {"i7": None, "t3": None}, live_flights=set())
     assert census["total"] == 2, census
-    assert "t3" not in census["reclaimable"], "a flight has no lane record; tidy can never take it"
+    assert census["reclaimable"] == ["i7", "t3"], census
     assert [h["id"] for h in census["held"]] == [], census
 
 

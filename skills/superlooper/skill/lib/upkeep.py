@@ -166,7 +166,7 @@ def branch_census(branches, proposals):
             "kept": len(sl) - len(hit)}
 
 
-def worktree_census(worktree_ids, issues, blocks):
+def worktree_census(worktree_ids, issues, blocks, live_flights=(), launching_flights=()):
     """What lane checkouts are on disk and which of them hold work that exists nowhere else.
 
     ``{"total", "reclaimable": [iid], "held": [{"id","status","block"}]}``.
@@ -196,7 +196,17 @@ def worktree_census(worktree_ids, issues, blocks):
     `blocks` is {iid: reason-or-None} from ``gitops.worktree_reclaim_block``. A missing/None/empty
     entry means "no reclaim-block known": eligible for the runner's own reaper (which re-guards each
     checkout with ``worktree_reclaim_block`` again at reap time), and not a held finding (no
-    evidence of unsaved work). Every wrong-typed input -> empty."""
+    evidence of unsaved work). Every wrong-typed input -> empty.
+
+    A `t<N>` TRIAGE FLIGHT's checkout is counted by the SAME two rules and the same two lists, via
+    the flight's own selector (issue #463). It has no lane record and never will — it belongs to no
+    issue — so before that widening a flight checkout landed in `total` and in neither list, which
+    on a repo running `triage.home: worktree` is the one page that could have said "these are piling
+    up" reporting them as merely present. `live_flights` is the ids whose session is still alive
+    (`worker.<id>.lock` naming a live pid) and `launching_flights` the ids whose checkout is too
+    young to prove a launch is not still reaching it; each is excluded from BOTH lists for the same
+    reason a live lane is — a session is standing in that directory, or is about to be. Both come
+    from the caller, so this page proposes exactly what the runner's own sweep would take."""
     import actions
     import tidy
 
@@ -204,19 +214,31 @@ def worktree_census(worktree_ids, issues, blocks):
                  if isinstance(worktree_ids, (set, frozenset, list, tuple)) else set())
     issues = issues if isinstance(issues, dict) else {}
     blocks = blocks if isinstance(blocks, dict) else {}
-    safe = [i for i in tidy.reclaimable_worktrees(issues, ids)
-            if not _s(blocks.get(i))]
+    flights = tidy.reclaimable_flight_worktrees(ids, live=live_flights,
+                                                launching=launching_flights)
+    safe = sorted([i for i in tidy.reclaimable_worktrees(issues, ids) + flights
+                   if not _s(blocks.get(i))])
     # A worker may still be writing in a territory-claim lane; a merged checkout is reclaimed on the
     # merge path. Everything else that holds unsaved work is a finding.
     live_or_reaped = actions.TERRITORY_CLAIM_STATUSES | {"merged"}
+    dead_flights = set(flights)
     held = []
     for iid in ids:
         ist = issues.get(iid)
         status = ist.get("status") if isinstance(ist, dict) else None
         status = status if isinstance(status, str) else None
         block = _s(blocks.get(iid))
-        if block and status not in live_or_reaped:
-            held.append({"id": iid, "status": status or "(no lane record)", "block": block})
+        if not block or status in live_or_reaped:
+            continue
+        if tidy.triage.is_flight_id(iid):
+            # A LIVE flight is excluded exactly as a live lane is; a dead one whose checkout holds
+            # work is a finding, and named as what it is rather than as "(no lane record)" — that
+            # phrase would send a reader looking for a lane that was never supposed to exist.
+            if iid not in dead_flights:
+                continue
+            held.append({"id": iid, "status": "(a triage flight)", "block": block})
+            continue
+        held.append({"id": iid, "status": status or "(no lane record)", "block": block})
     return {"total": len(ids), "reclaimable": safe, "held": held}
 
 
@@ -432,7 +454,10 @@ def _worktrees_row(census, out):
     held = census.get("held") or []
     reclaimable = reclaimable if isinstance(reclaimable, list) else []
     held = held if isinstance(held, list) else []
-    _row("worktrees", "%d on disk; %d park-family reclaimable, %d holding unsaved work"
+    # "reclaimable", not "park-family reclaimable": since #463 the list also holds the checkouts of
+    # triage flights whose session has ended, which the runner takes ungated. Naming one of the two
+    # classes would understate the number standing right beside it.
+    _row("worktrees", "%d on disk; %d reclaimable, %d holding unsaved work"
          % (total, len(reclaimable), len(held)), out)
     if held:
         _more(held, out, lambda h: "%s (%s) holds %s — nothing will reclaim it"

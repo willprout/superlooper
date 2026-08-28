@@ -35,6 +35,17 @@ would apply all three type labels and manufacture the very `type_duplicate` it w
 explicit per-key tap does. The ONE ungrouped metadata fix is the case where nothing is being chosen
 at all: the author already wrote the `touches:` value and only the heading above it is missing.
 
+**A `t<N>` TRIAGE FLIGHT IS NEVER A SUBJECT HERE, and the answer costs no code (issue #463).**
+Every class above is anchored to an ISSUE — a `sl/i<N>` branch, that branch's PR, a parked issue, a
+keyword-closed issue, an invalid issue's metadata. A flight (#448) opens no branch, files no PR and
+has no issue of its own; it acts ON the queue rather than appearing in it. So the sweep is silent
+about one structurally rather than by a check, and `branch_issue_num` — which is what would have to
+match — refuses an `sl/t<N>` for the same reason it refuses any other non-lane branch. The flight's
+own debris is local, not GitHub-side: its window is `superlooper tidy`'s and its checkout is the
+runner's (`tidy.reclaimable_flight_worktrees`). Stated because #463 found the whole engine
+answering questions about flights by not matching a pattern, and "nothing to do" is only a good
+answer when somebody has actually asked.
+
 Safety, stated as code below and pinned by tests:
   * A branch is proposed ONLY when its work provably landed or was provably replaced: its PR
     MERGED, or its PR CLOSED and labeled `superseded`. A branch with no PR, a refused PR lookup,
