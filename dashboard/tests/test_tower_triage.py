@@ -280,3 +280,39 @@ def test_the_dashboards_triage_vocabulary_and_the_towers_agree():
     # reverse) — so pin them together rather than leaving the seam to a reader.
     assert set(triage.ACT_COUNTS) <= set(tower.TRIAGE_ACTS)
     assert triage.LAUNCH_ACT in tower.TRIAGE_ACTS and triage.FINISH_ACT in tower.TRIAGE_ACTS
+
+
+# =============================== the two claims a truthy read would forge ===============================
+# (Fresh-agent review, medium.) Both of these fields are booleans the ENGINE writes, and both decide
+# a claim about what did NOT happen — "the issue was not touched", "no session was created". A
+# truthy read turns the string "false" (a hand-edited or half-written record) into that claim.
+
+def test_a_wrong_typed_held_never_claims_the_issue_was_left_untouched():
+    for junk in ("false", "no", 0.0, [], {}, "true", 1, object()):
+        text = _plain(_row("triage_escalate", num=460, flight="t7", held=junk, finding="x"))
+        if junk is True:                                    # unreachable; kept for the reader
+            continue
+        assert "untouched" not in text, (
+            "held=%r is not the engine's boolean claim — the line must not say the issue was left "
+            "alone" % (junk,))
+        assert "escalat" in text.lower(), "it is still an escalation, whatever `held` says"
+    assert "untouched" in _plain(_row("triage_escalate", num=460, flight="t7", held=True,
+                                      finding="x"))
+
+
+def test_a_fence_record_with_no_readable_outcome_claims_neither_way():
+    # `refused` is the engine's own boolean. Absent or wrong-typed, the honest render is that the
+    # record does not say — never "cleared" (a false all-clear on the one gate standing between an
+    # unattended, issue-closing session and an unfenced machine) and never "refused" either.
+    for junk in (None, "false", "true", 0, 1, [], {}):
+        row = _row("fence_preflight", id="t7", verdict="fenced", required=True, refused=junk)
+        text = _plain(row)
+        assert "t7" in text
+        assert "cleared" not in text.lower(), "refused=%r must not read as a pass" % (junk,)
+        assert "no session was created" not in text, "refused=%r must not read as a refusal" % (junk,)
+        assert "records no outcome" in text or "does not say" in text
+        assert row["kind"] == "unknown"
+    assert "cleared" in _plain(_row("fence_preflight", id="t7", verdict="fenced",
+                                    required=True, refused=False)).lower()
+    assert "no session was created" in _plain(_row("fence_preflight", id="t7", verdict="open",
+                                                   required=True, refused=True))

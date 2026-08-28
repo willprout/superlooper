@@ -499,7 +499,11 @@ def _triage_row(rec):
         # sentence has to say which of the two happened — "escalated" alone would read as an action
         # taken on frozen owner text.
         finding = _first_line(rec.get("finding")) or _first_line(rec.get("detail"))
-        how = "flagged for you, untouched" if rec.get("held") else "escalated for you"
+        # `is True`, not truthiness (fresh-agent review): "untouched" is a claim about what did NOT
+        # happen to frozen owner text, and only the engine's own boolean may make it. A hand-edited
+        # or half-written `"false"` is truthy, and would forge exactly that claim. Anything else
+        # still renders as the escalation it is — the weaker, always-true half of the sentence.
+        how = "flagged for you, untouched" if rec.get("held") is True else "escalated for you"
         return {"radio": "Tower, one for the owner.", "kind": "escalate",
                 "text": "%s %s %s%s." % (who, how, ref,
                                          " — %s" % finding if finding else "")}
@@ -522,14 +526,26 @@ def _triage_row(rec):
 def _fence_row(rec, fid):
     """A flight's launch-time fence check. The verdict only — never the socket path: what a session
     host is and where its door is are not this board's business (issue #310), and a path on screen is
-    a machine's detail rather than an owner's fact."""
+    a machine's detail rather than an owner's fact.
+
+    Three-way on ``refused``, exactly as ``fixer.launch_outcome`` is on a launch, and for the sharper
+    version of the same reason: this is the one gate standing between an unattended, issue-closing
+    session and an unfenced machine, so "cleared" must be an explicit ``False`` and never the default
+    a missing or wrong-typed field falls into. "Refused" is not the safe default either — it would
+    report a launch nobody has resolved as a failure. A record that does not say, says so.
+    """
     verdict = _plain(rec.get("verdict")) or "unrecorded"
-    if rec.get("refused"):
+    refused = rec.get("refused")
+    if refused is True:
         return {"radio": "", "kind": "alert",
                 "text": "%s was refused at the pre-flight fence check (%s) — no session was created."
                         % (fid, verdict)}
-    return {"radio": "", "kind": "gate",
-            "text": "%s cleared its pre-flight fence check (%s)." % (fid, verdict)}
+    if refused is False:
+        return {"radio": "", "kind": "gate",
+                "text": "%s cleared its pre-flight fence check (%s)." % (fid, verdict)}
+    return {"radio": "", "kind": "unknown",
+            "text": "%s has a pre-flight fence check on record (%s) that records no outcome — "
+                    "nothing here says whether it was let through." % (fid, verdict)}
 
 
 def comms_row(rec, operator="the owner"):

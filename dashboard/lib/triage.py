@@ -134,6 +134,26 @@ def _is_triage(rec):
     return isinstance(act, str) and act.startswith(ACT_PREFIX)
 
 
+def _rec_flight(rec):
+    """The ``t<N>`` a record belongs to, or ``None``.
+
+    Two keys, because the engine stamps it under two: an act carries ``flight`` (``_triage_record``
+    reads ``SL_ISSUE_ID``, which the LAUNCHER assigns and no session can self-assert) and the launch
+    itself carries ``id``. Both are the same claim, and a reader that knows only one of them
+    attributes either nothing or everything.
+
+    ``None`` is the load-bearing answer, and it is the engine's own (``triage.finished_flights``): a
+    hand-run verb from the owner's shell journals an EMPTY flight id — the CLI reads it from the
+    session's environment and a terminal has none — and that record belongs to NO flight rather than
+    to whichever one ran last.
+    """
+    for key in ("flight", "id"):
+        v = rec.get(key)
+        if is_flight_id(v):
+            return v
+    return None
+
+
 def _one_line(text, limit=140):
     """The first non-empty line of a field the flight wrote, trimmed. A run summary is one line by
     construction; a detail written by an agent is not necessarily."""
@@ -231,11 +251,20 @@ def run(records, now, activity=None, window_seconds=WINDOW_SECONDS,
         return _blank()
 
     launch_ts, launch_rec = launch
-    fid = launch_rec.get("id")
-    fid = fid if is_flight_id(fid) else None
-    # Only what happened at or after this run began — yesterday's finish must never land today's
-    # flight on the ground with yesterday's numbers on its card.
-    during = [rec for ts, rec in mine if ts >= launch_ts and rec is not launch_rec]
+    fid = _rec_flight(launch_rec)
+    # THIS FLIGHT's own acts, and nothing else's (fresh-agent review, P0). The window alone is not
+    # the boundary — two things slip through it, and they fail in opposite directions:
+    #
+    #   * an operator's hand-run `triage-finish` carries an EMPTY flight id, and read as this run's
+    #     close it grounds a still-working survey and prints a tally the flight never wrote;
+    #   * another flight's acts (a second `t<N>` in the same window) get counted into this one.
+    #
+    # So attribution is by the id the LAUNCHER assigned, exactly as `triage.finished_flights` does
+    # it one repo over. A launch that names no flight can attribute nothing: no identity, no claim.
+    # The `ts >= launch_ts` bound stays, so yesterday's t7 cannot lend today's t7 its numbers.
+    during = [rec for ts, rec in mine
+              if ts >= launch_ts and rec is not launch_rec and fid is not None
+              and _rec_flight(rec) == fid]
 
     finish = None
     for rec in during:
@@ -302,6 +331,12 @@ def _sentence(state, label, launch_rec, tally):
     if state == FINISHED:
         return "%s closed its run — %s." % (label, tally)
     why = _one_line(launch_rec.get("detail"))
+    if label == UNNAMED_LABEL:
+        # The launch is on record and its own id is not readable, so nothing it did could be
+        # attributed to it. Say exactly that rather than printing a tally of zeroes as if the run
+        # had judged nothing.
+        return ("%s is out — %s. Its launch record did not name the flight, so no act on this "
+                "board could be attributed to it." % (label, why or "a triage survey was launched"))
     return ("%s is over the unapproved queue — %s. So far: %s."
             % (label, why or "a triage survey is out", tally))
 

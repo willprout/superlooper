@@ -291,3 +291,68 @@ def test_the_absent_block_carries_every_key_the_present_one_does():
     # The card binds this block on every render; a key that appears only when a flight flew is how a
     # surface starts throwing at 3am on the one night it matters.
     assert set(_run([])) == set(_run([_launch()]))
+
+
+# =============================== a run is ONE flight's, and only its own ===============================
+# (Fresh-agent review, P0.) The window alone is not the boundary. Every act a flight takes carries its
+# own `flight` id (the CLI stamps it from `SL_ISSUE_ID`, which the launcher assigns and no session can
+# self-assert), and the engine's own reader — `triage.finished_flights` — refuses to attribute a
+# record with no flight id to whichever flight ran last. A run scoped by time alone gets the two ways
+# that can go wrong exactly backwards.
+
+def test_an_operators_hand_run_finish_never_grounds_a_flying_survey():
+    # `superlooper triage-finish` run from the owner's own shell journals an EMPTY flight id — the CLI
+    # reads it from the session's environment and a terminal has none. Reading it as t7's finish
+    # lands a still-working flight on the ground and puts a tally on its card that it never wrote.
+    block = _run([_launch(),
+                  _rec("triage_close", -2400, num=452, flight="t7", verdict="overtaken",
+                       commit="abc1234"),
+                  _rec("triage_finish", -120, flight="", counts=dict(FINISH_COUNTS),
+                       detail=FINISH_SUMMARY)])
+    assert block["state"] == triage.FLYING, "a hand-run finish belongs to no flight"
+    assert block["on_field"] is True
+    assert block["counts"] == {"judged": 1, "merged": 0, "closed": 1, "ledger": 0,
+                               "fixed": 0, "escalated": 0}
+    assert block["counts_source"] == triage.DERIVED
+
+
+def test_another_flights_acts_are_never_counted_into_this_run():
+    block = _run([_launch(flight="t7"),
+                  _rec("triage_close", -2400, num=452, flight="t7", verdict="overtaken",
+                       commit="abc1234"),
+                  _rec("triage_merge", -2000, num=470, flight="t8", absorber=440),
+                  _rec("triage_escalate", -1900, num=471, flight="t8", finding="not ours")])
+    assert block["id"] == "t7"
+    assert block["counts"] == {"judged": 1, "merged": 0, "closed": 1, "ledger": 0,
+                               "fixed": 0, "escalated": 0}
+
+
+def test_another_flights_finish_never_closes_this_run():
+    block = _run([_launch(flight="t7"),
+                  _rec("triage_finish", -120, flight="t8", counts=dict(FINISH_COUNTS),
+                       detail=FINISH_SUMMARY)])
+    assert block["state"] == triage.FLYING
+    assert block["on_field"] is True
+    assert block["tally"] != FINISH_SUMMARY, "t8's tally must never be printed as t7's"
+
+
+def test_a_launch_that_names_no_flight_attributes_no_acts_to_it():
+    # No identity, no attribution. The acts are still real and the tower log still shows every one —
+    # but a card that put them under a flight it cannot name would be inventing the connection.
+    block = _run([_launch(flight="???"),
+                  _rec("triage_close", -2400, num=452, flight="t7", verdict="overtaken",
+                       commit="abc1234")])
+    assert block["present"] is True
+    assert block["id"] is None
+    assert block["counts"] == {k: 0 for k in triage.COUNT_KEYS}
+    assert "could not be attributed" in block["text"] or "did not name" in block["text"]
+
+
+def test_the_launch_records_own_id_key_is_read_as_well_as_the_acts():
+    # The launch stamps the flight under `id`; every act stamps it under `flight`. Both are the same
+    # claim, and a reader that knows only one of them attributes nothing (or everything).
+    block = _run([_rec("triage_launch", -3600, id="t7", num=None, outcome="launched", detail="x"),
+                  _rec("triage_finish", -120, id="t7", counts=dict(FINISH_COUNTS),
+                       detail=FINISH_SUMMARY)])
+    assert block["state"] == triage.FINISHED
+    assert block["counts"] == FINISH_COUNTS
