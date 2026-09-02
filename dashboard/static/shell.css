@@ -1246,6 +1246,19 @@ html, body {
 .drawer-actions .drawer-session {
   font: 600 10.5px var(--mono); letter-spacing: 0.3px; white-space: nowrap;
 }
+/* #471: the drawer's go-ahead verb can take typed input (the #163 Answer). Field above button, in
+   the same `.act` column the card uses — the drawer opens on the flight whose memo IS the question,
+   so the answer belongs where the question is read. It takes the row's spare width; the drawer's
+   own actions row stays a row, so Discuss still sits beside it. */
+.drawer-actions .act { display: flex; flex-direction: column; gap: 3px; min-width: 0; flex: 1 1 auto; }
+.drawer-actions .answer-field {
+  width: 100%; max-width: 100%; min-width: 0; box-sizing: border-box; resize: vertical;
+  border: 1px solid #C9D2DC; border-radius: 6px; padding: 7px 9px;
+  font: 500 12px/1.45 var(--mono); color: var(--ink); background: #FBFDFF;
+}
+.drawer-actions .answer-field:focus { outline: none; border-color: var(--blue); }
+/* The row grows a stacked field, so its buttons stop being vertically centred against it. */
+.drawer-actions:has(.act) { align-items: flex-end; }
 
 /* ============================ Task 11 — night replay + morning digest ============================ */
 

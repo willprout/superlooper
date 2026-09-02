@@ -44,6 +44,11 @@ the operator liftoff's cwd-relative resolution, so the next run is right by unde
 import os
 import re
 
+# The literal "this is a command-center" claim a responder must carry before its pid is
+# trusted as a kill target. Imported, never re-spelled: the process that WRITES the claim
+# (lib/version) and the command that READS it must not be able to disagree about the word.
+from version import PRODUCT
+
 # ---------------------------------------------------------------- the runner's home (issue #306)
 # The runner no longer always lives in the tab you run liftoff from. ``runner_home`` is a per-repo
 # ENGINE config key, and liftoff must never read that file itself (the engine stays a black box we
@@ -189,7 +194,26 @@ def runner_lock_pid(state_home):
         return None
 
 
-def dashboard_restart_decision(url, snapshot, port_busy=False):
+def _identified_pid(version):
+    """The pid a version block hands over as a kill target, or ``None``.
+
+    Trusted ONLY when the responder also carries the ``product`` marker naming itself a
+    command-center. A pid is just a number anything could print; paired with the explicit product
+    claim it is the process asserting what it is. That pairing is what makes a SIGTERM safe here,
+    and it has bitten this project before: a pattern kill (``pkill -f``) collateral-killed
+    William's live dashboard (2026-07-07), and the port-holder is no safer.
+    """
+    if not isinstance(version, dict):
+        return None
+    pid = version.get("pid")
+    # bool is an int in Python — screen it out explicitly, or `True` reads as pid 1.
+    if (version.get("product") == PRODUCT
+            and isinstance(pid, int) and not isinstance(pid, bool) and pid > 0):
+        return pid
+    return None
+
+
+def dashboard_restart_decision(url, snapshot, port_busy=False, identity=None):
     """The pure decision behind ``liftoff --restart-dashboard`` (issue #136): what to do about a
     dashboard that is running an older build than the checkout on disk.
 
@@ -203,7 +227,10 @@ def dashboard_restart_decision(url, snapshot, port_busy=False):
     ``snapshot`` is the live dashboard's ``/api/snapshot`` (already probed and shape-verified by the
     composition root) or ``None`` if nothing of ours ANSWERED. ``port_busy`` is the kernel's separate,
     dumber answer to "is anything accepting TCP on that port": the two together are what let a silent
-    port be told apart from an empty one. Returns ``{action, pid, message}``:
+    port be told apart from an empty one. ``identity`` is the second, snapshot-free probe
+    (``/api/version``, issue #471) — the version block a dashboard can still publish while its
+    snapshot builder is crashing; consulted ONLY when the snapshot said nothing. Returns
+    ``{action, pid, message}``:
 
     * ``start`` — the port is free and nothing is serving; just bring one up.
     * ``stop-then-start`` — stop ``pid``, wait for it to actually go, then start fresh. The pid is
@@ -216,14 +243,29 @@ def dashboard_restart_decision(url, snapshot, port_busy=False):
       port-holder is no safer — ``_dashboard_up``'s own contract admits an unrelated app can squat
       the port.
     * ``refuse`` — something is serving but will not identify itself as a command-center with a pid
-      (a server predating this issue, or a stranger on the port). Guessing a kill target is exactly
-      the failure above, so liftoff stops and tells the owner how to finish by hand.
+      (a server predating this issue, or a stranger on the port) — and, for a silent port, did not
+      identify itself on ``/api/version`` either. Guessing a kill target is exactly the failure
+      above, so liftoff stops and tells the owner how to finish by hand.
 
     A dashboard that is already current still restarts: the flag is the owner's explicit act, not a
     repair the machine talks itself into. The message just says so.
     """
     if snapshot is None:
         if port_busy:
+            # A wedged dashboard that can still SAY WHO IT IS (issue #471). The snapshot is built
+            # from the watched repos' state homes and the identity from the checkout, so one can
+            # crash while the other answers — which is exactly what happened on 2026-09-02: every
+            # /api/snapshot 500'd on one repo's state, the port stayed held, and the refusal below
+            # sent the owner to Ctrl-C a background process with no tab. The bar for WHOM to signal
+            # is not lowered by a millimetre: still the process's own explicit product claim beside
+            # its own pid. All that changed is that we now ask on a route the failure does not
+            # silence, instead of concluding "unidentifiable" from one broken endpoint.
+            pid = _identified_pid(identity)
+            if pid is not None:
+                return {"action": "stop-then-start", "pid": pid,
+                        "message": ("the dashboard at %s is not answering /api/snapshot but still "
+                                    "identifies itself (pid %d) — stopping it and starting a fresh "
+                                    "one on the current build" % (url, pid))}
             # Silent is not empty. The snapshot probe answers None for a timeout or a truncated body
             # — exactly how a WEDGED BUT ALIVE dashboard looks, still holding the socket. Spawning
             # over that gives the owner a replacement that dies at bind while the stale server keeps
@@ -238,12 +280,12 @@ def dashboard_restart_decision(url, snapshot, port_busy=False):
                                 "tab), then run: liftoff --restart-dashboard" % url)}
         return {"action": "start", "pid": None,
                 "message": "nothing is serving at %s — starting a fresh dashboard" % url}
+    # A live snapshot decides on its OWN version block — one probe, one answer. The identity route
+    # is a fallback for the case above (nothing answered here), never a second opinion that could
+    # hand over a different pid than the process actually talking to us.
     version = (snapshot.get("version") or {}) if isinstance(snapshot, dict) else {}
-    pid = version.get("pid")
-    # bool is an int in Python — screen it out explicitly, or `True` reads as pid 1.
-    identified = (version.get("product") == "command-center"
-                  and isinstance(pid, int) and not isinstance(pid, bool) and pid > 0)
-    if not identified:
+    pid = _identified_pid(version)
+    if pid is None:
         return {"action": "refuse", "pid": None,
                 "message": ("something is serving at %s but does not identify itself as a "
                             "command-center with a pid — either it predates --restart-dashboard or "

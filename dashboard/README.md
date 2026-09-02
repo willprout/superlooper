@@ -165,6 +165,12 @@ bin/liftoff --restart-dashboard    # the dashboard says STALE TOWER: restart it 
   It stops **exactly** the pid the dashboard reports for itself (never a name or pattern), and
   starts the replacement only once that process is confirmed gone — if it can't stop the old one, it
   starts nothing and tells you, rather than leaving two dashboards fighting over one port.
+  It also heals a dashboard that is **up but useless** — one whose `/api/snapshot` is failing, so the
+  page shows "can't reach the tower" while the server keeps holding the port. A dashboard publishes
+  its identity on `/api/version` as well, which is built from the checkout rather than from the state
+  it choked on, so it can still say who it is while its board is dark. Something on the port that
+  answers *neither* — another app, or a server too old to have that route — is still refused rather
+  than guessed at: liftoff never signals a process that has not named itself.
 - **The runner start rides the config contract.** `liftoff` shells the engine's own documented
   `superlooper run` through the config's **`superlooper_cli`** — the dashboard names the engine's
   CLI, the engine never names the dashboard. Nothing engine-specific is hardcoded here.
