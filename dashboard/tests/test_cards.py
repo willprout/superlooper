@@ -513,12 +513,15 @@ def test_every_action_names_its_consequence():
               _flight(stage=flights.PARKED, attempt=2, go_arounds=1),
               _flight(stage=flights.PARKED, pr=555,        # a FINISHED lane (resume + rebuild, #161)
                       gate={"report": True, "review": True, "ci": False,
-                            "mergeable": False, "cleared": False})):
+                            "mergeable": False, "cleared": False}),
+              # the #163 QUESTION kind, whose go-ahead is `answer` — the kind whose absence from
+              # this sweep let issue #471's crash sit undetected in the drawer (Codex cross-review)
+              _flight(stage=flights.AWAITING, awaiting_reason="question", memo="QUESTION: A or B?")):
         acts = cards.decision_actions(f)
         assert acts, "a waiting flight always offers the owner a way out"
         for a in acts:
-            # the mechanical verbs only — approve/bounce-yes/drop/discuss plus the #161 rebuild split
-            assert a["act"] in ("approve", "bounce-yes", "drop", "discuss", "rebuild")
+            # the mechanical verbs only — approve/bounce-yes/answer/drop/discuss plus the #161 rebuild
+            assert a["act"] in ("approve", "bounce-yes", "answer", "drop", "discuss", "rebuild")
             assert a["consequence"] and a["consequence"][-1] == "."           # a plain sentence
             assert len(a["label"]) > len(a["act"])                            # never a bare verb
 

@@ -654,3 +654,41 @@ def test_the_running_handler_actually_serves_the_identity_over_a_real_socket(tmp
         srv.shutdown()
         srv.server_close()
         t.join(timeout=5)
+
+
+# =============== a probe must never become a traceback (Codex cross-review, issue #471) ===============
+# Both probes document "any error ⇒ None", and that promise is load-bearing: `None` lands on the
+# honest refusal, whereas an exception out of the probe kills `liftoff` before it has printed
+# anything — the operator's remedy failing with a stack trace instead of a sentence. `urlopen` can
+# raise `http.client.HTTPException` (a truncated body, a bad status line) which is NOT an OSError,
+# so catching OSError/ValueError alone left a hole in exactly the wedged-server case both probes
+# exist for.
+
+class _TruncatedResponse:
+    def read(self):
+        import http.client
+        raise http.client.IncompleteRead(b"half a bo")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+@pytest.mark.parametrize("probe", ["_dashboard_identity", "_dashboard_snapshot"])
+def test_a_truncated_response_answers_None_rather_than_killing_liftoff(monkeypatch, probe):
+    monkeypatch.setattr(lo.urllib.request, "urlopen",
+                        lambda url, timeout=None: _TruncatedResponse())
+    assert getattr(lo, probe)("127.0.0.1", 8611) is None
+
+
+@pytest.mark.parametrize("probe", ["_dashboard_identity", "_dashboard_snapshot"])
+def test_a_bad_status_line_answers_None_rather_than_killing_liftoff(monkeypatch, probe):
+    import http.client
+
+    def garbage(url, timeout=None):
+        raise http.client.BadStatusLine("not http at all")
+
+    monkeypatch.setattr(lo.urllib.request, "urlopen", garbage)
+    assert getattr(lo, probe)("127.0.0.1", 8611) is None

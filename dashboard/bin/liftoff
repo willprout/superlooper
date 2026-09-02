@@ -39,6 +39,7 @@ Run:  bin/liftoff [config.json] [--repo <slug|name|path>]   (default config: ./c
       bin/liftoff --restart-dashboard   (restart a STALE TOWER on the current build, then exit)
 """
 import errno
+import http.client
 import json
 import os
 import signal
@@ -139,7 +140,10 @@ def _dashboard_snapshot(host, port):
     """The live command-center's ``/api/snapshot`` as a dict, or ``None`` if what answers on
     ``host:port`` is not ours. Verified by SHAPE, not merely by something holding the port — so an
     UNRELATED app squatting it reads as "not ours". A short timeout keeps the probe cheap; any error
-    (refused, timeout, non-200, non-JSON, wrong shape) ⇒ None.
+    (refused, timeout, non-200, non-JSON, wrong shape, a TRUNCATED or non-HTTP body) ⇒ None. That
+    catch-all is load-bearing rather than tidy: `None` lands on liftoff's honest refusal, whereas an
+    exception out of a probe kills liftoff before it has printed a word — the operator's remedy
+    failing with a stack trace, in exactly the wedged-server case this probe exists for.
 
     This shape check is what makes ``--restart-dashboard`` safe to give a kill target: the pid it
     reads comes from the very process that answered as OUR dashboard, so liftoff can never signal a
@@ -148,7 +152,7 @@ def _dashboard_snapshot(host, port):
     try:
         with urllib.request.urlopen(url, timeout=1.0) as resp:   # HTTPError (>=400) raises → caught
             body = json.loads(resp.read())
-    except (OSError, ValueError):
+    except (OSError, ValueError, http.client.HTTPException):
         return None
     if isinstance(body, dict) and "generated_at" in body and "repos" in body:
         return body
@@ -172,7 +176,7 @@ def _dashboard_identity(host, port):
     try:
         with urllib.request.urlopen(url, timeout=1.0) as resp:  # HTTPError (>=400) raises → caught
             body = json.loads(resp.read())
-    except (OSError, ValueError):
+    except (OSError, ValueError, http.client.HTTPException):
         return None
     if isinstance(body, dict) and "product" in body and "pid" in body:
         return body

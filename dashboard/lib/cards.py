@@ -367,7 +367,9 @@ def decision_actions(flight, slug=None):
     """The ordered buttons for a waiting flight, each naming its consequence (issue #162).
 
     Each item is ``{act, label, consequence, tone, destructive}`` — plus ``armed_label`` and
-    ``armed_caption`` on a destructive verb, whose second tap the client arms. ``act`` is the wire
+    ``armed_caption`` on a destructive verb, whose second tap the client arms; ``yes: True`` on the
+    ONE go-ahead verb, whatever it is called for this kind (see :func:`yes_action`); and ``input``
+    naming a field the verb cannot fire without (the #163 Answer's typed text). ``act`` is the wire
     verb the server's executor already knows; the client binds these strings and derives none of
     them (design record B.1), so the card and the drawer can never drift apart or drift from the
     engine. ``slug`` names the destructive verb's unique target in its caption; without one the
