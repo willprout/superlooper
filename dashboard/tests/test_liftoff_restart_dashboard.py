@@ -31,6 +31,7 @@ The three properties that matter, in order of how badly each would hurt:
 import importlib.util
 import io
 import json
+import os
 import socket
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
@@ -196,13 +197,17 @@ class _Port:
         return True if self._n is None else self.calls <= self._n
 
 
-def _run(cfg_path, *, probe, stop=None, spawn=None, execr=None, sleep=None, port=None):
+def _run(cfg_path, *, probe, stop=None, spawn=None, execr=None, sleep=None, port=None,
+         identity=None):
     spawn = spawn if spawn is not None else _Recorder()
     execr = execr if execr is not None else _Recorder()
     stop = stop if stop is not None else _Recorder()
+    # Nothing identifies itself by default (issue #471): every pre-existing case in this file was
+    # written against a dashboard that answers the snapshot or answers nothing at all.
+    identity = identity if identity is not None else _Recorder(None)
     out = io.StringIO()
     rc = lo.main([str(_BIN), str(cfg_path), "--restart-dashboard"],
-                 dashboard_snapshot=probe, stop_process=stop,
+                 dashboard_snapshot=probe, dashboard_identity=identity, stop_process=stop,
                  spawn_dashboard=spawn, exec_runner=execr,
                  # held for the opening decision probe, released once stopped — the normal case
                  port_busy=(port if port is not None else _Port(held_for=1)),
@@ -405,3 +410,247 @@ def test_help_mentions_the_restart_flag():
     rc = lo.main([str(_BIN), "--help"], out=out)
     assert rc == 0
     assert "--restart-dashboard" in out.getvalue(), "a mechanical remedy nobody can find is not one"
+
+
+# ================== the wedged dashboard that CAN still name itself (issue #471) ==================
+# The 2026-09-02 incident (and its 2026-08-19 rehearsal): the dashboard answered every
+# /api/snapshot with HTTP 500 — alive, holding the port, serving static files, and useless. The
+# snapshot probe reads a 500 as "not ours" (HTTPError is an OSError), so --restart-dashboard took
+# the `refuse` branch and told the owner to Ctrl-C a background process with no tab. Recovery meant
+# a hand-kill, at exactly the moment the command exists to spare him one.
+#
+# The refusal itself was never wrong — liftoff had nothing to identify. What was missing is that
+# the wedged server COULD still identify itself: its own code identity (product + pid) is built by
+# lib.version, which reads the checkout, not the state homes that crashed the snapshot builder. So
+# the fix asks on a second, snapshot-free route (/api/version) rather than loosening the bar for
+# whom to signal — the pid still comes from the process's own explicit product claim.
+
+
+def _ident(pid=98833, product="command-center", skew=False):
+    """What /api/version answers: the same version block the snapshot carries, served alone."""
+    v = {"server": "aaaa", "server_on_disk": "bbbb" if skew else "aaaa",
+         "assets": "cccc", "assets_at_boot": "cccc", "skew": skew,
+         "message": "stale" if skew else None,
+         "remedy": "bin/liftoff --restart-dashboard", "pid": pid}
+    if product is not None:
+        v["product"] = product
+    return v
+
+
+def test_a_dashboard_whose_snapshot_500s_is_restarted_not_refused():
+    """The incident, as the pure decision. Snapshot silent, port held — but the process named
+    itself on the route that does not depend on the state it choked on."""
+    d = liftoff_mod.dashboard_restart_decision(URL, None, port_busy=True, identity=_ident(pid=98833))
+    assert d["action"] == "stop-then-start"
+    assert d["pid"] == 98833
+    assert "not answering" in d["message"], "the message must say WHY this restart is happening"
+
+
+def test_an_identity_without_the_product_claim_is_never_signalled():
+    """The second route must not be a softer bar than the first: a pid is a number anything can
+    print, and /api/version is as easy to squat as /api/snapshot."""
+    for impostor in (None, "", "something-else", "Command-Center", 1):
+        d = liftoff_mod.dashboard_restart_decision(URL, None, port_busy=True,
+                                                   identity=_ident(product=impostor))
+        assert d["action"] == "refuse", (
+            "product %r must not be trusted to hand over a kill target" % (impostor,))
+        assert d["pid"] is None
+
+
+def test_a_malformed_identity_pid_is_refused_not_coerced():
+    for bad in (None, 0, -1, "98833", 98833.7, True):
+        d = liftoff_mod.dashboard_restart_decision(URL, None, port_busy=True,
+                                                   identity=_ident(pid=bad))
+        assert d["action"] == "refuse", "pid %r must not be trusted as a kill target" % (bad,)
+
+
+def test_a_held_port_with_no_identity_at_all_is_still_refused():
+    """The property the new route must not erode: nothing identified ⇒ nothing signalled. A
+    stranger squatting the port answers neither route, and still gets the honest refusal."""
+    d = liftoff_mod.dashboard_restart_decision(URL, None, port_busy=True, identity=None)
+    assert d["action"] == "refuse" and d["pid"] is None
+    assert "Ctrl-C" in d["message"]
+
+
+def test_an_identity_on_a_FREE_port_starts_fresh_and_signals_nothing():
+    """A stale identity read (the process died between the two probes) must never become a SIGTERM
+    at a pid the kernel has already recycled. The port is the arbiter for starting, as before."""
+    d = liftoff_mod.dashboard_restart_decision(URL, None, port_busy=False, identity=_ident())
+    assert d["action"] == "start" and d["pid"] is None
+
+
+def test_a_healthy_snapshot_still_decides_on_its_own_version_block():
+    """The identity probe is a FALLBACK. When the snapshot answers, its version block is the
+    identity — one probe, one answer, unchanged from issue #136."""
+    d = liftoff_mod.dashboard_restart_decision(URL, _snap(pid=4242), port_busy=True,
+                                               identity=_ident(pid=98833))
+    assert d["pid"] == 4242
+
+
+# =============================== the snapshot-free identity route ===============================
+
+class _FakeVersion:
+    def __init__(self, state):
+        self._state = state
+
+    def state(self):
+        return dict(self._state)
+
+
+def _boom():
+    raise IndexError("list index out of range")
+
+
+def test_the_version_route_answers_while_the_snapshot_builder_is_crashing():
+    """The whole point: identity must not be reachable only through the thing that is broken. This
+    is the exact pairing of the incident — /api/snapshot 500s, /api/version answers."""
+    import server as server_mod
+    v = _FakeVersion(_ident(pid=98833))
+    assert server_mod.route("GET", "/api/snapshot", _boom, "/nonexistent").status == 500
+    resp = server_mod.route("GET", "/api/version", _boom, "/nonexistent", version=v)
+    assert resp.status == 200
+    body = json.loads(resp.body)
+    assert body["product"] == "command-center" and body["pid"] == 98833
+
+
+def test_the_version_route_is_a_clean_404_when_no_version_is_wired():
+    import server as server_mod
+    assert server_mod.route("GET", "/api/version", _boom, "/nonexistent").status == 404
+
+
+def test_the_version_route_never_becomes_an_unhandled_stack_trace():
+    import server as server_mod
+
+    class _Broken:
+        def state(self):
+            raise RuntimeError("stat storm")
+
+    resp = server_mod.route("GET", "/api/version", _boom, "/nonexistent", version=_Broken())
+    assert resp.status == 500
+    assert json.loads(resp.body)["error"]
+
+
+def test_the_version_route_is_never_cached():
+    import server as server_mod
+    resp = server_mod.route("GET", "/api/version", _boom, "/nonexistent",
+                            version=_FakeVersion(_ident()))
+    assert resp.headers.get("Cache-Control") == "no-store"
+
+
+# =============================== the bin flow, end to end ===============================
+
+def test_restart_heals_a_dashboard_whose_snapshot_endpoint_is_500ing(cfg):
+    """William's 2026-09-02 morning, driven: the snapshot probe answers nothing, the port stays
+    held until the pid is stopped, and the identity probe is what makes the pid knowable."""
+    ident = _Recorder(_ident(pid=98833))
+    probe = _Probe([None, None])                      # /api/snapshot never answers
+    rc, text, stop, spawn, execr = _run(cfg, probe=probe, identity=ident,
+                                        port=_Port(held_for=1))
+    assert rc == 0
+    assert stop.calls == [((98833,), {})], "stop exactly the pid the wedged dashboard published"
+    assert len(spawn.calls) == 1, "and bring a fresh one up on the current build"
+    assert execr.calls == [], "--restart-dashboard must never touch the runner"
+
+
+def test_restart_still_refuses_a_port_holder_that_answers_neither_route(cfg):
+    """The stranger case, unchanged: no snapshot, no identity ⇒ no signal and no second dashboard."""
+    rc, text, stop, spawn, execr = _run(cfg, probe=_Probe([None]),
+                                        identity=_Recorder(None), port=_Port(held_for=None))
+    assert rc == lo.EXIT_LAUNCH_FAILED
+    assert stop.calls == [] and spawn.calls == []
+    assert "Ctrl-C" in text
+
+
+def test_the_identity_probe_reads_the_version_route_not_the_snapshot(monkeypatch):
+    """The probe must ask the route that does not depend on the state homes."""
+    seen = []
+
+    class _Body:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def read(self):
+            return json.dumps(self._payload).encode("utf-8")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def fake_urlopen(url, timeout=None):
+        seen.append(url)
+        return _Body(_ident(pid=4242))
+
+    monkeypatch.setattr(lo.urllib.request, "urlopen", fake_urlopen)
+    got = lo._dashboard_identity("127.0.0.1", 8611)
+    assert seen == ["http://127.0.0.1:8611/api/version"]
+    assert got["pid"] == 4242
+
+
+def test_the_identity_probe_answers_None_for_anything_that_is_not_ours(monkeypatch):
+    """A refusal, a timeout, a non-JSON body, or a JSON body that is not an identity block — all
+    read as "nothing identified", which is the refuse branch, not a guess."""
+    for payload in ("not json", json.dumps([1, 2, 3]), json.dumps({"hello": "world"})):
+        class _Body:
+            def __init__(self, raw):
+                self._raw = raw
+
+            def read(self):
+                return self._raw.encode("utf-8")
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        monkeypatch.setattr(lo.urllib.request, "urlopen",
+                            lambda url, timeout=None, _p=payload: _Body(_p))
+        assert lo._dashboard_identity("127.0.0.1", 8611) is None
+
+    def refused(url, timeout=None):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(lo.urllib.request, "urlopen", refused)
+    assert lo._dashboard_identity("127.0.0.1", 8611) is None
+
+
+def test_the_running_handler_actually_serves_the_identity_over_a_real_socket(tmp_path):
+    """The gap the browser drive found, pinned.
+
+    ``route`` had the identity endpoint and the router tests were green — but ``make_handler``'s GET
+    branch never passed ``version`` through, so on the REAL server the route answered 404 and the
+    whole fix was inert. The unit above proves the router; only a request over a real socket proves
+    the wiring. Same class as the 2026-08-05 publish gap: a cure that never reaches the patient.
+
+    The snapshot provider RAISES here — this is the incident's condition, not a healthy server.
+    """
+    import http.client as http_client
+    import threading
+
+    import server as server_mod
+    import version as version_mod
+
+    v = version_mod.Version(str(_ROOT))
+    srv = server_mod.build_server(_boom, "/nonexistent", port=0, version=v)
+    host, port = srv.server_address
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    try:
+        conn = http_client.HTTPConnection(host, port, timeout=5)
+        conn.request("GET", "/api/snapshot")
+        snap = conn.getresponse()
+        assert snap.status == 500, "the wedged half — this is what the operator was seeing"
+        snap.read()
+        conn.request("GET", "/api/version")
+        r = conn.getresponse()
+        assert r.status == 200, "and the half that must keep answering anyway"
+        body = json.loads(r.read())
+        assert body["product"] == "command-center"
+        assert body["pid"] == os.getpid(), "the identity is THIS process, not a number from a file"
+        conn.close()
+    finally:
+        srv.shutdown()
+        srv.server_close()
+        t.join(timeout=5)

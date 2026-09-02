@@ -415,7 +415,14 @@ def decision_actions(flight, slug=None):
         yes = {"act": "approve", "label": "Re-approve & rebuild from scratch",
                "consequence": "Re-applies agent-ready in your name — your word, on the record. "
                               + discards}
-    yes.update({"tone": "ghost" if kind == "conflict-cap" else "primary", "destructive": False})
+    # ``yes`` MARKS the go-ahead verb where it is built, rather than leaving downstream surfaces to
+    # recognise it by act name (issue #471). The drawer used to name ``approve``/``bounce-yes`` and
+    # index ``[0]``; when #163 added a QUESTION kind whose go-ahead is ``answer``, that list came
+    # back empty and the IndexError took the WHOLE snapshot down — every repo, every poll, for as
+    # long as one paused worker's question sat unanswered. A flag set beside the label cannot fall
+    # out of step with it, and ``tests/test_cards`` pins one-per-kind for every kind at once.
+    yes.update({"tone": "ghost" if kind == "conflict-cap" else "primary", "destructive": False,
+                "yes": True})
 
     # The armed caption is a SEMANTIC — it names a destructive consequence — so it lives here beside
     # the label it warns about, never hard-coded in the JS where the two could drift (B.1 / Codex
@@ -443,13 +450,27 @@ def decision_actions(flight, slug=None):
                   "consequence": "Posts your answer on the issue and re-applies agent-ready in your "
                                  "name — a fresh session resumes with your answer in its brief, "
                                  "reusing the work so far if it still applies cleanly.",
-                  "tone": "primary", "destructive": False}
+                  "tone": "primary", "destructive": False, "yes": True}
         return [answer, discuss, drop]
 
     # The destructive rebuild (issue #161), when present, groups with the safe primary ahead of Drop.
     # On a collision, Discuss LEADS (§8 — the guard against a blind Approve press there).
     mid = [yes] + ([rebuild] if rebuild else [])
     return [discuss] + mid + [drop] if kind == "conflict-cap" else mid + [drop, discuss]
+
+
+def yes_action(actions):
+    """The ONE go-ahead verb in a ``decision_actions`` list — the marked one — or ``None``.
+
+    The go-ahead differs by kind (``approve`` / ``bounce-yes`` / ``answer``) and some kinds also
+    carry a destructive ``rebuild``, so any surface that wants "the button that means go" has to be
+    told which one that is. It is told by the flag, never by a name list a new kind can fall
+    outside of (issue #471 — that is precisely how the drawer came to 500 the whole snapshot).
+
+    ``None`` is a broken invariant, not a shape callers should expect; every kind builds exactly one
+    (pinned in ``tests/test_cards``). Returning it rather than raising is the fail-soft that keeps a
+    future slip to one missing button instead of a blacked-out command center."""
+    return next((a for a in actions if a.get("yes")), None)
 
 
 def needs_you_card(flight, slug, journal_slice=None):
@@ -623,12 +644,19 @@ def flight_drawer(flight, journal_slice, slug, name, title=None, hhmm=None, oper
         # actions as the card, so the two surfaces cannot drift. ``approve_act``/``approve_label``
         # are kept as the drawer's existing yes-verb contract — now read out of that single list.
         acts = decision_actions(flight)
-        yes = [a for a in acts if a["act"] in ("approve", "bounce-yes")][0]
+        # Read the MARKED go-ahead verb (issue #471). This used to name ``approve``/``bounce-yes``
+        # and index ``[0]`` — which held until #163 added a QUESTION kind whose go-ahead is
+        # ``answer``, and then a single `awaiting_answer` issue raised IndexError inside
+        # ``assemble_snapshot`` and 500'd every poll of the whole board. ``approve_input`` carries
+        # the verb's typed-input contract through, so a verb that cannot fire without the owner's
+        # words (Answer) reaches the client as a field, never as a button that dead-ends.
+        yes = yes_action(acts)
         decision = {
             "kind": kind,
             "actions": acts,
-            "approve_act": yes["act"],
-            "approve_label": yes["label"],
+            "approve_act": yes["act"] if yes else None,
+            "approve_label": yes["label"] if yes else None,
+            "approve_input": yes.get("input") if yes else None,
             "discuss_default": kind == "conflict-cap",
         }
 

@@ -155,6 +155,30 @@ def _dashboard_snapshot(host, port):
     return None
 
 
+def _dashboard_identity(host, port):
+    """The live command-center's ``/api/version`` as a dict, or ``None`` if what answers is not ours.
+
+    The second, snapshot-free way to ask "who are you?" (issue #471). ``/api/snapshot`` is built
+    from the WATCHED REPOS' state homes; this block is built from the checkout the server loaded.
+    They fail independently — and on 2026-09-02 exactly one of them failed: every snapshot poll
+    answered HTTP 500 on one repo's state, which also rendered the dashboard unidentifiable to
+    ``--restart-dashboard``, so the operator's own remedy refused and recovery took a hand-kill.
+
+    Shape-verified like the snapshot probe, and to the SAME bar: the caller trusts the pid only when
+    the block also carries the explicit ``product`` claim. A short timeout, and any error (refused,
+    timeout, non-200, non-JSON, wrong shape) ⇒ None — which lands on the honest refusal, never a
+    guess."""
+    url = "http://%s:%d/api/version" % (host, port)
+    try:
+        with urllib.request.urlopen(url, timeout=1.0) as resp:  # HTTPError (>=400) raises → caught
+            body = json.loads(resp.read())
+    except (OSError, ValueError):
+        return None
+    if isinstance(body, dict) and "product" in body and "pid" in body:
+        return body
+    return None
+
+
 def _dashboard_up(host, port):
     """True ONLY if command-center ITSELF is already serving on ``host:port`` — see
     :func:`_dashboard_snapshot` for the shape check. A false "already serving" would leave the
@@ -299,8 +323,8 @@ def _start_job(argv):
     return subprocess.run(argv).returncode
 
 
-def _restart_dashboard(cfg, config_path, url, out, *, dashboard_snapshot, stop_process,
-                       spawn_dashboard, sleep, port_busy):
+def _restart_dashboard(cfg, config_path, url, out, *, dashboard_snapshot, dashboard_identity,
+                       stop_process, spawn_dashboard, sleep, port_busy):
     """``--restart-dashboard`` (issue #136): stop the running dashboard and start it again on the
     current build. Dashboard only — the runner is never touched and this tab is never claimed.
 
@@ -314,9 +338,13 @@ def _restart_dashboard(cfg, config_path, url, out, *, dashboard_snapshot, stop_p
     kernel refused the connection, not merely that nobody said hello.
     """
     port = cfg["port"]
+    snapshot = dashboard_snapshot(server.BIND_HOST, port)
+    # The identity probe is asked only when the snapshot said nothing (issue #471) — a healthy
+    # dashboard is identified by the very body that answered, and a second request would be one
+    # more thing to go wrong at the moment the first one worked.
+    identity = None if snapshot is not None else dashboard_identity(server.BIND_HOST, port)
     decision = liftoff_mod.dashboard_restart_decision(
-        url, dashboard_snapshot(server.BIND_HOST, port),
-        port_busy=port_busy(server.BIND_HOST, port))
+        url, snapshot, port_busy=port_busy(server.BIND_HOST, port), identity=identity)
     out.write("liftoff: %s\n" % decision["message"])
     if decision["action"] == "refuse":
         return EXIT_LAUNCH_FAILED
@@ -357,7 +385,8 @@ def _restart_dashboard(cfg, config_path, url, out, *, dashboard_snapshot, stop_p
 
 def main(argv, *, is_dashboard_up=_dashboard_up, live_runner_pid=_live_runner_pid,
          spawn_dashboard=_spawn_dashboard, exec_runner=_exec_runner, out=None,
-         dashboard_snapshot=_dashboard_snapshot, stop_process=_stop_process, sleep=time.sleep,
+         dashboard_snapshot=_dashboard_snapshot, dashboard_identity=_dashboard_identity,
+         stop_process=_stop_process, sleep=time.sleep,
          port_busy=_port_busy, runner_home=_runner_home, start_job=_start_job):
     out = out if out is not None else sys.stderr
     try:
@@ -398,7 +427,9 @@ def main(argv, *, is_dashboard_up=_dashboard_up, live_runner_pid=_live_runner_pi
     if restart_dashboard:
         return _restart_dashboard(cfg, config_path,
                                   "http://%s:%d" % (server.BIND_HOST, cfg["port"]), out,
-                                  dashboard_snapshot=dashboard_snapshot, stop_process=stop_process,
+                                  dashboard_snapshot=dashboard_snapshot,
+                                  dashboard_identity=dashboard_identity,
+                                  stop_process=stop_process,
                                   spawn_dashboard=spawn_dashboard, sleep=sleep, port_busy=port_busy)
 
     try:

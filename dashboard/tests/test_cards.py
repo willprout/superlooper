@@ -11,6 +11,8 @@ Everything here is a pure function of an already-built flight object (``flights.
 its journal slice — no clock except an injected ``now``/``hhmm`` — so the JS binds strings it never
 derives.
 """
+import pytest
+
 import cards
 import flights
 
@@ -327,6 +329,54 @@ def test_drawer_conflict_cap_defaults_to_discuss_in_the_drawer_too():
     d = cards.flight_drawer(_flight(stage=flights.PARKED, attempt=2, go_arounds=1), [], "r", "Air")
     assert d["decision"]["kind"] == "conflict-cap"
     assert d["decision"]["discuss_default"] is True
+
+
+def test_drawer_for_a_durable_question_offers_the_typed_answer_verb():
+    """Issue #471 — the crash that blacked out the whole command center.
+
+    ``decision_actions`` grew a #163 QUESTION kind whose verbs are Answer/Discuss/Drop — no
+    ``approve`` and no ``bounce-yes``. The drawer picked its yes-verb by naming those two acts and
+    indexing ``[0]``, so a single ``awaiting_answer`` issue in any watched repo raised
+    ``IndexError: list index out of range`` inside ``assemble_snapshot`` and every ``/api/snapshot``
+    poll 500'd. The drawer must carry the question's OWN yes-verb — Answer, with the typed-input
+    contract the client needs to render its field."""
+    d = cards.flight_drawer(_flight(stage=flights.AWAITING, awaiting_reason="question",
+                                    memo="QUESTION: A or B?"), [], "r", "Air")
+    assert d["decision"]["kind"] == "question"
+    assert d["decision"]["approve_act"] == "answer"
+    assert "answer" in d["decision"]["approve_label"].lower()
+    # The client cannot fire Answer without the operator's words: an empty answer is refused by the
+    # executor, so a bare button would be a dead end. The input contract rides with the verb.
+    assert d["decision"]["approve_input"] == "answer"
+    assert d["decision"]["discuss_default"] is False
+
+
+@pytest.mark.parametrize("flight", [
+    dict(stage=flights.PARKED),
+    dict(stage=flights.AWAITING, awaiting_reason="needs-owner"),
+    dict(stage=flights.AWAITING, awaiting_reason="bounced"),
+    dict(stage=flights.PARKED, attempt=2, go_arounds=1),
+    dict(stage=flights.AWAITING, awaiting_reason="question"),
+    dict(stage=flights.AWAITING, awaiting_reason="question",
+         gate={"report": True, "review": True, "ci": True, "mergeable": True, "cleared": False}),
+])
+def test_every_decision_kind_offers_exactly_one_yes_verb_the_drawer_can_read(flight):
+    """The class-killing guard behind issue #471.
+
+    The drawer and ``decision_actions`` are two surfaces over ONE verb set, and the crash happened
+    because a new kind was added to one without the other. So the yes-verb is now MARKED where it is
+    built (``a["yes"] is True``) rather than recognised by name downstream, and this pins the
+    invariant for every kind at once: exactly one yes-verb per kind, and the drawer reads that one.
+    A future kind that forgets the flag fails here instead of blacking out the command center."""
+    f = _flight(**flight)
+    acts = cards.decision_actions(f)
+    yeses = [a for a in acts if a.get("yes")]
+    assert len(yeses) == 1, "each kind offers exactly one yes-verb, got %r" % [a["act"] for a in yeses]
+    d = cards.flight_drawer(f, [], "r", "Air")
+    assert d["decision"] is not None
+    assert d["decision"]["approve_act"] == yeses[0]["act"]
+    assert d["decision"]["approve_label"] == yeses[0]["label"]
+    assert d["decision"]["approve_input"] == yeses[0].get("input")
 
 
 def test_drawer_for_a_non_decision_flight_has_no_decision_actions():

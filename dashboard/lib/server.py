@@ -625,6 +625,29 @@ def route(method, path, snapshot_provider, static_root, *, actions=None, body=b"
                          {"Cache-Control": "no-store"})
         return _resp(200, "application/json", body, {"Cache-Control": "no-store"})
 
+    # This server's own code identity, served ALONE (issue #471). The same block the snapshot
+    # carries — but the snapshot is built from the watched repos' state homes, and this is built
+    # from the checkout, so the two fail independently. That independence is the whole point: on
+    # 2026-09-02 the snapshot builder crashed on one repo's state and every poll 500'd, which also
+    # made the dashboard unidentifiable — `liftoff --restart-dashboard` reads identity off
+    # /api/snapshot, got an HTTP error, and refused to signal a process it could not name. So the
+    # operator's remedy failed at exactly the moment it was needed, and recovery took a hand-kill.
+    #
+    # A wedged dashboard can still say who it is. Answering here costs a fingerprint of the checkout
+    # and touches no state home, so it keeps answering through precisely the failure that silences
+    # the poll. Read-only, and it publishes nothing the snapshot did not already publish.
+    if clean == "/api/version":
+        if version is None:
+            return _resp(404, "application/json", json.dumps({"error": "not found"}),
+                         {"Cache-Control": "no-store"})
+        try:
+            body = json.dumps(version.state()).encode("utf-8")
+        except Exception as e:   # identity is a nicety; never an unhandled trace out of the handler
+            return _resp(500, "application/json",
+                         json.dumps({"error": "version unavailable", "detail": str(e)}),
+                         {"Cache-Control": "no-store"})
+        return _resp(200, "application/json", body, {"Cache-Control": "no-store"})
+
     # The on-demand treat + digest (Task 11): computed only when a button asks, never on the poll.
     if clean == "/api/replay":
         return _provider_get(replay_provider, _query_params(path))
@@ -674,8 +697,12 @@ def make_handler(snapshot_provider, static_root, actions=None, desk=None, tidy=N
             return self.rfile.read(length) if length else b""
 
         def _get(self):
+            # ``version`` rides the GET path too (issue #471): the identity endpoint is a GET, and
+            # it exists precisely for the moment the snapshot is failing — a wedged dashboard that
+            # cannot name itself is one `liftoff --restart-dashboard` will not signal.
             self._write(route(self.command, self.path, snapshot_provider, static_root,
-                              replay_provider=replay_provider, digest_provider=digest_provider))
+                              replay_provider=replay_provider, digest_provider=digest_provider,
+                              version=version))
 
         def do_GET(self):
             self._get()

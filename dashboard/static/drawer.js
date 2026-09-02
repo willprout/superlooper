@@ -160,9 +160,25 @@
     // here that is purely a way to LOOK at the work, so it sits ahead of the verbs that change it.
     var session = sessionHTML(d);
     var discuss = '<button class="btn-note link" data-act="discuss"' + da + '>Discuss →</button>';
-    if (!dec) return '<div class="drawer-actions">' + session + discuss + '</div>';
+    // No go-ahead verb ⇒ Discuss only. A decision block always carries one (lib/cards pins one per
+    // kind), so this is a fail-soft, not a state the server ships: issue #471's crash was exactly a
+    // downstream surface assuming the verb it wanted was there, and the cost of being wrong must be
+    // one missing button, never a blank drawer or an "undefined" on a button the owner would tap.
+    if (!dec || !dec.approve_act) return '<div class="drawer-actions">' + session + discuss + '</div>';
+    // A go-ahead that takes the operator's typed words (the #163 Answer, whose verb is refused
+    // empty) renders its field here, in the same `.act` container the card uses — shell.js's
+    // doAnswer reads the textarea beside the button it was tapped on, so the two surfaces share one
+    // handler and neither can fire an empty answer.
+    var field = dec.approve_input
+      ? '<textarea class="answer-field" data-input="' + esc(dec.approve_input) + '"' + da +
+        ' rows="3" placeholder="Type your answer — it posts to the issue in your name and a fresh ' +
+        'session resumes with it."></textarea>'
+      : "";
     var approve = '<button class="btn ' + (dec.discuss_default ? "ghost" : "primary") +
-      '" data-act="' + esc(dec.approve_act) + '"' + da + '>' + esc(dec.approve_label) + '</button>';
+      '" data-act="' + esc(dec.approve_act) + '"' + da +
+      (dec.approve_input ? ' data-input="' + esc(dec.approve_input) + '"' : "") + '>' +
+      esc(dec.approve_label) + '</button>';
+    if (field) approve = '<div class="act">' + field + approve + '</div>';
     var bits = dec.discuss_default
       ? ['<button class="btn primary" data-act="discuss"' + da + '>Discuss →</button>', approve]
       : [approve, discuss];
