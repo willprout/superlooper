@@ -17,9 +17,9 @@
  * DIRTY field — `value !== defaultValue`, i.e. the field holds something other than what the HTML
  * rendered. So a field nobody has touched keeps refreshing from the server like every other pixel
  * (the drawer must never freeze on stale data), and one that has been typed into keeps its words,
- * its focus and its caret. It is deliberately general rather than keyed to `.answer-field`: any
- * free-text field a future render puts on this path inherits the survival instead of quietly
- * re-earning the bug. */
+ * its focus, its caret, and the place the operator had scrolled to. It is deliberately general
+ * rather than keyed to `.answer-field`: any free-text field a future render puts on this path
+ * inherits the survival instead of quietly re-earning the bug. */
 (function () {
   "use strict";
 
@@ -45,9 +45,11 @@
 
   // The identity that has to survive the rebuild. Never DOM position: a card can appear or leave
   // between two polls, and matching by position would pour one flight's half-written answer into
-  // another flight's field. It is the identifying attributes the renderers already emit — the
-  // verb's `data-input` and the (repo, num) the answer would be POSTed to — plus a per-key
-  // occurrence number so two identical fields in one container still can't swap contents.
+  // another flight's field — and that field POSTs to a different issue. It is the identifying
+  // attributes the renderers already emit: the verb's `data-input` and the (repo, num) the answer
+  // would be POSTed to, which make every answer field on the surface unique. Two fields that
+  // somehow shared ALL of those would fall back to their occurrence number, which IS positional —
+  // a tie-break, not a guarantee. A renderer that needs a distinction should emit one.
   function keyOf(el) {
     return [el.tagName, el.id || "", el.getAttribute("name") || "", el.className || "",
             el.getAttribute("data-input") || "", el.getAttribute("data-repo") || "",
@@ -63,6 +65,29 @@
     });
   }
 
+  // Where the operator had scrolled to, read off the chain from the field up to the container. The
+  // rebuild throws every one of those elements away, so the reader's place goes with them unless it
+  // is carried across too. Most entries are 0 and restoring 0 onto a non-scrolling box is a no-op,
+  // so the chain needs no cleverness about WHICH ancestor is the scroller.
+  function scrollChain(el, container) {
+    var chain = [];
+    for (var n = el.parentNode; n && n.nodeType === 1; n = n.parentNode) {
+      chain.push({ top: n.scrollTop, left: n.scrollLeft });
+      if (n === container) break;
+    }
+    return chain;
+  }
+
+  function applyScrollChain(el, container, chain) {
+    if (!chain) return;
+    var i = 0;
+    for (var n = el.parentNode; n && n.nodeType === 1 && i < chain.length; n = n.parentNode, i++) {
+      n.scrollTop = chain[i].top;
+      n.scrollLeft = chain[i].left;
+      if (n === container) break;
+    }
+  }
+
   function capture(container) {
     var doc = (container && container.ownerDocument) || document;
     var saved = {};
@@ -72,7 +97,8 @@
       if (!dirty && !focused) return;          // untouched and unfocused ⇒ nothing of the operator's
       var start = null, end = null;
       try { start = el.selectionStart; end = el.selectionEnd; } catch (e) { /* some input types */ }
-      saved[key] = { value: el.value, dirty: dirty, focused: focused, start: start, end: end };
+      saved[key] = { value: el.value, dirty: dirty, focused: focused, start: start, end: end,
+                     scroll: focused ? scrollChain(el, container) : null };
     });
     return saved;
   }
@@ -84,19 +110,30 @@
       if (!s) return;
       if (s.dirty) el.value = s.value;
       if (!s.focused) return;
-      try { el.focus(); } catch (e) { return; }
+      // preventScroll, then put the scroll back where the operator left it. A bare focus() scrolls
+      // the field into view, which every 2s dragged the drawer back down to the Answer box and made
+      // it impossible to scroll UP and re-read the question being answered (measured in Chrome).
+      try { el.focus({ preventScroll: true }); } catch (e) { return; }
+      applyScrollChain(el, container, s.scroll);
       if (s.start === null || !el.setSelectionRange) return;
       try { el.setSelectionRange(s.start, s.end); } catch (e) { /* not selectable */ }
     });
   }
 
   // Run `rebuild` — whatever wholesale re-render the caller does — with the operator's typed state
-  // carried across it. Fail-soft on purpose: if `rebuild` throws, the surface has bigger problems
-  // than a lost draft, and swallowing it here would hide the real error.
+  // carried across it.
+  //
+  // Only the DRAFT is allowed to be lost here. `rebuild` is deliberately NOT caught: if the render
+  // itself throws, the surface has bigger problems than a lost draft and swallowing it would hide
+  // the real error. But a throw out of capture or restore must never escape: shell.js re-parents
+  // the persistent airfield canvas and the Solari board into the fresh mount AFTER this returns,
+  // so an exception on the way out would skip that on every poll and leave both blank — joy is a
+  // terminal requirement (design record §0.1) and may not be collateral damage of a text field.
   function preserve(container, rebuild) {
-    var saved = capture(container);
+    var saved = null;
+    try { saved = capture(container); } catch (e) { saved = null; }
     rebuild();
-    restore(container, saved);
+    try { restore(container, saved); } catch (e) { /* the draft is lost; the surface is not */ }
   }
 
   window.KeepInput = { preserve: preserve, capture: capture, restore: restore };

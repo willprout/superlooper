@@ -725,6 +725,14 @@
     postJSON("/api/answer", { repo: repo, num: Number(num), text: text })
       .then(function (res) {
         if (res.status === 200 && res.body && res.body.ok) {
+          // The answer is posted, so the field must stop offering it (issue #475). Before the poll
+          // preserved typed text, the next redraw wiped it and that read — accidentally — as
+          // "sent". Now it would be faithfully carried over, and the operator's already-posted
+          // words would sit beside a live Answer button until the card leaves, which the slow gh
+          // clock can make tens of seconds; a second tap posts a SECOND answer and re-applies the
+          // label. Clearing here also makes the field non-dirty, so the preservation correctly
+          // lets it go. Before refresh(), or that poll's capture carries the posted text over.
+          if (field) field.value = "";
           toast("Answered SL-" + num + " — a fresh session resumes with your answer", "ok");
           refresh();
         } else {

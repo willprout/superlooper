@@ -69,6 +69,10 @@ function Element(doc, tag) {
   this._value = null;          // null ⇒ never assigned; falls back to defaultValue
   this.selectionStart = 0;
   this.selectionEnd = 0;
+  // A freshly parsed element starts scrolled to the top, exactly as the browser's does — which is
+  // the whole reason a rebuild loses the reader's place.
+  this.scrollTop = 0;
+  this.scrollLeft = 0;
 }
 
 Element.prototype.getAttribute = function (n) {
@@ -130,7 +134,15 @@ Object.defineProperty(Element.prototype, "value", {
 Element.prototype.setSelectionRange = function (a, b) {
   this.selectionStart = a; this.selectionEnd = b;
 };
-Element.prototype.focus = function () { this.ownerDocument.activeElement = this; };
+Element.prototype.focus = function (opts) {
+  this.ownerDocument.activeElement = this;
+  // A real browser scrolls the focused element into view unless preventScroll is passed; model the
+  // scroll as "the nearest scrolling ancestor jumps to the element", which is what makes an
+  // unguarded focus() steal the reader's place on every poll.
+  if (opts && opts.preventScroll) return;
+  for (var n = this.parentNode; n && n.nodeType === 1; n = n.parentNode) n.scrollTop = SCROLLED_TO_FOCUS;
+};
+var SCROLLED_TO_FOCUS = 9999;
 Element.prototype.blur = function () {
   if (this.ownerDocument.activeElement === this) this.ownerDocument.activeElement = null;
 };
@@ -146,13 +158,22 @@ Object.defineProperty(Element.prototype, "textContent", {
   },
 });
 
+function contains(root, node) {
+  for (var n = node; n; n = n.parentNode) if (n === root) return true;
+  return false;
+}
+
 Object.defineProperty(Element.prototype, "innerHTML", {
   get: function () { return this.childNodes.map(serialize).join(""); },
   set: function (html) {
+    var doc = this.ownerDocument;
+    // A browser blurs to <body> when the focused element is detached from the document. Model it,
+    // or a test could "prove" focus survived when nothing had actually restored it.
+    if (doc && doc.activeElement && contains(this, doc.activeElement)) doc.activeElement = null;
     this.childNodes.forEach(function (c) { c.parentNode = null; });
     this.childNodes = [];
     var self = this;
-    parse(String(html), this.ownerDocument).forEach(function (n) { self.appendChild(n); });
+    parse(String(html), doc).forEach(function (n) { self.appendChild(n); });
   },
 });
 
@@ -277,12 +298,23 @@ function walk(node, fn) {
   });
 }
 
+// A NodeList-alike, deliberately WITHOUT Array's extras: a real NodeList has `length`, indices,
+// `item()` and `forEach` and nothing else, so code that wrongly assumes `.filter`/`.map` on a query
+// result fails here exactly as it would in the browser rather than being quietly indulged.
+function nodeList(hits) {
+  var list = { length: hits.length };
+  hits.forEach(function (el, i) { list[i] = el; });
+  list.item = function (i) { return hits[i] === undefined ? null : hits[i]; };
+  list.forEach = function (fn, thisArg) { hits.forEach(fn, thisArg); };
+  return list;
+}
+
 Element.prototype.querySelectorAll = function (sel) {
   var specs = compile(sel), hits = [];
   walk(this, function (el) { if (matches(el, specs)) hits.push(el); });
-  return hits;
+  return nodeList(hits);
 };
-Element.prototype.querySelector = function (sel) { return this.querySelectorAll(sel)[0] || null; };
+Element.prototype.querySelector = function (sel) { return this.querySelectorAll(sel).item(0); };
 Element.prototype.closest = function (sel) {
   var specs = compile(sel), n = this;
   while (n && n.nodeType === 1) { if (matches(n, specs)) return n; n = n.parentNode; }

@@ -138,7 +138,7 @@ test("drawer: the restored field is still the sibling doAnswer reads from", () =
   win.Drawer.update(drawerObj("second line"));
 
   // shell.js's doAnswer: `btn.parentNode.querySelector("textarea.answer-field")`.
-  const btn = doc.querySelectorAll("button").filter((b) => b.getAttribute("data-act") === "answer")[0];
+  const btn = doc.querySelector('button[data-act="answer"]');
   ok(!!btn, "the Answer button is rendered");
   const read = btn.parentNode.querySelector("textarea.answer-field");
   ok(!!read, "the submit handler still finds the field beside its button");
@@ -180,26 +180,51 @@ test("card: typed answer survives three rebuilds of the whole panel", () => {
   ok(root.textContent.indexOf("first memo") === -1, "the card is not frozen on the stale memo");
 });
 
-test("card: two flights' answer fields never cross-wire", () => {
+test("card: a half-written answer follows its own flight when the panel reorders", () => {
+  // Needs You is whole-field and re-derived every poll: a decision can appear, be answered, or
+  // change places between two ticks. Restoring by POSITION would pour a half-written answer into
+  // another flight's field — and that field POSTs to a DIFFERENT GitHub issue. So the panel is
+  // driven through a reorder, an arrival and a departure, not just a redraw of the same list.
   const { win, doc } = bootstrap(["keepinput.js", "needsyou.js"]);
   const root = doc.createElement("div");
   doc.body.appendChild(root);
-  const cards = () => [cardObj(475, "a"), cardObj(476, "b")];
-  root.innerHTML = win.NeedsYou.panelHTML(cards(), null);
+  const paint = (nums) => win.NeedsYou.panelHTML(nums.map((n) => cardObj(n, "memo " + n)), null);
+  const byNum = () => {
+    const map = {};
+    root.querySelectorAll("textarea.answer-field").forEach(function (f) {
+      map[f.getAttribute("data-num")] = f.value;
+    });
+    return map;
+  };
 
+  root.innerHTML = paint([475, 476]);
   const fields = root.querySelectorAll("textarea.answer-field");
   eq(fields.length, 2, "both waiting decisions render their own field");
   fields[1].value = "words for 476";
   fields[1].focus();
 
-  win.KeepInput.preserve(root, function () { root.innerHTML = win.NeedsYou.panelHTML(cards(), null); });
-  win.KeepInput.preserve(root, function () { root.innerHTML = win.NeedsYou.panelHTML(cards(), null); });
+  // redraw 1: the ordinary poll, same order
+  win.KeepInput.preserve(root, function () { root.innerHTML = paint([475, 476]); });
+  eq(byNum()["476"], "words for 476", "same-order redraw: the words stayed on 476");
+  eq(byNum()["475"], "", "same-order redraw: 475's field stayed empty");
 
-  const after = root.querySelectorAll("textarea.answer-field");
-  eq(after[0].value, "", "the untouched flight's field stayed empty");
-  eq(after[0].getAttribute("data-num"), "475", "…and is still the first flight's field");
-  eq(after[1].value, "words for 476", "the typed flight's words survived, on its own field");
-  eq(after[1].getAttribute("data-num"), "476", "…bound to the flight the operator typed for");
+  // redraw 2: the two flights swap places
+  win.KeepInput.preserve(root, function () { root.innerHTML = paint([476, 475]); });
+  eq(byNum()["476"], "words for 476", "after a reorder the draft followed its own flight");
+  eq(byNum()["475"], "", "…and never landed in the other flight's field");
+  eq(doc.activeElement.getAttribute("data-num"), "476", "focus followed the flight, not the slot");
+
+  // redraw 3: a new decision arrives ABOVE the one being answered
+  win.KeepInput.preserve(root, function () { root.innerHTML = paint([477, 476, 475]); });
+  eq(byNum()["476"], "words for 476", "a decision arriving above did not shift the draft");
+  eq(byNum()["477"], "", "the new decision's field is empty");
+  eq(byNum()["475"], "", "and 475's field is still empty");
+
+  // redraw 4: the flight being answered leaves the field entirely
+  win.KeepInput.preserve(root, function () { root.innerHTML = paint([477, 475]); });
+  eq(byNum()["476"], undefined, "the flight left the field, so its field is gone");
+  eq(byNum()["477"], "", "its draft did not fall through to the flight that took its slot");
+  eq(byNum()["475"], "", "nor to any other flight");
 });
 
 // ------------------------------------------------------------------ the general rule KeepInput sets
@@ -220,6 +245,30 @@ test("keepinput: a field the operator never touched keeps refreshing from the se
     root.innerHTML = '<input type="text" name="server-owned" value="three">';
   });
   eq(root.querySelector("input").value, "mine", "once dirty, the operator's text wins over the poll");
+});
+
+test("keepinput: the reader keeps their place — a restored field does not yank the scroll", () => {
+  // Measured in a real Chrome on the fixed build before this guard existed: with a draft focused in
+  // the drawer and the panel taller than the window, scrolling UP to re-read the question was undone
+  // by the very next poll (scrollTop 0 → 1223, every 2s). The operator could not read the question
+  // they were answering. Restoring focus must not move the page, and the scroll position the
+  // rebuild threw away has to come back with the draft.
+  const { win, doc } = bootstrap(["keepinput.js"]);
+  const root = doc.createElement("div");
+  doc.body.appendChild(root);
+  const paint = () => '<div class="panel"><textarea class="answer-field" data-num="475"></textarea></div>';
+  root.innerHTML = paint();
+
+  const field = root.querySelector("textarea.answer-field");
+  field.value = "half an answer";
+  field.focus();
+  root.querySelector(".panel").scrollTop = 140;      // the operator scrolls back up to re-read
+
+  win.KeepInput.preserve(root, function () { root.innerHTML = paint(); });
+
+  eq(root.querySelector("textarea.answer-field").value, "half an answer", "the draft survived");
+  eq(doc.activeElement, root.querySelector("textarea.answer-field"), "focus survived");
+  eq(root.querySelector(".panel").scrollTop, 140, "…and the operator kept the place they scrolled to");
 });
 
 test("keepinput: a rebuild with nothing typed is left exactly as the poll rendered it", () => {
