@@ -68,11 +68,14 @@
   // Where the operator had scrolled to, read off the chain from the field up to the container. The
   // rebuild throws every one of those elements away, so the reader's place goes with them unless it
   // is carried across too. Most entries are 0 and restoring 0 onto a non-scrolling box is a no-op,
-  // so the chain needs no cleverness about WHICH ancestor is the scroller.
+  // so the chain needs no cleverness about WHICH ancestor is the scroller — but each entry does
+  // carry its element's shape, because the walk back up matches by POSITION in the chain. Every
+  // renderer here puts the field at a fixed depth today; a future one that wraps a field
+  // conditionally would otherwise hand a box a scroll position belonging to a different box.
   function scrollChain(el, container) {
     var chain = [];
     for (var n = el.parentNode; n && n.nodeType === 1; n = n.parentNode) {
-      chain.push({ top: n.scrollTop, left: n.scrollLeft });
+      chain.push({ tag: n.tagName, cls: n.className, top: n.scrollTop, left: n.scrollLeft });
       if (n === container) break;
     }
     return chain;
@@ -82,9 +85,13 @@
     if (!chain) return;
     var i = 0;
     for (var n = el.parentNode; n && n.nodeType === 1 && i < chain.length; n = n.parentNode, i++) {
-      n.scrollTop = chain[i].top;
-      n.scrollLeft = chain[i].left;
-      if (n === container) break;
+      var s = chain[i];
+      // The shape moved under us: stop rather than guess. Losing the reader's place is a small
+      // cost; scrolling a box the operator never touched is a wrong answer that looks deliberate.
+      if (n.tagName !== s.tag || n.className !== s.cls) return;
+      n.scrollTop = s.top;
+      n.scrollLeft = s.left;
+      if (n === container) return;
     }
   }
 

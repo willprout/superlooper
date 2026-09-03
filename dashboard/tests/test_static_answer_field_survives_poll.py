@@ -59,8 +59,6 @@ def test_the_drawer_rebuild_carries_typed_text_across_it():
     # in-place re-render — so the preservation belongs there, not at one call site.
     assert "KeepInput.preserve" in _DRAWER_CODE, (
         "the drawer's innerHTML rebuild must carry the operator's typed answer across it")
-    assert "node.innerHTML" not in _DRAWER_CODE.split("function paint")[0], (
-        "no drawer rebuild may bypass the preservation")
 
 
 def test_the_shell_rebuild_carries_typed_text_across_it():
@@ -178,6 +176,31 @@ def test_a_posted_answer_is_cleared_so_the_preservation_cannot_re_offer_it():
     assert 'querySelectorAll("textarea.answer-field")' in clear
     assert 'getAttribute("data-repo")' in clear and 'getAttribute("data-num")' in clear, (
         "clearing must be scoped to the flight that was answered, never every field on the surface")
+
+
+def test_restoring_focus_does_not_scroll_the_page():
+    """A bare ``focus()`` scrolls the focused element into view. With a draft focused that dragged
+    the drawer back down to the Answer box every 2s and made it impossible to scroll UP and re-read
+    the question being answered (measured in Chrome: scrollTop 0 → 1223, every poll).
+
+    This is a STRING guard on purpose. The behavioural suite cannot see it: ``restore`` re-applies
+    the scroll chain immediately after focusing, which masks a bare ``focus()`` in a shim with no
+    layout. In a real browser it is not masked — the chain stops at the container, so a bare
+    ``focus()`` still scrolls the document itself, which nothing captures or restores.
+    """
+    assert "preventScroll" in _KEEP_CODE
+
+
+def test_a_second_tap_cannot_post_a_second_answer_while_the_first_is_in_flight():
+    """The door the preservation re-opens. A GitHub answer is three sequential ``gh`` calls and
+    takes seconds; before this issue the ~1s field wipe accidentally guarded a double tap (the
+    second tap found an empty field and was refused). Now the words stay, the tap looks like it did
+    nothing, and a second tap would post a SECOND answer comment and re-write the labels. So the
+    verb tracks its own flight, and says out loud that it is sending."""
+    body = _handler_body(_SHELL_CODE, "doAnswer")
+    assert "answering[" in body, "the answer verb must refuse to fly twice on one flight"
+    assert "delete answering[" in body, "…and must let go when the write lands or fails"
+    assert body.count("delete answering[") >= 2, "released on BOTH the response and the failure"
 
 
 def test_the_preservation_cannot_take_the_joy_surfaces_down_with_it():

@@ -271,6 +271,34 @@ test("keepinput: the reader keeps their place — a restored field does not yank
   eq(root.querySelector(".panel").scrollTop, 140, "…and the operator kept the place they scrolled to");
 });
 
+test("keepinput: a rebuild that changes the field's depth does not scroll the wrong box", () => {
+  // The chain is walked by index. Today every renderer puts the field at a fixed depth, but the
+  // module advertises itself to any future free-text field on this path — and one behind a
+  // conditional wrapper would, with a naive index walk, hand the container a scroll position that
+  // belongs to a box nobody ever scrolled. The chain therefore carries each ancestor's shape and
+  // stops the moment it stops matching, rather than guessing.
+  const { win, doc } = bootstrap(["keepinput.js"]);
+  const root = doc.createElement("div");
+  doc.body.appendChild(root);
+  root.innerHTML = '<div class="panel"><div class="wrap">' +
+    '<textarea class="answer-field" data-num="475"></textarea></div></div>';
+
+  const field = root.querySelector("textarea.answer-field");
+  field.value = "half an answer";
+  field.focus({ preventScroll: true });
+  root.querySelector(".panel").scrollTop = 500;      // the operator's place, in the real scroller
+
+  // the next poll renders the same field one level shallower
+  win.KeepInput.preserve(root, function () {
+    root.innerHTML = '<div class="panel"><textarea class="answer-field" data-num="475"></textarea></div>';
+  });
+
+  eq(root.querySelector("textarea.answer-field").value, "half an answer", "the draft still survived");
+  eq(root.scrollTop, 0, "the container was never scrolled, so it must not be given a scroll position");
+  eq(root.querySelector(".panel").scrollTop, 0,
+     "a box whose place we can no longer identify is left where the render put it, not guessed at");
+});
+
 test("keepinput: a rebuild with nothing typed is left exactly as the poll rendered it", () => {
   const { win, doc } = bootstrap(["keepinput.js"]);
   const root = doc.createElement("div");

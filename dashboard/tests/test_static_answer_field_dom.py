@@ -32,7 +32,8 @@ def test_typed_answer_survives_the_poll_redraw_in_a_real_dom():
     if not node:
         pytest.skip("node is not installed — the string guards in "
                     "test_static_answer_field_survives_poll.py still hold the wiring")
-    proc = subprocess.run([node, str(_SUITE)], cwd=str(_ROOT),
+    # A timeout, so a wedged node never hangs the gate with no diagnostic.
+    proc = subprocess.run([node, str(_SUITE)], cwd=str(_ROOT), timeout=120,
                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     out = proc.stdout.decode("utf-8", "replace")
     assert proc.returncode == 0, "the behavioural answer-field suite failed:\n" + out

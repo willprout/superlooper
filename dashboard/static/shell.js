@@ -718,12 +718,26 @@
   // #163: Answer a durable owner-decision question — read the operator's typed answer from the field
   // beside this button (its own `.act` container, so two cards can never cross wires) and post the
   // one mechanical verb (a comment + the approval label). Empty is refused client-side with a nudge.
+  // "repo#num" -> true while that flight's answer is in flight. Posting an answer is three
+  // sequential gh calls and takes seconds; until #475 the ~1s field wipe accidentally guarded a
+  // double tap, because the second tap found an empty field and was refused client-side. Now the
+  // words stay put — which is the point — so the tap can look like it did nothing, and a second one
+  // would post a SECOND answer comment and re-write the labels. The verb tracks its own flight
+  // instead, and says out loud that it is sending (the discipline submitFlag already uses: block
+  // while in flight, release on failure).
+  var answering = {};
+
   function doAnswer(btn, repo, num) {
     var field = btn && btn.parentNode ? btn.parentNode.querySelector("textarea.answer-field") : null;
     var text = field ? String(field.value || "").trim() : "";
     if (!text) { toast("Type an answer first — it becomes your word on the issue", "err"); if (field) field.focus(); return; }
+    var flight = repo + "#" + num;
+    if (answering[flight]) { toast("Still sending that answer — one moment", "ok"); return; }
+    answering[flight] = true;
+    toast("Sending your answer to SL-" + num + "…", "ok");
     postJSON("/api/answer", { repo: repo, num: Number(num), text: text })
       .then(function (res) {
+        delete answering[flight];
         if (res.status === 200 && res.body && res.body.ok) {
           // The answer is posted, so the field must stop offering it (issue #475). Before the poll
           // preserved typed text, the next redraw wiped it and that read — accidentally — as
@@ -739,7 +753,10 @@
           toast((res.body && res.body.error) || "GitHub write failed — nothing changed", "err");
         }
       })
-      .catch(function () { toast("couldn't reach the command center", "err"); });
+      .catch(function () {
+        delete answering[flight];
+        toast("couldn't reach the command center", "err");
+      });
   }
 
   // Clear this flight's Answer field(s) by (repo, num), NOT through the reference doAnswer read
@@ -747,8 +764,8 @@
   // by the time the answer comes back the surface has usually been rebuilt and that reference is a
   // detached node — clearing it would clear nothing the operator can see, and the live field would
   // keep offering already-posted words beside a live Answer button (measured in Chrome with a 5s
-  // write). Both surfaces can show the same flight, so both are cleared; the one the operator did
-  // not type in is already empty.
+  // write). Both surfaces that can show this flight are cleared: the question is answered, so any
+  // draft still sitting in either one is a draft of an answer that has already been given.
   function clearAnswerFields(repoSlug, num) {
     var all = document.querySelectorAll("textarea.answer-field");
     for (var i = 0; i < all.length; i++) {
