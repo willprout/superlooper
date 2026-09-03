@@ -198,8 +198,13 @@ def test_a_second_tap_cannot_post_a_second_answer_while_the_first_is_in_flight()
     nothing, and a second tap would post a SECOND answer comment and re-write the labels. So the
     verb tracks its own flight, and says out loud that it is sending."""
     body = _handler_body(_SHELL_CODE, "doAnswer")
-    assert "answering[" in body, "the answer verb must refuse to fly twice on one flight"
-    assert "delete answering[" in body, "…and must let go when the write lands or fails"
+    # Pin the ACTIVE half explicitly. `"answering["` alone is satisfied by the substring inside
+    # `delete answering[...]`, so deleting the two lines that do the work left this green — the
+    # flag would never be set, a second tap would sail through, and no test would say so. That is
+    # the inert-guard class this repo has been bitten by (#165).
+    assert "if (answering[flight])" in body, "a second tap while in flight must be refused"
+    assert "answering[flight] = true" in body, "…which means the first tap has to mark the flight"
+    assert "delete answering[" in body, "…and it must let go when the write lands or fails"
     assert body.count("delete answering[") >= 2, "released on BOTH the response and the failure"
 
 
