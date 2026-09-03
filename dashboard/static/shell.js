@@ -108,7 +108,12 @@
       updateFirehose();
     } else {
       var towerScroll = captureTowerScroll();   // read the outgoing feed BEFORE the rebuild (issue #27)
-      root.innerHTML = shellHTML();
+      // The Needs You panel's Answer field (#163) is rendered INSIDE this wholesale rebuild, so a
+      // rebuilt textarea came back empty ~1s after the operator started typing — the Answer verb
+      // was unusable (issue #475). KeepInput carries a typed-but-unsubmitted field's words, focus
+      // and caret across the rebuild; everything the operator has NOT touched still refreshes from
+      // the fresh snapshot, so no live data is frozen. Fail-soft if the module didn't load.
+      keepTypedText(root, function () { root.innerHTML = shellHTML(); });
       state.builtView = "shell";
       // The airfield's canvas is a PERSISTENT node owned by field.js — re-parent it into the
       // fresh mount so sprite state and the animation loop survive every innerHTML rebuild.
@@ -131,6 +136,14 @@
     // an open flight card tracks live state (design record §4 — always the same, always current).
     refreshDrawer();
     updateChrome();
+  }
+
+  // Run a wholesale innerHTML rebuild with the operator's half-typed text carried across it
+  // (issue #475). One place, so any free-text field a future render puts inside #root inherits the
+  // survival rather than quietly re-earning the bug.
+  function keepTypedText(container, rebuild) {
+    if (window.KeepInput) window.KeepInput.preserve(container, rebuild);
+    else rebuild();
   }
 
   // The honest FIRST-PAINT failure surface (issue #34). Before the first successful snapshot there is
