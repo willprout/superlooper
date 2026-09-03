@@ -22,6 +22,10 @@
   <!-- The Solari flagship + the boards renderer load before the shell binds them (design record §8). -->
   <script src="/solari.js"></script>
   <script src="/boards.js"></script>
+  <!-- Issue #475: the operator's half-typed words survive the 2s poll rebuild. Loaded before every
+       renderer that puts a free-text field on that path (the Needs You card, the drawer) and before
+       shell.js, which drives the rebuild. -->
+  <script src="/keepinput.js"></script>
   <!-- The three decision surfaces (Task 9): tower comms feed, Needs You cards, flight-card drawer.
        Loaded before shell.js, which binds them into the four-panel shell. -->
   <script src="/tower.js"></script>

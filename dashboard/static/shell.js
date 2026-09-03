@@ -108,7 +108,12 @@
       updateFirehose();
     } else {
       var towerScroll = captureTowerScroll();   // read the outgoing feed BEFORE the rebuild (issue #27)
-      root.innerHTML = shellHTML();
+      // The Needs You panel's Answer field (#163) is rendered INSIDE this wholesale rebuild, so a
+      // rebuilt textarea came back empty ~1s after the operator started typing — the Answer verb
+      // was unusable (issue #475). KeepInput carries a typed-but-unsubmitted field's words, focus
+      // and caret across the rebuild; everything the operator has NOT touched still refreshes from
+      // the fresh snapshot, so no live data is frozen. Fail-soft if the module didn't load.
+      keepTypedText(root, function () { root.innerHTML = shellHTML(); });
       state.builtView = "shell";
       // The airfield's canvas is a PERSISTENT node owned by field.js — re-parent it into the
       // fresh mount so sprite state and the animation loop survive every innerHTML rebuild.
@@ -131,6 +136,14 @@
     // an open flight card tracks live state (design record §4 — always the same, always current).
     refreshDrawer();
     updateChrome();
+  }
+
+  // Run a wholesale innerHTML rebuild with the operator's half-typed text carried across it
+  // (issue #475). One place, so any free-text field a future render puts inside #root inherits the
+  // survival rather than quietly re-earning the bug.
+  function keepTypedText(container, rebuild) {
+    if (window.KeepInput) window.KeepInput.preserve(container, rebuild);
+    else rebuild();
   }
 
   // The honest FIRST-PAINT failure surface (issue #34). Before the first successful snapshot there is
@@ -705,20 +718,60 @@
   // #163: Answer a durable owner-decision question — read the operator's typed answer from the field
   // beside this button (its own `.act` container, so two cards can never cross wires) and post the
   // one mechanical verb (a comment + the approval label). Empty is refused client-side with a nudge.
+  // "repo#num" -> true while that flight's answer is in flight. Posting an answer is three
+  // sequential gh calls and takes seconds; until #475 the ~1s field wipe accidentally guarded a
+  // double tap, because the second tap found an empty field and was refused client-side. Now the
+  // words stay put — which is the point — so the tap can look like it did nothing, and a second one
+  // would post a SECOND answer comment and re-write the labels. The verb tracks its own flight
+  // instead, and says out loud that it is sending (the discipline submitFlag already uses: block
+  // while in flight, release on failure).
+  var answering = {};
+
   function doAnswer(btn, repo, num) {
     var field = btn && btn.parentNode ? btn.parentNode.querySelector("textarea.answer-field") : null;
     var text = field ? String(field.value || "").trim() : "";
     if (!text) { toast("Type an answer first — it becomes your word on the issue", "err"); if (field) field.focus(); return; }
+    var flight = repo + "#" + num;
+    if (answering[flight]) { toast("Still sending that answer — one moment", "ok"); return; }
+    answering[flight] = true;
+    toast("Sending your answer to SL-" + num + "…", "ok");
     postJSON("/api/answer", { repo: repo, num: Number(num), text: text })
       .then(function (res) {
+        delete answering[flight];
         if (res.status === 200 && res.body && res.body.ok) {
+          // The answer is posted, so the field must stop offering it (issue #475). Before the poll
+          // preserved typed text, the next redraw wiped it and that read — accidentally — as
+          // "sent". Now it would be faithfully carried over, and the operator's already-posted
+          // words would sit beside a live Answer button until the card leaves, which the slow gh
+          // clock can make tens of seconds; a second tap posts a SECOND answer and re-applies the
+          // label. Clearing also makes the field non-dirty, so the preservation lets it go — and
+          // it must happen before refresh(), or that poll's capture carries the posted text over.
+          clearAnswerFields(repo, num);
           toast("Answered SL-" + num + " — a fresh session resumes with your answer", "ok");
           refresh();
         } else {
           toast((res.body && res.body.error) || "GitHub write failed — nothing changed", "err");
         }
       })
-      .catch(function () { toast("couldn't reach the command center", "err"); });
+      .catch(function () {
+        delete answering[flight];
+        toast("couldn't reach the command center", "err");
+      });
+  }
+
+  // Clear this flight's Answer field(s) by (repo, num), NOT through the reference doAnswer read
+  // before the POST. A GitHub write is a comment plus a label and routinely outlasts a 2s poll, so
+  // by the time the answer comes back the surface has usually been rebuilt and that reference is a
+  // detached node — clearing it would clear nothing the operator can see, and the live field would
+  // keep offering already-posted words beside a live Answer button (measured in Chrome with a 5s
+  // write). Both surfaces that can show this flight are cleared: the question is answered, so any
+  // draft still sitting in either one is a draft of an answer that has already been given.
+  function clearAnswerFields(repoSlug, num) {
+    var all = document.querySelectorAll("textarea.answer-field");
+    for (var i = 0; i < all.length; i++) {
+      if (all[i].getAttribute("data-repo") === String(repoSlug) &&
+          all[i].getAttribute("data-num") === String(num)) all[i].value = "";
+    }
   }
 
   function doDiscuss(repo, num) {

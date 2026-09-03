@@ -185,7 +185,21 @@
     return '<div class="drawer-actions">' + session + bits.join("") + '</div>';
   }
 
+  // Every rebuild of the drawer goes through here — the 2s poll's update(), and the in-place
+  // re-render a journal caret does — and each one is a wholesale innerHTML assignment that
+  // destroys the Answer textarea. KeepInput carries the operator's typed-but-unsubmitted words,
+  // focus and caret across it (issue #475); everything else still refreshes from the fresh
+  // snapshot, so the drawer keeps tracking live state while a draft is in the field. Fail-soft:
+  // if the module ever fails to load, the drawer still renders — it just loses the draft again.
   function render(d) {
+    if (window.KeepInput) {
+      window.KeepInput.preserve(node, function () { paint(d); });
+    } else {
+      paint(d);
+    }
+  }
+
+  function paint(d) {
     cur._last = d;
     node.innerHTML =
       '<div class="drawer-panel">' +
