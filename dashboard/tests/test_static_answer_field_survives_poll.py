@@ -164,10 +164,20 @@ def test_a_posted_answer_is_cleared_so_the_preservation_cannot_re_offer_it():
     """
     body = _handler_body(_SHELL_CODE, "doAnswer")
     ok_branch = body.split("res.body.ok")[1].split("} else {")[0]
-    assert 'field.value = ""' in ok_branch, (
+    assert "clearAnswerFields(repo, num)" in ok_branch, (
         "a successful answer must clear the field, or the preservation re-offers posted words")
     # …and it must clear BEFORE the re-poll, or that poll's capture carries the posted text over.
-    assert ok_branch.index('field.value = ""') < ok_branch.index("refresh()")
+    assert ok_branch.index("clearAnswerFields") < ok_branch.index("refresh()")
+    # It must NOT clear through the reference read before the POST. A GitHub write is a comment
+    # plus a label and routinely outlasts a 2s poll, so by the time it returns the surface has been
+    # rebuilt and that reference is a DETACHED node — clearing it clears nothing the owner can see
+    # (measured in Chrome with a 5s write: the posted words sat in the live field indefinitely).
+    assert 'field.value = ""' not in ok_branch, (
+        "clear the LIVE field by (repo, num); the captured reference may be detached by then")
+    clear = _handler_body(_SHELL_CODE, "clearAnswerFields")
+    assert 'querySelectorAll("textarea.answer-field")' in clear
+    assert 'getAttribute("data-repo")' in clear and 'getAttribute("data-num")' in clear, (
+        "clearing must be scoped to the flight that was answered, never every field on the surface")
 
 
 def test_the_preservation_cannot_take_the_joy_surfaces_down_with_it():

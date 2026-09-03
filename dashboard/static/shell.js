@@ -730,9 +730,9 @@
           // "sent". Now it would be faithfully carried over, and the operator's already-posted
           // words would sit beside a live Answer button until the card leaves, which the slow gh
           // clock can make tens of seconds; a second tap posts a SECOND answer and re-applies the
-          // label. Clearing here also makes the field non-dirty, so the preservation correctly
-          // lets it go. Before refresh(), or that poll's capture carries the posted text over.
-          if (field) field.value = "";
+          // label. Clearing also makes the field non-dirty, so the preservation lets it go — and
+          // it must happen before refresh(), or that poll's capture carries the posted text over.
+          clearAnswerFields(repo, num);
           toast("Answered SL-" + num + " — a fresh session resumes with your answer", "ok");
           refresh();
         } else {
@@ -740,6 +740,21 @@
         }
       })
       .catch(function () { toast("couldn't reach the command center", "err"); });
+  }
+
+  // Clear this flight's Answer field(s) by (repo, num), NOT through the reference doAnswer read
+  // before the POST. A GitHub write is a comment plus a label and routinely outlasts a 2s poll, so
+  // by the time the answer comes back the surface has usually been rebuilt and that reference is a
+  // detached node — clearing it would clear nothing the operator can see, and the live field would
+  // keep offering already-posted words beside a live Answer button (measured in Chrome with a 5s
+  // write). Both surfaces can show the same flight, so both are cleared; the one the operator did
+  // not type in is already empty.
+  function clearAnswerFields(repoSlug, num) {
+    var all = document.querySelectorAll("textarea.answer-field");
+    for (var i = 0; i < all.length; i++) {
+      if (all[i].getAttribute("data-repo") === String(repoSlug) &&
+          all[i].getAttribute("data-num") === String(num)) all[i].value = "";
+    }
   }
 
   function doDiscuss(repo, num) {
