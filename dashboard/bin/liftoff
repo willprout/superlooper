@@ -52,7 +52,8 @@ from pathlib import Path
 
 # Exit codes. Distinct so a supervisor / a human reading a log can tell a first-run config dead-end
 # from a launch failure — the same discipline bin/command-center uses (issue #34).
-EXIT_CONFIG_ERROR = 2   # config missing / malformed / schema-invalid, or an unresolvable --repo
+EXIT_CONFIG_ERROR = 2   # config missing / malformed / schema-invalid, or a --repo that is
+                        # unresolvable, ambiguous, or not the repo that came back (issue #482)
 EXIT_LAUNCH_FAILED = 3  # the runner could not be exec'd (bad CLI path) / the dashboard couldn't spawn
 
 _ROOT = Path(__file__).resolve().parent.parent
@@ -442,6 +443,16 @@ def main(argv, *, is_dashboard_up=_dashboard_up, live_runner_pid=_live_runner_pi
         out.write("liftoff: %s\n" % e)
         return EXIT_CONFIG_ERROR
 
+    # The repo the operator NAMED must be the repo that starts (issue #482, the #477 incident).
+    # Checked HERE — before any repo's runner pidfile is read, before the dashboard is touched,
+    # before anything is started — because the whole failure is liftoff proceeding confidently
+    # against the wrong loop's state. A refusal that has already probed something has already been
+    # inside the wrong repo's state home.
+    mismatch = liftoff_mod.named_repo_mismatch(repo, repo_arg)
+    if mismatch is not None:
+        out.write("liftoff: %s\n" % mismatch)
+        return EXIT_CONFIG_ERROR
+
     url = "http://%s:%d" % (server.BIND_HOST, cfg["port"])
     dash_argv = liftoff_mod.dashboard_argv(sys.executable, _COMMAND_CENTER, config_path)
     # WHERE this repo's runner lives decides what starting it even means (issue #306, wired here by
@@ -480,10 +491,14 @@ def main(argv, *, is_dashboard_up=_dashboard_up, live_runner_pid=_live_runner_pi
     #    LOGIN_ITEM home, run the engine's bootstrap step and hand the terminal back. Either way,
     #    a runner that is already live is left exactly alone.
     run = plan["runner"]
-    if not run["start"]:
-        out.write("liftoff: %s\n" % run["message"])
-        return 0
+    # The slug alone was never enough to tell a right start from a wrong one on screen (issue #482):
+    # in the #477 incident the slug liftoff printed was the one the operator asked for. The checkout
+    # it hands the engine and the state home that gets written are the two facts that actually
+    # decide, so they go beside EVERY runner line — started or left alone.
     out.write("liftoff: %s\n" % run["message"])
+    out.write(liftoff_mod.runner_target_lines(repo))
+    if not run["start"]:
+        return 0
     out.flush()
     if not run["foreground"]:
         # launchd owns the runner's process here, so there is nothing for liftoff to become. The

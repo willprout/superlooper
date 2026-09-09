@@ -145,6 +145,15 @@ bin/liftoff /path/to/config.json   # from anywhere: name the config (or set CC_C
 bin/liftoff --restart-dashboard    # the dashboard says STALE TOWER: restart it on the current build
 ```
 
+- **Which repo starts is the one you name — or nothing starts.** `--repo` takes a full slug
+  (`owner/name`), a bare repo name, or a checkout path, and every watched repo is tested against all
+  three before anything is started. If more than one repo matches, liftoff **refuses** and names each
+  candidate by slug and checkout: two owners can own a repo of the same name, and picking one by the
+  order they happen to sit in your config would start a loop you did not ask for. A full slug names
+  exactly one repo, so it still resolves through such a collision. Every runner line — started or
+  left alone — also prints the **checkout** liftoff hands the engine and the **state home** that gets
+  written, so you can see which loop is coming up without waiting to find out.
+
 - **Where it finds the config.** With no path argument, `liftoff` reads `./config.json` **relative
   to the directory you run it from** (or `$CC_CONFIG`), exactly like `bin/command-center`. So run it
   from the dashboard directory, or — to run it from anywhere — pass the config's path as the first

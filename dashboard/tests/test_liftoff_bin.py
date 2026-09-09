@@ -417,3 +417,99 @@ def test_the_home_is_not_probed_when_a_live_runner_already_answers(one_repo):
     _run(one_repo, up=False, pid=4321,
          runner_home=lambda cli, path: probes.append(path) or lo.liftoff_mod.PANE)
     assert probes == [], "a live runner needs no home probe — nothing is being started"
+
+
+# --------------------------- issue #482: the named repo is the repo that starts ---------------------------
+# The #477 incident (2026-09-09): with two watched repos the operator ran
+# `bin/liftoff --repo will-titan/agent-360-eapp` and the OTHER repo's runner is what came up —
+# the eApp runner was never started at all. These pin the whole path from the typed word to the
+# exec'd argv: the named repo starts, no other repo's state is even READ, and a checkout that is
+# not the repo the config says it is stops liftoff dead instead of starting something else.
+
+@pytest.fixture
+def two_repos(tmp_path, monkeypatch):
+    monkeypatch.setenv("SL_HOME", str(tmp_path / "slhome"))
+    eapp = _repo_checkout(tmp_path, "agent-360-eapp", "will-titan/agent-360-eapp")
+    partner = _repo_checkout(tmp_path, "titan-apps-partner", "titancasket/titan-apps-partner")
+    return _config_file(tmp_path, partner, eapp), eapp, partner
+
+
+def _run_recording_probes(cfg_path, slug):
+    """Drive main() recording EVERY state home whose runner pidfile was consulted."""
+    probed, spawn, execr, out = [], _Recorder(), _Recorder(), io.StringIO()
+
+    def live(state_home):
+        probed.append(str(state_home))
+        return None
+
+    rc = lo.main([str(_BIN), str(cfg_path), "--repo", slug],
+                 is_dashboard_up=lambda h, p: True, live_runner_pid=live,
+                 spawn_dashboard=spawn, exec_runner=execr, out=out,
+                 runner_home=lambda e, p: lo.liftoff_mod.PANE)
+    return rc, out.getvalue(), execr, probed
+
+
+@pytest.mark.parametrize("slug,checkout,other", [
+    ("will-titan/agent-360-eapp", "agent-360-eapp", "titancasket__titan-apps-partner"),
+    ("titancasket/titan-apps-partner", "titan-apps-partner", "will-titan__agent-360-eapp"),
+])
+def test_the_named_repo_is_the_one_that_starts_and_no_other_repos_state_is_touched(
+        two_repos, slug, checkout, other):
+    cfg, eapp, partner = two_repos
+    rc, text, execr, probed = _run_recording_probes(cfg, slug)
+    assert rc == 0
+    want = str(Path(cfg).parent / checkout)
+    assert execr.calls[0][0][0][1:] == ["run", "--repo", want]
+    assert slug in text
+    # the OTHER repo's state home is never even read — the incident rewrote one
+    assert len(probed) == 1 and other not in probed[0]
+    assert probed[0].endswith(slug.replace("/", "__"))   # ...and the one home read is the named repo's
+
+
+def test_the_runner_line_names_the_checkout_and_the_state_home_being_handed_over(two_repos):
+    # The #477 forensics could not attribute the wrong start because liftoff prints only the slug it
+    # BELIEVES. The two facts that decide what actually comes up — the checkout path handed to the
+    # engine and the state home that will be rewritten — go on screen before the exec.
+    cfg, eapp, partner = two_repos
+    rc, text, execr, probed = _run_recording_probes(cfg, "will-titan/agent-360-eapp")
+    assert str(eapp) in text
+    assert "will-titan__agent-360-eapp" in text
+
+
+def test_a_resolution_that_returns_the_other_repo_refuses_and_starts_nothing(two_repos, monkeypatch):
+    # THE #477 REGRESSION PIN, with teeth: force the exact reported shape — the operator names
+    # will-titan/agent-360-eapp and resolution hands back titancasket/titan-apps-partner — and
+    # liftoff must start NOTHING. Not the partner (the repo nobody named), and not the eApp either.
+    # Forcing it is the point: the resolver is correct today, so the only way to prove the doorway
+    # guard holds is to make resolution wrong on purpose.
+    cfg, eapp, partner = two_repos
+
+    def resolves_to_the_wrong_repo(config, repo_arg):
+        return next(r for r in config["repos"]
+                    if r["slug"] == "titancasket/titan-apps-partner")
+
+    monkeypatch.setattr(lo.liftoff_mod, "resolve_repo", resolves_to_the_wrong_repo)
+    probed, spawn, execr, out = [], _Recorder(), _Recorder(), io.StringIO()
+    rc = lo.main([str(_BIN), str(cfg), "--repo", "will-titan/agent-360-eapp"],
+                 is_dashboard_up=lambda h, p: True,
+                 live_runner_pid=lambda s: probed.append(str(s)),
+                 spawn_dashboard=spawn, exec_runner=execr, out=out,
+                 runner_home=lambda e, p: lo.liftoff_mod.PANE)
+    text = out.getvalue()
+    assert rc == lo.EXIT_CONFIG_ERROR
+    assert not execr.calls          # nothing started — not the named repo, and not the other one
+    assert not probed               # and no repo's state was touched on the way to refusing
+    assert "will-titan/agent-360-eapp" in text and "titancasket/titan-apps-partner" in text
+    assert str(partner) in text
+
+
+def test_an_ambiguous_repo_arg_refuses_with_the_candidates_named(tmp_path, monkeypatch):
+    monkeypatch.setenv("SL_HOME", str(tmp_path / "slhome"))
+    a = _repo_checkout(tmp_path, "mine", "will-titan/agent-360-eapp")
+    b = _repo_checkout(tmp_path, "theirs", "titancasket/agent-360-eapp")
+    cfg = _config_file(tmp_path, a, b)
+    rc, text, spawn, execr = _run(cfg, up=True, pid=None,
+                                  extra_argv=["--repo", "agent-360-eapp"])
+    assert rc == lo.EXIT_CONFIG_ERROR
+    assert not execr.calls and not spawn.calls
+    assert "will-titan/agent-360-eapp" in text and "titancasket/agent-360-eapp" in text
