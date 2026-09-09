@@ -41,7 +41,7 @@ _ELLIPSIS = "…"
 
 
 def scrub(text):
-    """Drop C0/C1 control bytes except \n and \t, so a binary or an ANSI-painted TUI screen can
+    r"""Drop C0/C1 control bytes except \n and \t, so a binary or an ANSI-painted TUI screen can
     never ride into a record a human reads. \r collapses into \n: a TUI screen is full of them and
     a bare \r would overwrite the line in whatever renders the text. "" for a non-string.
 

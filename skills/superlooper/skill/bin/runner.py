@@ -432,6 +432,20 @@ def _short_repr(exc, limit=500):
     return r if len(r) <= limit else r[:limit] + f"...<+{len(r) - limit} chars truncated>"
 
 
+def _joined(proc):
+    """A finished subprocess's stdout and stderr as ONE piece of text, separated by a newline.
+
+    Concatenating them raw (what this used to do) welds stdout's last line onto stderr's first
+    whenever stdout does not end in one — and macOS libmalloc prints its chatter as a child's FIRST
+    stderr output, so exactly that weld hid a chatter line from the pattern that exists to drop it
+    (issue #480, fresh-agent review round 2). The incident was a DRIP, one line per child per tick;
+    a fold and a cap cannot answer a drip, so a hole in the pattern is the whole cost. It also
+    stops two unrelated lines being read as one sentence, which was a small lie either way.
+    """
+    parts = [s for s in (getattr(proc, "stdout", ""), getattr(proc, "stderr", "")) if s]
+    return "\n".join(parts)
+
+
 def _read_json(path):
     txt = _read(path)
     if txt is None:
@@ -2577,11 +2591,12 @@ class Runner:
 
     # ------------------------- executors -------------------------
 
+
     def _run_script(self, args, env=None, timeout=LAUNCH_TIMEOUT):   # injectable
         try:
             r = subprocess.run([str(a) for a in args], env={**os.environ, **(env or {})},
                                capture_output=True, text=True, timeout=timeout)
-            self._log((r.stdout or "") + (r.stderr or ""))
+            self._log(_joined(r))
             # Carry the stderr — the ONLY account of WHY (issue #152). It used to stop here, at
             # `return r.returncode`: runner.log kept the reason and every caller got a bare int, so
             # the 07-09 storm's "Pane or workspace not found" was written to a file nobody read
@@ -2597,7 +2612,7 @@ class Runner:
         try:
             r = subprocess.run(["bash", "-lc", cmd], cwd=cwd, capture_output=True,
                                text=True, timeout=timeout)
-            self._log((r.stdout or "") + (r.stderr or ""))
+            self._log(_joined(r))
             return r.returncode
         except subprocess.TimeoutExpired:
             return 124

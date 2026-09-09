@@ -7758,3 +7758,25 @@ def test_a_boot_that_never_ticked_is_not_recorded_as_a_finished_run(rig, armed, 
     assert rig.r.run(max_ticks=1, sleep=lambda s: None) == 2
     assert armed.record_clean() is True
     assert _exit_records(rig)[0]["reason"] == "boot_refused"
+
+
+def test_a_childs_stdout_is_never_welded_onto_its_first_stderr_line(rig, monkeypatch):
+    # Review round 2: `_log(stdout + stderr)` glued stdout's last line onto stderr's first whenever
+    # stdout lacked a trailing newline — and macOS libmalloc prints its chatter as a child's FIRST
+    # stderr output, so exactly that weld hid a chatter line from the pattern that drops it. The
+    # incident was a DRIP (one line per child per tick); neither the fold nor the cap answers a drip.
+    class _Ran:
+        returncode = 0
+        stdout = "worktree ready"          # no trailing newline: the weld case
+        stderr = ("python3(9129) MallocStackLogging: can't turn off malloc stack logging "
+                  "because it was not enabled.\n")
+
+    monkeypatch.setattr(runner_mod.subprocess, "run", lambda *a, **k: _Ran())
+    # A fresh Runner: the rig injects a recording `run_script`, so `rig.r._run_script` is the stub.
+    r = runner_mod.Runner(repo=str(rig.repo), config=make_config(), state_home=str(rig.home),
+                          pane="p", fetch_usage=lambda: {})
+    r._run_script(["/nonexistent/launch-session.py"])
+    text = _runner_log_text(rig)
+    assert "worktree ready" in text
+    assert "MallocStackLogging" not in text
+    assert text.splitlines()[0] == "worktree ready"     # its own line, not a welded sentence

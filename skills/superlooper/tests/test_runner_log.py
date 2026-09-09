@@ -394,27 +394,43 @@ def test_arming_covers_sigterm_before_the_runner_installs_its_own_handler(home):
     assert signal.getsignal(signal.SIGTERM) is before      # and hands it straight back
 
 
-def test_the_boot_handler_records_and_then_dies_exactly_as_it_would_have(home, monkeypatch):
-    # It must not CHANGE the process's fate — only whether it left a note. So: record, restore the
-    # default disposition, re-raise at ourselves. (os.kill is stubbed; a real one ends the test run.)
+@pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGINT])
+def test_the_boot_handler_records_and_then_dies_exactly_as_it_would_have(home, monkeypatch, signum):
+    # It must not CHANGE the process's fate — only whether it left a note. So: record, put back
+    # WHATEVER disposition was there before, re-raise at ourselves. Not SIG_DFL: CPython's default
+    # for SIGINT is default_int_handler, which raises KeyboardInterrupt and unwinds the stack, and
+    # forcing SIG_DFL turned a ^C that ran every `finally` into a hard kill that ran none (review
+    # round 2). (os.kill is stubbed; a real one would end the test run.)
     killed = []
     monkeypatch.setattr(runner_log.os, "kill", lambda pid, sig: killed.append((pid, sig)))
-    runner_log.arm(str(home), stream=io.StringIO())
-    signal.getsignal(signal.SIGTERM)(signal.SIGTERM, None)
-    assert _exits(home)[0]["signal"] == "SIGTERM"
-    assert killed == [(os.getpid(), signal.SIGTERM)]
-    assert signal.getsignal(signal.SIGTERM) is signal.SIG_DFL
+    before = signal.getsignal(signum)
+    try:
+        runner_log.arm(str(home), stream=io.StringIO())
+        signal.getsignal(signum)(signum, None)
+        assert _exits(home)[0]["signal"] == signal.Signals(signum).name
+        assert killed == [(os.getpid(), signum)]
+        assert signal.getsignal(signum) is before, "it did not die as it would have"
+    finally:
+        signal.signal(signum, before)      # restore what this test broke, whatever happened
+
+
+def test_sigints_real_default_is_not_sig_dfl():
+    # The fact the fix above turns on, pinned so nobody "simplifies" it back to SIG_DFL.
+    assert signal.getsignal(signal.SIGINT) is not signal.SIG_DFL
 
 
 # --------------------------- the bound's own edges ---------------------------
 
 def test_a_bound_cannot_be_switched_off_by_passing_a_small_limit():
     # `text[-0:]` is the WHOLE string, so limit 0/1 used to make the bound return MORE than it got.
+    # Asserted against the CAPS, not the input: the bug's own output was still smaller than the
+    # input, so an input-relative bound passed against it and pinned nothing (review round 2).
     for text in ("\n".join("line %d" % i for i in range(400)), "z" * 40_000):
         for kwargs in ({"max_lines": 0}, {"max_lines": 1}, {"max_lines": 2},
                        {"max_chars": 0}, {"max_chars": 1}, {"max_lines": True}):
             out = runner_log.bounded(text, **kwargs)
-            assert len(out) <= len(text) + 200, (kwargs, len(out), len(text))
+            assert len(out) <= runner_log.CHILD_MAX_CHARS + 300, (kwargs, len(out))
+            assert len(out.splitlines()) <= runner_log.CHILD_MAX_LINES + 3, (kwargs, len(out))
 
 
 def test_a_run_of_blank_lines_is_one_blank_line_not_a_count_of_nothing():
@@ -426,6 +442,15 @@ def test_control_bytes_and_ansi_paint_never_reach_the_log():
     out = runner_log.bounded("\x1b[31mFATAL\x1b[0m: gone\x00\n")
     assert "FATAL" in out and "gone" in out
     assert "\x1b" not in out and "\x00" not in out
+
+
+def test_chatter_is_recognised_whatever_the_child_is_called():
+    # Real captured shapes plus the ones a spaced process name or an indented line produce. A hole
+    # here is a DRIP — one line per child per tick — and neither the fold nor the cap answers a
+    # drip (review round 2).
+    for name in ("python3", "Python", "sh", "bash", "Google Chrome Helper", "  python3"):
+        line = "%s(3938) MallocStackLogging: can't turn off malloc stack logging." % name
+        assert runner_log.bounded(line) == "", name
 
 
 def test_a_line_that_merely_mentions_the_chatter_is_not_censored():
@@ -441,11 +466,21 @@ def test_a_monstrous_write_is_bounded_without_reading_all_of_it():
     flood = "\n".join("row %d" % i for i in range(400_000))          # ~4 MB
     out = runner_log.bounded(flood)
     assert len(out) <= runner_log.CHILD_MAX_CHARS + 300
-    assert "row 0" in out and "past the scan window" in out
+    assert "row 0" in out and "row 399999" in out      # head AND tail both kept
+    assert "were not read" in out                      # and the gap is declared
 
 
 def test_a_chatter_only_flood_past_the_scan_window_still_says_nothing():
     assert runner_log.bounded("\n".join([NOISE] * 40_000)) == ""
+
+
+def test_the_tail_survives_a_write_whose_tail_slice_holds_one_huge_line():
+    # The tail is where a failing command's reason lives. A tail slice whose only newline is its
+    # LAST character used to trim to "" — every byte of the later, error-bearing line gone, with
+    # only a char count hinting at it (review round 2).
+    out = runner_log.bounded("A" * 500_000 + "\n" + "B" * 300_000 + "\n")
+    assert "B" in out, out[:200]
+    assert "A" in out
 
 
 def test_one_colossal_line_with_no_newline_is_still_reported():

@@ -95,7 +95,10 @@ CHILD_MAX_CHARS = 16000
 # `MallocStackLogging` also matches a line that MENTIONS it — and `_run_cmd` pipes this repo's own
 # recheck output through the same doorway, so a red test named for this feature would have had its
 # failing assertion censored out of the log an operator was reading to debug it.
-_CHATTER = (re.compile(r"^\S+\(\d+\) MallocStackLogging:"),)
+# `[^()\n]{0,120}` rather than `\S+`: a process name can carry spaces ("Google Chrome Helper") and
+# the line can arrive indented. BOUNDED on purpose — an unbounded `\S+(?: \S+)*` backtracks
+# quadratically against a 128 KB line that does not match, which is a fine way to wedge a logger.
+_CHATTER = (re.compile(r"^\s*[^()\n]{0,120}\(\d+\) MallocStackLogging:"),)
 
 # How much of a monstrous write we even LOOK at. `_run_script` hands over whatever the child
 # produced, and a 48 MB flood split into lines costs ~1.5x its own size in peak RSS — an
@@ -197,9 +200,12 @@ def _scan(text):
     # with no boundary at all means the write is one colossal line — keep the fragment then, rather
     # than log nothing whatsoever about it.
     hb, tb = h.rfind("\n"), tl.find("\n")
-    if hb != -1:
+    if hb > 0:
         h = h[:hb + 1]
-    if tb != -1:
+    # `tb + 1 < len(tl)` guards the case that cost the whole tail: a tail slice whose ONLY newline
+    # is its last character trimmed to "" — and the tail is where a failing command's reason lives
+    # (fresh-agent review round 2). Same "keep the fragment rather than keep nothing" rule as above.
+    if tb != -1 and tb + 1 < len(tl):
         tl = tl[tb + 1:]
     return h + "\n" + tl, len(text) - len(h) - len(tl)
 
@@ -244,7 +250,7 @@ def bounded(text, max_lines=CHILD_MAX_LINES, max_chars=CHILD_MAX_CHARS):
         if dropped:
             out += "\n[%d line(s) of macOS malloc stack-logging chatter suppressed]" % dropped
         if unscanned:
-            out += "\n[+%d chars past the scan window were not read]" % unscanned
+            out += "\n[+%d chars between the head and the tail above were not read]" % unscanned
         return out
     except Exception:
         return _BOUND_FAILED
@@ -477,7 +483,9 @@ def record_exception(exc_type, exc, tb):
     """Record an uncaught exception as this runner's exit reason."""
     if exc_type is KeyboardInterrupt or isinstance(exc, KeyboardInterrupt):
         # ^C is a signal wearing an exception's clothes. Recording it as a crash would put a
-        # phantom fault in the journal every time an operator stops a runner by hand.
+        # phantom fault in the journal every time an operator stops a runner by hand. Defence in
+        # depth rather than the usual path: `_boot_signal` intercepts ^C in the boot window and
+        # `Runner._handle_signal` owns it after that, so this fires only where neither is installed.
         return record_signal(signal.SIGINT)
     try:
         err = repr(exc) if exc is not None else str(exc_type)
@@ -504,17 +512,31 @@ def record_clean():
 def _boot_signal(signum, frame):
     """The entrypoint's stand-in handler, alive only until `Runner.run` installs the real one.
 
-    Records the reason, then dies EXACTLY as it would have without this: the default disposition is
-    restored and the signal re-raised at ourselves, so nothing about the process's fate changes —
-    only whether it left a note. Never let a failure here swallow the signal."""
+    Records the reason, then dies EXACTLY as it would have without this: whatever disposition was
+    in place before `arm()` is put back and the signal re-raised at ourselves, so nothing about the
+    process's fate changes — only whether it left a note.
+
+    The PREVIOUS handler, not ``SIG_DFL`` (fresh-agent review round 2). CPython's default for SIGINT
+    is ``signal.default_int_handler``, which RAISES KeyboardInterrupt and unwinds the stack; forcing
+    SIG_DFL turned a ^C that ran every ``finally`` into a hard kill that ran none — a leak with no
+    warning sign the moment anything up here acquires a resource in a ``with``. Restoring the real
+    predecessor also handles ``SIG_IGN`` correctly: the re-raise then does nothing, which is exactly
+    what would have happened. The KeyboardInterrupt that follows for SIGINT reaches `_excepthook`,
+    whose `record_exception` maps it back to this same signal and finds the record already spent.
+    """
     try:
         record_signal(signum)
     except Exception:
         pass
+    previous = (_STATE or {}).get("signals", {}).get(signum, signal.SIG_DFL)
+    if not (callable(previous) or previous in (signal.SIG_DFL, signal.SIG_IGN)):
+        previous = signal.SIG_DFL           # getsignal() answers None for a non-Python handler
     try:
-        signal.signal(signum, signal.SIG_DFL)
+        signal.signal(signum, previous)
     except Exception:
-        pass
+        # We could not stand down, so re-raising would re-enter THIS handler forever. The process
+        # has been asked to die; die, with the conventional status for the signal.
+        os._exit(128 + signum)
     os.kill(os.getpid(), signum)
 
 
