@@ -250,3 +250,110 @@ def test_a_live_runner_is_left_alone_in_either_home():
 def test_the_default_home_is_the_pane_so_an_unprobed_caller_keeps_todays_behaviour():
     p = liftoff.make_plan(_R, _URL, _DASH, _RUN, dashboard_up=True, runner_pid=None)
     assert p["runner"]["foreground"] is True
+
+
+# --------------------------- issue #482: never a fallback to a different repo ---------------------------
+# The #477 incident: the operator named `will-titan/agent-360-eapp` and the OTHER watched repo's
+# runner started. Two holes in the path from the typed word to the exec'd argv, both closed here.
+
+def test_a_bare_name_shared_by_two_watched_repos_refuses_naming_the_candidates():
+    # First-match-wins on a bare name is a coin flip decided by config ORDER — exactly "a fallback
+    # to a different repo". Two owners can (and do) own a repo of the same name.
+    a = _repo("will-titan/agent-360-eapp", "/co/eapp")
+    b = _repo("titancasket/agent-360-eapp", "/co/partner-eapp")
+    with pytest.raises(ValueError) as e:
+        liftoff.resolve_repo(_config(a, b), "agent-360-eapp")
+    text = str(e.value)
+    assert "agent-360-eapp" in text
+    # both candidates named, with the slugs that tell them apart — the operator can retype exactly
+    assert "will-titan/agent-360-eapp" in text and "titancasket/agent-360-eapp" in text
+
+
+def test_an_exact_slug_still_resolves_through_a_bare_name_collision():
+    # The refusal above must not cost the operator the unambiguous spelling: a full slug names
+    # exactly one repo, so it resolves even when the bare names collide.
+    a = _repo("will-titan/agent-360-eapp", "/co/eapp")
+    b = _repo("titancasket/agent-360-eapp", "/co/partner-eapp")
+    cfg = _config(a, b)
+    assert liftoff.resolve_repo(cfg, "will-titan/agent-360-eapp") is a
+    assert liftoff.resolve_repo(cfg, "titancasket/agent-360-eapp") is b
+
+
+def test_two_checkouts_of_the_same_repo_refuse_naming_their_paths():
+    # Same slug twice (two checkouts of one repo). The slug cannot tell them apart, so the refusal
+    # has to name the PATHS — the only thing that does.
+    a = _repo("o/a", "/co/a")
+    b = _repo("o/a", "/co/a-second")
+    with pytest.raises(ValueError) as e:
+        liftoff.resolve_repo(_config(a, b), "o/a")
+    text = str(e.value)
+    assert "/co/a" in text and "/co/a-second" in text
+
+
+def test_a_checkout_path_that_matches_two_entries_refuses():
+    a = _repo("o/a", "/co/shared")
+    b = _repo("o/b", "/co/shared")
+    with pytest.raises(ValueError) as e:
+        liftoff.resolve_repo(_config(a, b), "/co/shared")
+    assert "o/a" in str(e.value) and "o/b" in str(e.value)
+
+
+def test_a_duplicated_or_aliased_repo_entry_is_one_candidate_not_an_ambiguity():
+    # Refusing on COUNT alone would leave a duplicated entry unstartable by every spelling, behind a
+    # message no string can satisfy ("name one exactly", the same repo printed twice). Entries that
+    # agree on both slug and resolved checkout are the same repo written twice — same state home,
+    # same runner — so they collapse to one candidate. (fresh-agent review)
+    a = _repo("o/a", "/co/a")
+    dup = _repo("o/a", "/co/a")            # a copy-pasted config block
+    trailing = _repo("o/a", "/co/a/")      # the same path with a stray trailing slash
+    assert liftoff.resolve_repo(_config(a, dup), "o/a") is a
+    assert liftoff.resolve_repo(_config(a, dup), "a") is a
+    assert liftoff.resolve_repo(_config(a, dup), "/co/a") is a
+    assert liftoff.resolve_repo(_config(a, trailing), "o/a") is a
+
+
+def test_two_different_repos_matched_by_different_spellings_still_refuse():
+    # Cross-spelling ambiguity: `x` is one repo's bare NAME and (from this cwd) another repo's
+    # checkout PATH. Ranking the spellings would have picked one silently — which is the very thing
+    # this refuses — so all three are collected in one pass and two distinct repos raise.
+    by_name = _repo("o1/x", "/co/somewhere-else", name="x")
+    by_path = _repo("o2/y", os.path.join(os.getcwd(), "x"))
+    with pytest.raises(ValueError) as e:
+        liftoff.resolve_repo(_config(by_name, by_path), "x")
+    assert "o1/x" in str(e.value) and "o2/y" in str(e.value)
+
+
+# --------------------------- issue #482: the resolved repo must BE the one that was named --------
+# #477 asked it directly: should liftoff refuse when the resolved repo differs from the named one,
+# rather than proceed on any fallback? Yes — starting a runner writes another repo's lock, anchor and
+# home file, so there is no fallback that beats stopping. A post-condition on resolve_repo, taken at
+# the doorway where the consequence is.
+
+def test_the_repo_the_operator_named_passes_by_each_spelling_repo_arg_accepts():
+    r = _repo("will-titan/agent-360-eapp", "/co/eapp", name="agent-360-eapp")
+    assert liftoff.named_repo_mismatch(r, "will-titan/agent-360-eapp") is None   # slug
+    assert liftoff.named_repo_mismatch(r, "agent-360-eapp") is None              # bare name
+    assert liftoff.named_repo_mismatch(r, "/co/eapp") is None                    # checkout path
+    assert liftoff.named_repo_mismatch(r, "  will-titan/agent-360-eapp  ") is None
+    assert liftoff.named_repo_mismatch(r, None) is None   # named nothing -> mismatched nothing
+
+
+def test_a_resolved_repo_that_is_not_the_named_one_is_refused_naming_both():
+    # THE #477 SHAPE, stated as the guard that makes it impossible: named eApp, resolved partner.
+    partner = _repo("titancasket/titan-apps-partner", "/co/partner")
+    msg = liftoff.named_repo_mismatch(partner, "will-titan/agent-360-eapp")
+    assert msg is not None
+    assert "will-titan/agent-360-eapp" in msg              # what was named
+    assert "titancasket/titan-apps-partner" in msg         # what came back instead
+    assert "/co/partner" in msg                            # and the checkout it would have started
+    assert "started nothing" in msg
+
+
+# --------------------------- issue #482: what a start actually touches, on screen ----------------
+
+def test_the_runner_target_lines_name_the_checkout_and_the_state_home():
+    r = _repo("will-titan/agent-360-eapp", "/co/eapp")
+    r["state_home"] = "/sl/will-titan__agent-360-eapp"
+    text = liftoff.runner_target_lines(r)
+    assert "/co/eapp" in text and "/sl/will-titan__agent-360-eapp" in text
+    assert text.endswith("\n")

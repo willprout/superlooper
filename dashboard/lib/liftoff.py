@@ -149,6 +149,27 @@ def resolve_repo(config, repo_arg):
     With no ``--repo`` and exactly one watched repo, that repo is the obvious target. With no
     ``--repo`` and several, or a ``--repo`` that matches none, raise ``ValueError`` naming the
     watched repos — liftoff steers exactly one runner, so the choice must be explicit, never guessed.
+
+    **Ambiguity REFUSES; it is never broken by config order (issue #482).** Every watched repo is
+    tested against all three spellings in ONE pass and the matches are collected, not returned on
+    sight. More than one distinct repo matching raises, naming each candidate by slug AND resolved
+    checkout — which of the two tells them apart depends on the collision: same name under different
+    owners ⇒ the slug; one repo checked out twice ⇒ only the path can. First-match-wins is a coin
+    flip decided by the order somebody happened to list their repos in, and both of those collisions
+    are ordinary (two owners can own a repo of the same name; a repo can be checked out twice). In
+    either case liftoff used to start a repo the operator did not name — the #477 outcome — and say
+    nothing.
+
+    Collecting rather than ranking is deliberate: a priority order (slug beats name beats path)
+    would still resolve a genuine cross-spelling collision silently, which is the very thing this
+    refuses. The unambiguous spelling is not lost to it — a full slug names exactly one watched
+    repo, so it still resolves through a bare-name collision.
+
+    Two entries that agree on BOTH slug and resolved checkout are ONE candidate, not an ambiguity:
+    a duplicated or aliased ``repos`` entry (a copy-pasted block, ``~/co/a`` beside ``/Users/w/co/a``,
+    a stray trailing slash) is provably the same repo and the same state home either way. Counting
+    those as two would refuse with a message no string could satisfy — the same path printed twice
+    under "name one exactly" — and leave that repo unstartable by any spelling (fresh-agent review).
     """
     repos = config["repos"]
     slugs = ", ".join(r["slug"] for r in repos)
@@ -160,10 +181,78 @@ def resolve_repo(config, repo_arg):
             "--repo <slug|name|path> (watched: %s)" % (len(repos), slugs))
     want = repo_arg.strip()
     want_path = os.path.abspath(os.path.expanduser(want))
+    matched, seen = [], set()
     for r in repos:
-        if want in (r["slug"], r.get("name")) or want_path == os.path.abspath(r["path"]):
-            return r
+        if want not in (r["slug"], r.get("name")) and want_path != os.path.abspath(r["path"]):
+            continue
+        key = (r["slug"], os.path.abspath(r["path"]))
+        if key in seen:
+            continue
+        seen.add(key)
+        matched.append(r)
+    if len(matched) == 1:
+        return matched[0]
+    if matched:
+        candidates = "; ".join("%s at %s" % (r["slug"], os.path.abspath(r["path"]))
+                               for r in matched)
+        raise ValueError(
+            "--repo %r matches %d watched repos — liftoff starts exactly one runner and will not "
+            "pick for you. Name one exactly (%s)" % (repo_arg, len(matched), candidates))
     raise ValueError("--repo %r matches no watched repo (watched: %s)" % (repo_arg, slugs))
+
+
+def named_repo_mismatch(repo, repo_arg):
+    """``None`` if ``repo`` really is the repo the operator NAMED — else the refusal to print,
+    having started nothing (issue #482; the #477 incident was "named eApp, started the partner").
+
+    This is issue #477's second question answered in code: should liftoff proceed when the repo it
+    resolved is not the one that was asked for? No — it refuses. Starting a runner is not a read: it
+    claims a tab, writes another repo's ``runner.lock``, anchor and home file, and sets a loop
+    working on issues nobody pointed it at. There is no fallback that beats stopping and saying so.
+
+    Honest about what it is: a post-condition restating ``resolve_repo``'s own predicates, so
+    against TODAY's resolver it cannot fire — what actually keeps the two repos apart is that
+    ``lib/config.py`` derives each entry's slug FROM its checkout on every load, leaving nothing to
+    drift. Its value is placement, not cleverness. It converts one whole class of future failure —
+    a matching rule someone loosens, a config shape nobody anticipated, a refactor that crosses the
+    wires — from a silent start on the wrong loop into a refusal naming both repos, and it sits at
+    the doorway where the consequence is rather than beside the rules it checks. #477 cost hours
+    precisely because a wrong start looked exactly like a right one.
+
+    ``repo_arg`` of ``None`` names nothing and mismatches nothing: that is the single-watched-repo
+    case, where ``resolve_repo`` has already refused to guess among several.
+    """
+    if repo_arg is None:
+        return None
+    want = repo_arg.strip()
+    if want in (repo["slug"], repo.get("name")):
+        return None
+    if os.path.abspath(os.path.expanduser(want)) == os.path.abspath(repo["path"]):
+        return None
+    return ("--repo %r resolved to %s — a DIFFERENT repo from the one you named, so liftoff started "
+            "nothing.\n"
+            "  you named:   %s\n"
+            "  it resolved: %s at %s\n"
+            "  Starting that would have run %s's loop and written its runner lock, anchor and home "
+            "file. Re-run naming one watched repo exactly, by slug, bare name, or checkout path."
+            % (repo_arg, repo["slug"], want, repo["slug"], repo["path"], repo["slug"]))
+
+
+def runner_target_lines(repo):
+    """The two facts that say WHICH loop a start actually touches: the checkout path liftoff hands
+    the engine, and the state home that gets written (issue #482).
+
+    Printed beside every runner line — started or left alone. liftoff used to name only the slug it
+    believed, which is why the #477 forensics could not attribute a wrong start from the operator's
+    own screen: the slug was right, and the two facts that were not were never shown. These are the
+    same two the refusals above talk about, so a healthy run and a refused one read the same way.
+
+    The checkout is printed RESOLVED. ``lib/config.py`` only ``expanduser``s a configured path, so a
+    relative ``repos[].path`` reaches here relative (#483) — and a relative path on screen is exactly
+    as unattributable afterwards as the slug this line exists to supplement.
+    """
+    return "  checkout: %s\n  state:    %s\n" % (os.path.abspath(repo["path"]),
+                                                  repo["state_home"])
 
 
 def runner_argv(superlooper_cli, repo_path):
