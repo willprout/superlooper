@@ -659,6 +659,20 @@ def route(method, path, snapshot_provider, static_root, *, actions=None, body=b"
 
 # =============================== the server (loopback only) ===============================
 
+# The "the client went away" family. A dropped socket is routine traffic on a 2-second poll, not a
+# fault: the browser tab was closed, reloaded, or backgrounded while a response was in flight. Kept
+# as an explicit, narrow tuple — never a bare ``except OSError`` — so a real write fault (a full
+# disk, a bug in the write path) still surfaces in full (issue #481).
+_GONE_PEER = (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)
+
+
+def _log_client_gone(method, path):
+    """One concise line for a client that hung up. The wording is deliberately STABLE (no pid, no
+    port, no errno): ``lib/logbook``'s collapser keys on the sentence, so 282 of these collapse to
+    a handful of counted records instead of 282 separate entries."""
+    sys.stderr.write("command-center: client disconnected during %s %s\n" % (method, path))
+
+
 def make_handler(snapshot_provider, static_root, actions=None, desk=None, tidy=None, restart=None,
                  janitor=None, replay_provider=None, digest_provider=None, version=None,
                  fixer=None, session_window=None, stopswitch=None):
@@ -679,14 +693,22 @@ def make_handler(snapshot_provider, static_root, actions=None, desk=None, tidy=N
             return
 
         def _write(self, resp):
-            self.send_response(resp.status)
-            self.send_header("Content-Type", resp.content_type)
-            self.send_header("Content-Length", str(len(resp.body)))
-            for k, v in resp.headers.items():
-                self.send_header(k, v)
-            self.end_headers()
-            if self.command != "HEAD":
-                self.wfile.write(resp.body)
+            try:
+                self.send_response(resp.status)
+                self.send_header("Content-Type", resp.content_type)
+                self.send_header("Content-Length", str(len(resp.body)))
+                for k, v in resp.headers.items():
+                    self.send_header(k, v)
+                self.end_headers()
+                if self.command != "HEAD":
+                    self.wfile.write(resp.body)
+            except _GONE_PEER:
+                # The front-end polls every 2 seconds, so a tab that is closed, reloaded or
+                # backgrounded mid-poll drops the socket before the body is written. That is a
+                # non-event, and on 2026-09-09 it was the SECOND-largest contributor to a 331 MB
+                # unreadable log: 282 full BrokenPipeError tracebacks (issue #481, evidence #477).
+                # One concise line, in a stable shape lib/logbook's collapser can count.
+                _log_client_gone(self.command, self.path)
 
         def _read_body(self):
             try:
@@ -721,6 +743,28 @@ def make_handler(snapshot_provider, static_root, actions=None, desk=None, tidy=N
     return _Handler
 
 
+class _LoopbackServer(ThreadingHTTPServer):
+    """``ThreadingHTTPServer`` with one thing changed: a client that hangs up is not an error.
+
+    ``socketserver.BaseServer.handle_error`` answers *anything* that escapes a handler with forty
+    dashes and a full traceback. For a gone peer that is the wrong shape of truth — a reload during
+    a 2-second poll is normal traffic — and repeated 282 times it is what made the 2026-09-09 log
+    unreadable (issue #481, evidence record #477 item 1). ``_write`` already catches the disconnect
+    on the response half; this is the belt to that brace, because the *request* half (``rfile``
+    reads, header parsing) breaks the same way and never passes through ``_write`` at all.
+
+    A real fault keeps its traceback in full — that is the whole point of the narrow
+    :data:`_GONE_PEER` tuple."""
+
+    def handle_error(self, request, client_address):
+        exc = sys.exc_info()[1]
+        if isinstance(exc, _GONE_PEER):
+            sys.stderr.write("command-center: client disconnected mid-request (%s)\n"
+                             % type(exc).__name__)
+            return
+        ThreadingHTTPServer.handle_error(self, request, client_address)
+
+
 def build_server(snapshot_provider, static_root, port=8611, host=BIND_HOST, actions=None, desk=None,
                  tidy=None, restart=None, janitor=None, replay_provider=None, digest_provider=None,
                  version=None, fixer=None, session_window=None, stopswitch=None):
@@ -740,10 +784,10 @@ def build_server(snapshot_provider, static_root, port=8611, host=BIND_HOST, acti
         raise ValueError(
             "command center binds %s only (refusing %r) — it can write GitHub labels, so it must "
             "never be reachable off the machine" % (BIND_HOST, host))
-    return ThreadingHTTPServer((host, port),
-                               make_handler(snapshot_provider, static_root, actions, desk, tidy,
-                                            restart, janitor, replay_provider, digest_provider,
-                                            version, fixer, session_window, stopswitch))
+    return _LoopbackServer((host, port),
+                           make_handler(snapshot_provider, static_root, actions, desk, tidy,
+                                        restart, janitor, replay_provider, digest_provider,
+                                        version, fixer, session_window, stopswitch))
 
 
 # =============================== CachedGh — the gh slow clock (decision B.2) ===============================

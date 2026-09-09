@@ -37,6 +37,7 @@ import desk as desk_mod       # noqa: E402
 import engine as engine_mod   # noqa: E402
 import fixer as fixer_mod     # noqa: E402
 import gh                     # noqa: E402
+import logbook as logbook_mod  # noqa: E402
 import pollers                # noqa: E402
 import janitor as janitor_mod  # noqa: E402
 import restart as restart_mod # noqa: E402
@@ -247,4 +248,16 @@ def main(argv):
 
 
 if __name__ == "__main__":
+    # The logbook (issue #481) takes over THIS PROCESS's stdout+stderr before anything is written to
+    # them: from here on every line reaching the launcher's log file — ours, and any descendant's on
+    # the fd 2 it inherits — is timestamped, a repeating line is collapsed to a bounded count, and
+    # the file itself can never exceed lib/logbook.MAX_BYTES. On 2026-09-09 that log reached 331 MB
+    # / 3.4M lines of one repeating child message with no timestamps (evidence record #477 item 1),
+    # which buried the ~3,700 lines that mattered.
+    #
+    # It is installed HERE, in the process entry point, and never inside main(): owning a process's
+    # file descriptors is a thing only the real process may do — a library or a test that did it
+    # would hijack its caller's streams. Everything downstream of the takeover (the stamping, the
+    # collapsing, the cap) is plain injectable code, unit-tested in tests/test_logbook.py.
+    logbook_mod.install()
     sys.exit(main(sys.argv))
