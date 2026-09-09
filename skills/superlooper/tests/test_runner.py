@@ -7638,3 +7638,95 @@ def test_absorb_on_a_freshly_launched_lane_closes_its_merged_issue(rig, monkeypa
     assert rig.r._execute({"act": "absorb_merged", "id": "i5", "num": 5, "pr": 555}, NOW) == "ok"
     assert [m["num"] for m in mutations(rig) if m["kind"] == "close_issue"] == ["5"]
     assert issue_state(rig, "i5")["status"] == "merged"
+
+
+# --------------------------- exit visibility (issue #480) ---------------------------
+# The 2026-09-09 incident: a pane-home runner exited leaving NOTHING — no log line, no journal
+# record, a watchdog still reading "healthy". Two guarantees the SHELL owes, pinned here; the
+# machinery itself is tested in test_runner_log.py.
+
+@pytest.fixture
+def armed(rig):
+    """runner_log armed against this rig's state home, always disarmed afterwards (it wraps
+    sys.stderr and installs an excepthook — process-global state no test may leak)."""
+    import io as _io
+    import runner_log
+    runner_log.arm(str(rig.home), stream=_io.StringIO())
+    try:
+        yield runner_log
+    finally:
+        runner_log.disarm()
+
+
+def _exit_records(rig):
+    return [r for r in journal.read(str(rig.home)) if r.get("act") == "runner_exit"]
+
+
+def test_sigterm_records_its_reason_before_the_fail_stop(rig, armed):
+    rig.r._handle_signal(signal.SIGTERM, None)
+    assert rig.r.stop is True                       # unchanged: fail-stopped, in-flight untouched
+    rec = _exit_records(rig)
+    assert len(rec) == 1
+    assert rec[0]["reason"] == "signal" and rec[0]["signal"] == "SIGTERM"
+
+
+def test_sigint_records_its_own_signal(rig, armed):
+    rig.r._handle_signal(signal.SIGINT, None)
+    assert _exit_records(rig)[0]["signal"] == "SIGINT"
+
+
+def test_a_signal_on_an_unarmed_runner_is_still_a_clean_fail_stop(rig):
+    # Nothing armed (a Runner built by a test, a one-shot CLI): the handler must behave exactly as
+    # it always did. Observability is never a new way for the loop to break.
+    rig.r._handle_signal(signal.SIGTERM, None)
+    assert rig.r.stop is True
+    assert _exit_records(rig) == []
+
+
+def _runner_log_text(rig):
+    p = rig.home / "logs" / "runner.log"
+    return p.read_text() if p.exists() else ""
+
+
+def test_a_noisy_child_cannot_flood_the_runner_log(rig):
+    # #477 item 1c: a per-tick child emitted thousands of identical lines. The bound lives at
+    # _log — the ONE doorway into runner.log — so no spawn helper can route around it.
+    rig.r._log("\n".join(["worker: retrying"] * 5000))
+    text = _runner_log_text(rig)
+    assert len(text.splitlines()) < 5
+    assert "worker: retrying" in text and "5000" in text
+
+
+def test_malloc_chatter_from_a_child_never_reaches_the_runner_log(rig):
+    rig.r._log("Python(3938) MallocStackLogging: can't turn off malloc stack logging "
+               "because it was not enabled.\n")
+    assert _runner_log_text(rig) == ""
+
+
+def test_a_scripts_real_stderr_still_reaches_the_log_beside_the_chatter(rig):
+    rig.r._log("Python(3938) MallocStackLogging: not enabled.\nFATAL: Pane or workspace not found\n")
+    text = _runner_log_text(rig)
+    assert "FATAL: Pane or workspace not found" in text
+    assert "MallocStackLogging" not in text
+
+
+def test_ordinary_short_log_lines_are_untouched(rig):
+    rig.r._log("morning report 2026-09-09: notify [imessage ok=True rc=0]")
+    assert _runner_log_text(rig) == "morning report 2026-09-09: notify [imessage ok=True rc=0]\n"
+
+
+def test_a_scripts_captured_output_goes_through_the_bound(rig, monkeypatch):
+    # The spawn helper's own path, end to end: subprocess.run is stubbed (no real binary), and what
+    # the child screamed reaches the log only in its bounded form.
+    class _Ran:
+        returncode = 3
+        stdout = ""
+        stderr = "\n".join(["stack smashing"] * 4000)
+
+    monkeypatch.setattr(runner_mod.subprocess, "run", lambda *a, **k: _Ran())
+    r = runner_mod.Runner(repo=str(rig.repo), config=make_config(), state_home=str(rig.home),
+                          pane="p", fetch_usage=lambda: {})
+    out = r._run_script(["/nonexistent/launch-session.py"])
+    assert int(out) == 3 and "stack smashing" in out.stderr_tail   # caller evidence intact
+    text = _runner_log_text(rig)
+    assert len(text.splitlines()) < 5 and "4000" in text

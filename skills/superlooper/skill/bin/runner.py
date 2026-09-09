@@ -44,6 +44,7 @@ import panes as panes_lib
 import phase as phase_mod
 import published_view
 import runner_home
+import runner_log
 import session_host
 import tidy
 import usage as usage_mod
@@ -1045,6 +1046,16 @@ class Runner:
                 _rm(path)
 
     def _handle_signal(self, signum, frame):
+        # Leave a reason BEFORE the flag (issue #480). A runner that is signalled away used to go
+        # exactly as quietly as one that crashed — the 2026-09-09 eApp exit left no log line, no
+        # journal record, and a watchdog still reading "healthy". This writes ONE `runner_exit` act
+        # naming the signal; it is a no-op in any process that never armed (a unit test's Runner, a
+        # one-shot CLI verb), and it is guarded, because observability must never become a new way
+        # for the loop to die inside a signal handler.
+        try:
+            runner_log.record_signal(signum)
+        except Exception:
+            pass
         # Fail-stopped by design: in-flight sessions untouched, nothing merges while down.
         self.stop = True
 
@@ -2584,13 +2595,25 @@ class Runner:
             return 127
 
     def _log(self, text):
+        """The ONE doorway into runner.log — and therefore where the bound lives (issue #480).
+
+        Bounding here rather than at each spawn helper in turn is the point: #477 item 1c is a child
+        that printed thousands of identical lines, and a rule enforced at the door cannot be routed
+        around by the next executor somebody adds. `runner_log.bounded` folds identical runs to one
+        line and a count, caps the rest head-and-tail, and drops the one known-benign runtime
+        chatter pattern outright — so a call whose entire content was chatter writes NOTHING, which
+        is the only bound that actually holds when the noise arrives one line per tick forever.
+        Short ordinary lines (every other caller here) pass through untouched. The write itself
+        moves to `runner_log.append_log` for the encoding reason named there: this used to catch
+        OSError alone, and a UnicodeEncodeError (a launchd-started runner inherits an ASCII locale,
+        and a script's stderr is full of em-dashes) is not one — it would leave the logger and land
+        in the tick that called it.
+        """
+        text = runner_log.bounded(text)
         if not text:
             return
-        try:
-            with open(os.path.join(self.home, "logs", "runner.log"), "a") as f:
-                f.write(text if text.endswith("\n") else text + "\n")
-        except OSError:
-            pass
+        runner_log.append_log(runner_log.log_path(self.home),
+                              text if text.endswith("\n") else text + "\n")
 
     def _script_env(self, model, effort=""):
         # SL_EFFORT is empty by default; a value comes from a per-issue effort:* label or the
