@@ -486,3 +486,20 @@ def test_the_tail_survives_a_write_whose_tail_slice_holds_one_huge_line():
 def test_one_colossal_line_with_no_newline_is_still_reported():
     out = runner_log.bounded("q" * 4_000_000)
     assert out and "q" in out and len(out) <= runner_log.CHILD_MAX_CHARS + 300
+
+
+def test_a_signal_the_process_was_already_ignoring_is_not_an_exit_reason(home):
+    # Restoring the true predecessor (rather than SIG_DFL) made the process's FATE right, but opened
+    # one case where it survives the signal: SIG_IGN. Recording then spends the single record this
+    # process gets on a signal it lived through — a false "the runner exited" against a live runner,
+    # and silence at its real death (review round 2, residual).
+    before = signal.getsignal(signal.SIGINT)
+    try:
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        runner_log.arm(str(home), stream=io.StringIO())
+        signal.getsignal(signal.SIGINT)(signal.SIGINT, None)   # the ignored signal arrives
+        assert _exits(home) == []
+        assert runner_log.record_signal(signal.SIGTERM) is True   # the record is NOT spent
+        assert _exits(home)[0]["signal"] == "SIGTERM"
+    finally:
+        signal.signal(signal.SIGINT, before)

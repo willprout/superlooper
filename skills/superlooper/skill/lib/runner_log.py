@@ -427,10 +427,10 @@ def stand_down():
     """Renounce the exit record: this process turned out NOT to be the runner.
 
     `arm()` runs at the CLI entrypoint, which is above `acquire_singleton()` — so a second
-    `superlooper run` against a live home (an operator opening a diagnostic tab, the dashboard's
-    Liftoff button, a watchdog kickstart racing a runner that already recovered) would arm, lose the
-    singleton, exit, and write "the runner exited" into the LIVE runner's journal while that runner
-    is perfectly healthy. That is the exact false signal this whole feature exists to make
+    `superlooper run` against a live home (an operator opening a diagnostic tab, a local ops UI over
+    the loop shelling the same verb, a watchdog kickstart racing a runner that already recovered)
+    would arm, lose the singleton, exit, and write "the runner exited" into the LIVE runner's
+    journal while that runner is perfectly healthy. That is the exact false signal this whole feature exists to make
     trustworthy (fresh-agent review).
 
     Only the exit act is renounced. The stderr tee STAYS armed: "another runner is live for this
@@ -524,11 +524,18 @@ def _boot_signal(signum, frame):
     what would have happened. The KeyboardInterrupt that follows for SIGINT reaches `_excepthook`,
     whose `record_exception` maps it back to this same signal and finds the record already spent.
     """
+    previous = (_STATE or {}).get("signals", {}).get(signum, signal.SIG_DFL)
+    if previous is signal.SIG_IGN:
+        # The process was IGNORING this signal before we armed, so it is not going to die of it and
+        # it is not an exit reason (fresh-agent review round 2, residual). Recording one would spend
+        # the single record this process gets on a signal it survived — a false "the runner exited"
+        # against a live runner, and silence at its real death. Restoring the predecessor made the
+        # process's FATE right; this makes the RECORD right too.
+        return
     try:
         record_signal(signum)
     except Exception:
         pass
-    previous = (_STATE or {}).get("signals", {}).get(signum, signal.SIG_DFL)
     if not (callable(previous) or previous in (signal.SIG_DFL, signal.SIG_IGN)):
         previous = signal.SIG_DFL           # getsignal() answers None for a non-Python handler
     try:
