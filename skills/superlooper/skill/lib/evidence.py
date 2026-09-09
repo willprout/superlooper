@@ -40,6 +40,24 @@ SCREEN_SNIPPET_MAX = 800
 _ELLIPSIS = "…"
 
 
+def scrub(text):
+    """Drop C0/C1 control bytes except \n and \t, so a binary or an ANSI-painted TUI screen can
+    never ride into a record a human reads. \r collapses into \n: a TUI screen is full of them and
+    a bare \r would overwrite the line in whatever renders the text. "" for a non-string.
+
+    Split out of bound() (issue #480) because `runner_log` needs the same CONTENT rule with a
+    different CAP: a journal record or a GitHub memo wants the last N chars, a log file wants head
+    AND tail. One policy on what may appear, two policies on how much.
+    """
+    if not isinstance(text, str):
+        return ""
+    cleaned = []
+    for ch in text.replace("\r\n", "\n").replace("\r", "\n"):
+        if ch in "\n\t" or (ord(ch) >= 32 and not (127 <= ord(ch) <= 159)):
+            cleaned.append(ch)
+    return "".join(cleaned)
+
+
 def bound(text, limit=STDERR_TAIL_MAX):
     """Sanitize and cap caller-controlled captured text; "" for anything unusable.
 
@@ -48,15 +66,7 @@ def bound(text, limit=STDERR_TAIL_MAX):
     or a GitHub memo. Newlines and tabs survive — a stderr tail and a screen snippet are multi-line,
     and flattening them would cost the reader the shape of the error. Keeps the LAST `limit` chars.
     """
-    if not isinstance(text, str):
-        return ""
-    # Drop C0/C1 control bytes except \n and \t (\r collapses into \n: a TUI screen is full of them
-    # and a bare \r would overwrite the line in a terminal that renders the memo).
-    cleaned = []
-    for ch in text.replace("\r\n", "\n").replace("\r", "\n"):
-        if ch in "\n\t" or (ord(ch) >= 32 and not (127 <= ord(ch) <= 159)):
-            cleaned.append(ch)
-    out = "".join(cleaned).strip()
+    out = scrub(text).strip()
     if not out:
         return ""
     if not isinstance(limit, int) or limit < 1:

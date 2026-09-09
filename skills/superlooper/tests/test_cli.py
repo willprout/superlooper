@@ -3442,9 +3442,12 @@ def test_a_signalled_runner_records_the_signal_that_killed_it(rig):
     # The whole point of the issue, driven for real: a live runner, a real SIGTERM, and a durable
     # record of WHY afterwards. Backgrounded with Popen so only THIS pid is ever signalled.
     env = {**rig.env, "SL_CMUX": _cmux_stub(rig, resolve=True)}
+    # Output to FILES, not pipes: this child is unbounded (no --ticks), and an undrained pipe that
+    # fills is the classic Popen deadlock. Files cannot fill.
+    out, err = rig.tmp / "live.out", rig.tmp / "live.err"
+    fo, fe = out.open("w"), err.open("w")
     p = subprocess.Popen([sys.executable, str(CLI), "run", "--repo", str(rig.repo),
-                          "--pane", "p1"], env=env, stdout=subprocess.PIPE,
-                         stderr=subprocess.PIPE, text=True)
+                          "--pane", "p1"], env=env, stdout=fo, stderr=fe, text=True)
     hb = rig.tmp / "slhome" / "o__r" / "state" / "runner.heartbeat"
     try:
         deadline = time.time() + 60
@@ -3457,6 +3460,8 @@ def test_a_signalled_runner_records_the_signal_that_killed_it(rig):
         if p.poll() is None:
             p.kill()
             p.wait(timeout=30)
+        fo.close()
+        fe.close()
     rec = _exit_records(rig)
     assert len(rec) == 1, rec
     assert rec[0]["reason"] == "signal" and rec[0]["signal"] == "SIGTERM"

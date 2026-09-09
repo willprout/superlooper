@@ -1424,6 +1424,12 @@ class Runner:
     def run(self, max_ticks=None, sleep=time.sleep):
         if not self.acquire_singleton():
             print("another runner is live for this state home — exiting", file=sys.stderr)
+            # This process is NOT the runner, so it must leave no exit record in the live runner's
+            # journal (issue #480, fresh-agent review): arming happens at the CLI entrypoint, which
+            # is above this check, and an operator's diagnostic second start would otherwise write
+            # "the runner exited" against a runner that is perfectly healthy. The line above still
+            # reaches the log — that somebody tried is worth knowing.
+            runner_log.stand_down()
             return 1
         # Hygiene (fresh-agent review): consume any lingering re-exec adopt token so it can never be
         # inherited by a worker subprocess. acquire_singleton already pops it on the adoption path;
@@ -1477,6 +1483,10 @@ class Runner:
                       "ALERT and the notification. Fix it (check gh auth / re-run `superlooper "
                       "adopt`, both idempotent) and restart the runner.", file=sys.stderr)
                 return 2
+            # Past every boot refusal: from here a clean exit is a runner that RAN and stopped, not
+            # one that never started (issue #480, fresh-agent review). Both are recorded; recording
+            # them under the same word would make "the runner exited" unreadable.
+            runner_log.note_started()
             while not self.stop and (max_ticks is None or ticks < max_ticks):
                 try:
                     self.tick()

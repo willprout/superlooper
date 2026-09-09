@@ -25,12 +25,21 @@ Three properties, deliberately independent — each survives the other two faili
   C-level writes straight to fd 2 (a crashing extension, dyld's own chatter). Stated here rather
   than implied: the tee makes a Python-level death legible, not a segfault.
 
+  One asymmetry survives on purpose. The login-item plist points StandardOUTPath at the same file,
+  so that home's log also carries the boot line naming the pane and workspace; the tee wraps stderr
+  only, so the pane home's log does not. Wrapping stdout as well would be a second, wider change to
+  what an interactive CLI prints, and the exit reason — the thing that was missing — is on stderr.
+
 * **The exit record.** An uncaught exception or a terminating signal writes exactly ONE
   ``runner_exit`` journal act naming the reason, before the process dies. The journal is the durable
   half — it is timestamped, it is what the morning report and the dashboard read, and it survives a
   pane the tee cannot save. Exactly one, however many hooks fire: a SIGTERM sets the fail-stop flag,
   ``run()`` returns normally, and the interpreter then exits, so the same death reaches three hooks,
   and a log that says the runner exited three times is a log that lies.
+
+  The signal path writes from inside the handler, ahead of the fail-stop flag, and `journal.append`
+  fsyncs — so on a stalled disk the stop is delayed by that fsync. Deliberate: a reason that is not
+  on disk when the process dies is not a reason, and the runner is fail-stopped either way.
 
 * **The bound.** Everything the runner logs goes through ``bounded()`` at ``Runner._log`` — the one
   doorway into ``runner.log`` — so the guarantee is structural rather than a promise made at each
@@ -50,6 +59,7 @@ import signal
 import sys
 import traceback
 
+import evidence
 import journal
 
 # The journal act. One name for every way a runner can go, with `reason` telling them apart —
@@ -80,7 +90,23 @@ CHILD_MAX_CHARS = 16000
 # flood is ACROSS invocations — one line per tick per child, which is still a flood at one line a
 # tick. Keep this list short and provable: a pattern here is output nobody will ever read, and the
 # cap above — not this list — is what actually bounds an unknown noisy child.
-_CHATTER = (re.compile(r"MallocStackLogging"),)
+#
+# ANCHORED to the whole line's shape, not a substring search (fresh-agent review). An unanchored
+# `MallocStackLogging` also matches a line that MENTIONS it — and `_run_cmd` pipes this repo's own
+# recheck output through the same doorway, so a red test named for this feature would have had its
+# failing assertion censored out of the log an operator was reading to debug it.
+_CHATTER = (re.compile(r"^\S+\(\d+\) MallocStackLogging:"),)
+
+# How much of a monstrous write we even LOOK at. `_run_script` hands over whatever the child
+# produced, and a 48 MB flood split into lines costs ~1.5x its own size in peak RSS — an
+# out-of-memory death inside the logger, which is the one place that must never be able to kill the
+# loop. Clipped head-and-tail FIRST, before anything walks the string. A flood past this loses the
+# exact suppressed-line count in the note below; a runner that dies bounding its log loses more.
+_SCAN_MAX = CHILD_MAX_CHARS * 16
+
+# Returned when bounding itself fails (a MemoryError on something pathological). A fixed, already
+# allocated string: whatever went wrong, saying so costs nothing and silence would be a lie.
+_BOUND_FAILED = "[runner_log: this output could not be bounded, and was dropped]"
 
 # Process-global by design, exactly like `gh.set_repo` / `gh.set_telemetry`: this is a posture the
 # ONE long-lived runner process adopts at its entrypoint, and a Runner built inside a unit test or a
@@ -101,6 +127,12 @@ def _clip(text, limit):
     and for a script's output the head names what ran and the tail carries why it failed."""
     if not isinstance(text, str):
         return ""
+    # A limit of 0 or 1 would make `tail` 0, and `text[-0:]` is the WHOLE string — a bound that
+    # silently un-bounds itself, and for `_cap_lines` below one that RETURNS MORE than it was given
+    # (fresh-agent review). These are public parameters; a caller must not be able to switch the
+    # guarantee off by passing a small number. Same clamp `evidence.bound` uses on its own limit.
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit < 2:
+        limit = CHILD_MAX_CHARS
     if len(text) <= limit:
         return text
     head = limit // 2
@@ -119,6 +151,13 @@ def _fold(lines):
     would change what the log says happened."""
     runs = []
     for line in lines:
+        if not line.strip():
+            # A run of blank lines collapses to ONE blank line, unlabelled: `_run_script` hands over
+            # stdout concatenated with stderr, so blank runs are ordinary, and "[x40 identical
+            # lines]" against nothing is a count of nothing (fresh-agent review).
+            if not (runs and not runs[-1][0].strip()):
+                runs.append([line, 1])
+            continue
         if runs and runs[-1][0] == line:
             runs[-1][1] += 1
         else:
@@ -127,12 +166,42 @@ def _fold(lines):
 
 
 def _cap_lines(lines, max_lines):
+    # Three is the floor a head/marker/tail split needs; below it the `[-0:]` slice above returns
+    # everything. See _clip's note.
+    if not isinstance(max_lines, int) or isinstance(max_lines, bool) or max_lines < 3:
+        max_lines = CHILD_MAX_LINES
     if len(lines) <= max_lines:
         return lines
     head = max_lines // 2
     tail = max_lines - head - 1
     dropped = len(lines) - head - tail
     return lines[:head] + ["...<%d more line(s) dropped>..." % dropped] + lines[-tail:]
+
+
+def _scan(text):
+    """The slice of a monstrous write we actually look at, and how many chars we did not.
+
+    Head AND tail, joined by a newline so two partial lines never glue into one bogus line — and
+    deliberately NOT `_clip`, because `_clip` splices a marker line into the text and a marker line
+    is not chatter: doing it that way defeated the "nothing but chatter says nothing" rule outright
+    (caught by this module's own test). The accounting is returned instead, and declared at the end
+    only when something real survived.
+    """
+    if len(text) <= _SCAN_MAX:
+        return text, 0
+    head, tail = _SCAN_MAX // 2, _SCAN_MAX - _SCAN_MAX // 2
+    h, tl = text[:head], text[-tail:]
+    # A byte offset lands MID-LINE, and a fragment is not a line: half a chatter line no longer
+    # looks like chatter, survives the filter, and lands in the log as a sentence with its subject
+    # cut off (caught by this module's own test). Trim each half back to a line boundary. A half
+    # with no boundary at all means the write is one colossal line — keep the fragment then, rather
+    # than log nothing whatsoever about it.
+    hb, tb = h.rfind("\n"), tl.find("\n")
+    if hb != -1:
+        h = h[:hb + 1]
+    if tb != -1:
+        tl = tl[tb + 1:]
+    return h + "\n" + tl, len(text) - len(h) - len(tl)
 
 
 def bounded(text, max_lines=CHILD_MAX_LINES, max_chars=CHILD_MAX_CHARS):
@@ -145,22 +214,40 @@ def bounded(text, max_lines=CHILD_MAX_LINES, max_chars=CHILD_MAX_CHARS):
     When real output survives beside dropped chatter the drop IS declared, so nothing vanishes from
     a log an operator is reading for a reason.
 
-    Fail-open on wrong-typed input (never raise into a tick): a non-string reads as nothing to log.
+    A write past ``_SCAN_MAX`` is sliced head-and-tail BEFORE anything walks it, and how much went
+    unread is declared alongside the result — a bound that cost a runner its memory would be the
+    wrong trade in the one place that must never be able to kill the loop.
+
+    Never raises: a non-string reads as nothing to log, and anything else that goes wrong in here
+    returns a fixed short line saying so rather than escaping into the tick that called it.
     """
     if not isinstance(text, str) or not text.strip():
         return ""
-    kept, dropped = [], 0
-    for line in text.splitlines():
-        if _is_chatter(line):
-            dropped += 1
-        else:
-            kept.append(line)
-    if not any(ln.strip() for ln in kept):
-        return ""
-    out = "\n".join(_cap_lines(_fold(kept), max_lines))
-    if dropped:
-        out += "\n[%d line(s) of macOS malloc stack-logging chatter suppressed]" % dropped
-    return _clip(out, max_chars)
+    try:
+        # Slice BEFORE walking it (see _SCAN_MAX), scrub second: `evidence.scrub` builds a list the
+        # size of its input, so this order is what keeps a 48 MB child from costing 74 MB of RSS
+        # inside the logger. `splitlines()` also normalises the exotic separators (\x0b \x0c \x1c-\x1e
+        # \x85 \u2028 \u2029) to \n — accepted: a log file is lines, and the alternative is a
+        # separator nobody can grep for.
+        text, unscanned = _scan(text)
+        kept, dropped = [], 0
+        for line in evidence.scrub(text).splitlines():
+            if _is_chatter(line):
+                dropped += 1
+            else:
+                kept.append(line)
+        if not any(ln.strip() for ln in kept):
+            return ""
+        # Clipped FIRST, then the notes, so the notes cannot themselves be clipped away — a bound
+        # that silently drops its own accounting is how a log stops being trustworthy.
+        out = _clip("\n".join(_cap_lines(_fold(kept), max_lines)), max_chars)
+        if dropped:
+            out += "\n[%d line(s) of macOS malloc stack-logging chatter suppressed]" % dropped
+        if unscanned:
+            out += "\n[+%d chars past the scan window were not read]" % unscanned
+        return out
+    except Exception:
+        return _BOUND_FAILED
 
 
 # ------------------------------- the tee -------------------------------
@@ -279,10 +366,21 @@ def arm(state_home, stream=None, append=None):
     teed = not _already_lands_in(target, path)
     if teed:
         sys.stderr = Tee(target, path)
-    _STATE = {"home": home, "log": path, "teed": teed, "wrote": False,
+    _STATE = {"home": home, "log": path, "teed": teed, "wrote": False, "started": False,
               "append": append or journal.append,
-              "stderr": original, "excepthook": sys.excepthook}
+              "stderr": original, "excepthook": sys.excepthook, "signals": {}}
     sys.excepthook = _excepthook
+    # The window this covers is the reason arming sits at the entrypoint at all (fresh-agent
+    # review). `Runner.run` installs the real handlers, but only AFTER the CLI has resolved the
+    # anchor (a multiplexer subprocess), run the pane preflight (another), and in the login-item
+    # home checked gh auth over the NETWORK — seconds in which SIGTERM was still SIG_DFL and a
+    # `superlooper stop` killed the process with nothing written down. This records and then dies
+    # exactly as it would have; run()'s own handler replaces it, unchanged, a moment later.
+    for signum in (signal.SIGTERM, signal.SIGINT):
+        try:
+            _STATE["signals"][signum] = signal.signal(signum, _boot_signal)
+        except (ValueError, OSError, RuntimeError):
+            pass                     # not the main thread, or a platform without it: nothing lost
     atexit.register(record_clean)
     return _STATE
 
@@ -296,15 +394,44 @@ def disarm():
         return
     sys.stderr = st["stderr"]
     sys.excepthook = st["excepthook"]
+    for signum, previous in (st.get("signals") or {}).items():
+        try:
+            if signal.getsignal(signum) is _boot_signal:
+                signal.signal(signum, previous)
+        except (ValueError, OSError, RuntimeError, TypeError):
+            pass
     try:
         atexit.unregister(record_clean)
     except Exception:
         pass
 
 
-def armed():
-    """True when this process has armed its exit visibility."""
-    return _STATE is not None
+def note_started():
+    """The loop is about to tick: from here a clean exit really is a runner that RAN and stopped.
+
+    Before this, a clean exit is a boot that refused — the pane preflight, the empty-required_checks
+    doorway, a held migration. Both are worth recording (the 2026-09-09 morning had two failed
+    starts), but recording them under the same word would make "the runner exited" unreadable on the
+    surface that renders it (fresh-agent review)."""
+    if _STATE is not None:
+        _STATE["started"] = True
+
+
+def stand_down():
+    """Renounce the exit record: this process turned out NOT to be the runner.
+
+    `arm()` runs at the CLI entrypoint, which is above `acquire_singleton()` — so a second
+    `superlooper run` against a live home (an operator opening a diagnostic tab, the dashboard's
+    Liftoff button, a watchdog kickstart racing a runner that already recovered) would arm, lose the
+    singleton, exit, and write "the runner exited" into the LIVE runner's journal while that runner
+    is perfectly healthy. That is the exact false signal this whole feature exists to make
+    trustworthy (fresh-agent review).
+
+    Only the exit act is renounced. The stderr tee STAYS armed: "another runner is live for this
+    state home" is true, it is evidence somebody tried, and it belongs in the log.
+    """
+    if _STATE is not None:
+        _STATE["wrote"] = True          # the one record this process had is spent, unwritten
 
 
 def _write(fields):
@@ -317,13 +444,19 @@ def _write(fields):
     st = _STATE
     if st is None or st["wrote"]:
         return False
+    # CLAIMED before the write, released only if the write failed. `journal.append` opens, writes,
+    # flushes and fsyncs — many bytecodes, and a signal handler runs BETWEEN bytecodes, so a second
+    # signal landing inside that window would otherwise pass the guard and write the record twice
+    # (fresh-agent review). Releasing on failure is what keeps the retry: the next hook down gets a
+    # turn, exactly as the wedged-tick ALERT is retried until it lands.
+    st["wrote"] = True
     rec = {"act": EXIT_ACT, "pid": os.getpid()}
     rec.update(fields)
     try:
         st["append"](st["home"], rec)
     except Exception:
+        st["wrote"] = False
         return False
-    st["wrote"] = True
     return True
 
 
@@ -361,8 +494,28 @@ def record_exception(exc_type, exc, tb):
 def record_clean():
     """Record an exit nothing else claimed — the interpreter simply ended. Registered with atexit,
     so a runner that returns normally still says so; suppressed when a signal or an exception has
-    already written the record for this death."""
-    return _write({"reason": "clean"})
+    already written the record for this death, and renounced entirely by `stand_down`.
+
+    `clean` once the loop has ticked, `boot_refused` before that — see `note_started`."""
+    started = bool(_STATE and _STATE.get("started"))
+    return _write({"reason": "clean" if started else "boot_refused"})
+
+
+def _boot_signal(signum, frame):
+    """The entrypoint's stand-in handler, alive only until `Runner.run` installs the real one.
+
+    Records the reason, then dies EXACTLY as it would have without this: the default disposition is
+    restored and the signal re-raised at ourselves, so nothing about the process's fate changes —
+    only whether it left a note. Never let a failure here swallow the signal."""
+    try:
+        record_signal(signum)
+    except Exception:
+        pass
+    try:
+        signal.signal(signum, signal.SIG_DFL)
+    except Exception:
+        pass
+    os.kill(os.getpid(), signum)
 
 
 def _excepthook(exc_type, exc, tb):

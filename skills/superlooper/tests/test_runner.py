@@ -7730,3 +7730,31 @@ def test_a_scripts_captured_output_goes_through_the_bound(rig, monkeypatch):
     assert int(out) == 3 and "stack smashing" in out.stderr_tail   # caller evidence intact
     text = _runner_log_text(rig)
     assert len(text.splitlines()) < 5 and "4000" in text
+
+
+def test_a_runner_that_loses_the_singleton_leaves_no_exit_record(rig, armed):
+    # #480 fresh-agent review: arming happens at the CLI entrypoint, ABOVE acquire_singleton — so a
+    # second `superlooper run` against a live home (a diagnostic tab, the Liftoff button, a watchdog
+    # kickstart racing a recovered runner) would write "the runner exited" into the LIVE runner's
+    # journal while that runner is healthy. The exact false signal this feature exists to end.
+    rig.r.acquire_singleton()
+    other = runner_mod.Runner(repo=str(rig.repo), config=make_config(), state_home=str(rig.home),
+                              pane="p", run_script=lambda *a, **k: 0, fetch_usage=lambda: {})
+    assert other.run(max_ticks=1, sleep=lambda s: None) == 1     # loses the singleton
+    assert armed.record_clean() is False                        # every later hook is spent too
+    assert _exit_records(rig) == []
+
+
+def test_a_runner_that_reaches_its_tick_loop_records_a_finished_run(rig, armed):
+    rig.r.run(max_ticks=1, sleep=lambda s: None)
+    assert armed.record_clean() is True
+    assert _exit_records(rig)[0]["reason"] == "clean"
+
+
+def test_a_boot_that_never_ticked_is_not_recorded_as_a_finished_run(rig, armed, monkeypatch):
+    # A held boot migration returns before the first tick. "the runner exited" must not read the
+    # same for that as for a loop that ran all night.
+    monkeypatch.setattr(rig.r, "_apply_boot_migrations", lambda: False)
+    assert rig.r.run(max_ticks=1, sleep=lambda s: None) == 2
+    assert armed.record_clean() is True
+    assert _exit_records(rig)[0]["reason"] == "boot_refused"

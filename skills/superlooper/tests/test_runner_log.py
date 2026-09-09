@@ -196,8 +196,17 @@ def test_a_keyboard_interrupt_is_recorded_as_its_signal_not_as_a_crash(home):
 
 def test_a_clean_exit_still_leaves_a_reason(home):
     runner_log.arm(str(home), stream=io.StringIO())
+    runner_log.note_started()                      # the loop reached its tick loop
     assert runner_log.record_clean() is True
     assert _exits(home)[0]["reason"] == "clean"
+
+
+def test_a_refused_boot_is_not_recorded_as_a_finished_run(home):
+    # The 2026-09-09 morning had two failed starts. Both are worth recording — but "the runner
+    # exited" must not read the same for a loop that ran all night and one that never ticked.
+    runner_log.arm(str(home), stream=io.StringIO())
+    assert runner_log.record_clean() is True
+    assert _exits(home)[0]["reason"] == "boot_refused"
 
 
 def test_only_one_exit_act_is_written_however_many_hooks_fire(home):
@@ -209,6 +218,24 @@ def test_only_one_exit_act_is_written_however_many_hooks_fire(home):
     runner_log.record_clean()
     assert len(_exits(home)) == 1
     assert _exits(home)[0]["reason"] == "signal"
+
+
+def test_a_second_signal_landing_inside_the_first_write_cannot_double_the_record(home):
+    # `journal.append` opens, writes, flushes and fsyncs — and a Python signal handler runs BETWEEN
+    # bytecodes, so a second signal really can arrive mid-write. Simulated by re-entering from
+    # inside the writer itself, which is exactly the shape of that race.
+    seen = []
+
+    def reentrant(state_home, record, now=None):
+        seen.append(record)
+        if len(seen) == 1:
+            runner_log.record_signal(signal.SIGINT)      # the second signal, mid-write
+        journal.append(state_home, record, now)
+
+    runner_log.arm(str(home), stream=io.StringIO(), append=reentrant)
+    runner_log.record_signal(signal.SIGTERM)
+    assert len(seen) == 1, seen
+    assert len(_exits(home)) == 1
 
 
 def test_a_failed_journal_write_leaves_the_door_open_for_the_next_hook(home):
@@ -330,3 +357,97 @@ def test_the_bound_emits_only_ascii_so_the_logger_cannot_trip_on_its_own_markers
     for text in ("\n".join(["x"] * 5000), "\n".join("line %d" % i for i in range(5000)),
                  "y" * 500_000, NOISE + "\nreal error\n"):
         runner_log.bounded(text).encode("ascii")   # raises on a non-ASCII marker of our own
+
+
+# --------------------------- who is allowed to leave a record ---------------------------
+
+def test_standing_down_renounces_the_record_but_keeps_the_tee(home):
+    # A process that lost the singleton is NOT the runner: it must leave no exit act in the live
+    # runner's journal. Its stderr still belongs in the log — somebody tried to start a second one.
+    pane = io.StringIO()
+    runner_log.arm(str(home), stream=pane)
+    runner_log.stand_down()
+    sys.stderr.write("another runner is live for this state home — exiting\n")
+    assert runner_log.record_clean() is False
+    assert runner_log.record_signal(signal.SIGTERM) is False
+    assert _exits(home) == []
+    assert "another runner is live" in _log_text(home)
+
+
+def test_standing_down_before_arming_is_a_no_op(home):
+    runner_log.stand_down()          # must not raise
+    runner_log.note_started()
+
+
+# --------------------------- the window before run() installs its handlers ---------------------------
+
+def test_arming_covers_sigterm_before_the_runner_installs_its_own_handler(home):
+    # `Runner.run` installs the real handlers only AFTER the CLI resolves the anchor, runs the pane
+    # preflight, and (login-item home) checks gh auth over the network. A SIGTERM in that window
+    # used to hit SIG_DFL: dead process, nothing written down — the very silence this issue is about.
+    before = signal.getsignal(signal.SIGTERM)
+    armed = runner_log.arm(str(home), stream=io.StringIO())
+    handler = signal.getsignal(signal.SIGTERM)
+    assert handler is not before, "arm() left the boot window uncovered"
+    assert armed["signals"][signal.SIGTERM] is before
+    runner_log.disarm()
+    assert signal.getsignal(signal.SIGTERM) is before      # and hands it straight back
+
+
+def test_the_boot_handler_records_and_then_dies_exactly_as_it_would_have(home, monkeypatch):
+    # It must not CHANGE the process's fate — only whether it left a note. So: record, restore the
+    # default disposition, re-raise at ourselves. (os.kill is stubbed; a real one ends the test run.)
+    killed = []
+    monkeypatch.setattr(runner_log.os, "kill", lambda pid, sig: killed.append((pid, sig)))
+    runner_log.arm(str(home), stream=io.StringIO())
+    signal.getsignal(signal.SIGTERM)(signal.SIGTERM, None)
+    assert _exits(home)[0]["signal"] == "SIGTERM"
+    assert killed == [(os.getpid(), signal.SIGTERM)]
+    assert signal.getsignal(signal.SIGTERM) is signal.SIG_DFL
+
+
+# --------------------------- the bound's own edges ---------------------------
+
+def test_a_bound_cannot_be_switched_off_by_passing_a_small_limit():
+    # `text[-0:]` is the WHOLE string, so limit 0/1 used to make the bound return MORE than it got.
+    for text in ("\n".join("line %d" % i for i in range(400)), "z" * 40_000):
+        for kwargs in ({"max_lines": 0}, {"max_lines": 1}, {"max_lines": 2},
+                       {"max_chars": 0}, {"max_chars": 1}, {"max_lines": True}):
+            out = runner_log.bounded(text, **kwargs)
+            assert len(out) <= len(text) + 200, (kwargs, len(out), len(text))
+
+
+def test_a_run_of_blank_lines_is_one_blank_line_not_a_count_of_nothing():
+    out = runner_log.bounded("first\n\n\n\n\nsecond")
+    assert out == "first\n\nsecond", out
+
+
+def test_control_bytes_and_ansi_paint_never_reach_the_log():
+    out = runner_log.bounded("\x1b[31mFATAL\x1b[0m: gone\x00\n")
+    assert "FATAL" in out and "gone" in out
+    assert "\x1b" not in out and "\x00" not in out
+
+
+def test_a_line_that_merely_mentions_the_chatter_is_not_censored():
+    # `_run_cmd` pipes this repo's own recheck output through the same doorway. An unanchored
+    # substring match ate the failing assertion line of the test named for this very feature.
+    out = runner_log.bounded("FAILED test_runner_log.py::test_malloc_stack_logging_chatter\n"
+                             "E   assert 'MallocStackLogging' not in out\n")
+    assert "assert 'MallocStackLogging' not in out" in out
+    assert "suppressed" not in out
+
+
+def test_a_monstrous_write_is_bounded_without_reading_all_of_it():
+    flood = "\n".join("row %d" % i for i in range(400_000))          # ~4 MB
+    out = runner_log.bounded(flood)
+    assert len(out) <= runner_log.CHILD_MAX_CHARS + 300
+    assert "row 0" in out and "past the scan window" in out
+
+
+def test_a_chatter_only_flood_past_the_scan_window_still_says_nothing():
+    assert runner_log.bounded("\n".join([NOISE] * 40_000)) == ""
+
+
+def test_one_colossal_line_with_no_newline_is_still_reported():
+    out = runner_log.bounded("q" * 4_000_000)
+    assert out and "q" in out and len(out) <= runner_log.CHILD_MAX_CHARS + 300
