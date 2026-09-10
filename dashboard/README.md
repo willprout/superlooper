@@ -120,6 +120,33 @@ with `bin/command-center /path/to/config.json` (or `CC_CONFIG=/path/to/config.js
 The server binds `127.0.0.1` **only** — it can write GitHub labels (approve, flag, drop), so it
 is never reachable off your machine, by design.
 
+#### The log
+
+Whoever starts the dashboard decides where its output goes — `bin/liftoff` sends it to
+`$SL_HOME/command-center.log`, the launchd job to `~/Library/Logs/command-center.log`, and a
+foreground run to your terminal. Wherever it lands, the dashboard keeps that log readable itself:
+
+| | |
+|---|---|
+| **Dated** | Every line carries a local timestamp with its UTC offset (`2026-09-09T09:45:01-0700`) — the dashboard's own lines *and* anything a child process writes to the stderr it inherits. |
+| **Capped** | The file never exceeds **8 MiB**. When it fills, the dashboard truncates it in place, immediately rewrites the most recent **256 KiB**, and leaves one marker line naming exactly how many bytes it dropped. |
+| **De-flooded** | A line that repeats is written once, then counted: at most one `repeated N× in Ms, suppressed — …` summary per message per minute. |
+
+A log that is **already over the cap when the dashboard starts** is brought under it at the first
+write. The dashboard cannot keep a tail of writing it did not do — the launcher opened that file
+write-only and never told it the path — so the marker line records the whole drop and the run
+starts clean. Copy an oversized log aside before restarting if you want to keep it.
+
+Override the two bounds with `CC_LOG_MAX_BYTES` / `CC_LOG_KEEP_BYTES` (bytes) if you want a
+longer or shorter memory. The cap has a 4 KiB floor — the marker line alone is ~160 bytes, so a
+smaller cap could not be honoured by any rewrite.
+
+Why it works this way: on 2026-09-09 this log reached **331 MB / 3.4 million lines**, of which
+3.38 million were a single message repeating from short-lived child processes — with no timestamps,
+so the flood could not even be dated, and the ~3,700 lines that mattered were buried in it. Capturing
+the process's own stdout and stderr is the only place that noise can be seen, because a line written
+to an inherited file descriptor never passes through a child's captured output.
+
 ### One command: bring up the dashboard **and** a repo's runner (`liftoff`)
 
 The dashboard and the loop runner are two processes. `bin/liftoff` is the single command that
