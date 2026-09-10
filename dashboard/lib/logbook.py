@@ -77,6 +77,10 @@ _NUM_RE = re.compile(r"\d+")
 _WS_RE = re.compile(r"\s+")
 
 _MAX_ECHO = 400   # how much of a repeating line a summary quotes back
+# Room reserved for the cap marker itself when the retained tail is sized: a timestamp,
+# the sentence, and two byte counts. Generous, so the marker can never be the thing that
+# pushes a freshly capped file back over its own bound.
+_MARKER_ALLOWANCE = 256
 
 # Everything the dashboard itself writes carries this prefix (server.py, the launcher,
 # the cap marker). It is what tells our own sentences apart from a descendant's output.
@@ -209,7 +213,7 @@ class BoundedSink:
 
     def _cap(self):
         """Truncate to zero and rewrite the retained tail behind one honest marker line."""
-        dropped = max(0, self._size - self._tail_bytes)
+        old_size = self._size
         try:
             os.ftruncate(self._fd, 0)
             try:
@@ -221,14 +225,16 @@ class BoundedSink:
             self._cappable = False   # cannot be capped after all; stop pretending it can
             self._size = 0
             return
-        stamped = stamp(self._clock())
-        # Size the marker first, then give the tail whatever the cap has left over — the rewrite is
-        # what has to fit under the bound, not just the truncation.
-        head = ("%s command-center: log capped at %d bytes — dropped the oldest %d bytes, kept "
-                "the most recent " % (stamped, self._max, dropped))
-        chunks = self._fit_tail(max(0, self._max - len(head.encode("utf-8", "replace")) - 64))
+        # Fit the tail to what the cap has left after a generous marker allowance, THEN count what
+        # was dropped — as `old_size - kept`, not `old_size - tail_bytes`. `_fit_tail` may itself
+        # discard part of the tail (an oversized retained chunk), and a marker that reported the
+        # pre-trim figure would understate the loss, sometimes as zero (fresh-agent review, #481).
+        chunks = self._fit_tail(max(0, self._max - _MARKER_ALLOWANCE))
         kept = sum(len(c) for c in chunks)
-        marker = "%s%d (bound: CC_LOG_MAX_BYTES)\n" % (head, kept)
+        dropped = max(0, old_size - kept)
+        marker = ("%s command-center: log capped at %d bytes — dropped the oldest %d bytes, kept "
+                  "the most recent %d (bound: CC_LOG_MAX_BYTES)\n"
+                  % (stamp(self._clock()), self._max, dropped, kept))
         self._size = 0
         self._raw_write(marker.encode("utf-8", "replace"))
         for chunk in chunks:
@@ -600,13 +606,27 @@ def _catch_termination(handle):
     The handler flushes, then re-raises the signal with its default disposition, so the exit status
     the supervisor sees is unchanged. Signals can only be installed from the main thread; anywhere
     else this is simply a no-op."""
+    installed = []
+
     def _on_signal(signum, frame):
+        # Put BOTH signals back to their default disposition FIRST, before touching a single lock.
+        # The flush below takes the logbook's and the sink's locks, and a signal handler runs on the
+        # main thread on top of whatever it interrupted — including a previous run of this handler,
+        # or the identical `atexit` shutdown. A second SIGTERM arriving mid-flush would then block
+        # forever on a lock its own suspended caller holds: the process would never die, the port
+        # would stay held, and `liftoff --restart-dashboard` would time out instead of restarting
+        # (fresh-agent review, issue #481). Disarming first makes that impossible — an impatient
+        # second signal simply kills us, which is exactly what it is asking for.
+        for s in installed:
+            try:
+                signal.signal(s, signal.SIG_DFL)
+            except Exception:
+                pass
         try:
             _shutdown(handle)
         except Exception:
             pass
         try:
-            signal.signal(signum, signal.SIG_DFL)
             os.kill(os.getpid(), signum)
         except Exception:                        # pragma: no cover — the kill above ends us
             os._exit(1)
@@ -618,6 +638,7 @@ def _catch_termination(handle):
         try:
             if signal.getsignal(sig) in (signal.SIG_DFL, None):
                 signal.signal(sig, _on_signal)
+                installed.append(sig)
         except (ValueError, OSError, RuntimeError):
             pass          # not the main thread, or the platform refuses — the log is not worth a crash
 

@@ -505,3 +505,63 @@ def test_a_sigterm_still_leaves_the_suppressed_count_in_the_log(tmp_path):
     assert proc.returncode == -signal.SIGTERM, proc.returncode
     text = log.read_text()
     assert "repeated 299" in text, "the count was lost to the SIGTERM:\n%s" % text
+
+
+def test_the_termination_handler_disarms_itself_before_it_touches_a_lock(tmp_path):
+    # Fresh-agent review, round 2. The termination handler runs on the main thread, on top of
+    # whatever it interrupted — including a previous run of ITSELF, or the identical atexit
+    # shutdown. Its flush takes the logbook's lock, so a second SIGTERM landing in that window can
+    # block forever on a lock its own suspended caller holds: the process never dies, the port
+    # stays held, and `liftoff --restart-dashboard` times out instead of restarting.
+    #
+    # The fix is an ordering invariant — put BOTH signals back to SIG_DFL before touching a single
+    # lock, so an impatient second signal just kills us — and the invariant is what is pinned here.
+    # The hang itself is not a good test: on macOS the second signal is usually delivered to the
+    # thread that sent it, so the main thread is not interrupted mid-handler and the deadlock only
+    # shows up under a delivery pattern a test cannot force. The ordering can be checked exactly.
+    log = tmp_path / "command-center.log"
+    src = ("import os, signal, sys, time\n"
+           "sys.path.insert(0, %r)\n"
+           "import logbook\n"
+           "h = logbook.install(max_bytes=8 * 1024 * 1024, collapse_seconds=600)\n"
+           "for i in range(300):\n"
+           "    sys.stderr.write('Noise(%%d) from a child\\n' %% i)\n"
+           "sys.stderr.flush()\n"
+           "time.sleep(0.5)\n"
+           "real = logbook._shutdown\n"
+           "def spy(handle):\n"
+           "    armed = [n for n in ('SIGTERM', 'SIGHUP')\n"
+           "             if signal.getsignal(getattr(signal, n)) is not signal.SIG_DFL]\n"
+           "    os.write(h.sink_fd, ('STILL_ARMED=%%s\\n' %% ','.join(armed) or '-').encode())\n"
+           "    real(handle)\n"
+           "logbook._shutdown = spy\n"
+           "os.kill(os.getpid(), signal.SIGTERM)\n"
+           "time.sleep(30)\n" % str(_ROOT / "lib"))
+    with open(str(log), "a") as fh:
+        proc = subprocess.run([sys.executable, "-c", src], stdout=fh,
+                              stderr=subprocess.STDOUT, timeout=60)
+    text = log.read_text()
+    assert "STILL_ARMED=\n" in text or "STILL_ARMED=-" in text, (
+        "the handler was still armed when it reached the flush — a second signal arriving there "
+        "can deadlock on the lock this one is about to take:\n%s" % text)
+    # ...and the fix must not have cost the two things the flush was added for.
+    assert proc.returncode == -signal.SIGTERM, proc.returncode
+    assert "repeated 299" in text, "the count was lost to the SIGTERM:\n%s" % text
+
+
+def test_the_cap_marker_never_understates_what_it_dropped(tmp_path):
+    # Fresh-agent review, round 2: the marker counted `size - tail_bytes`, but the tail itself can
+    # be trimmed on the way out (an oversized retained chunk). For that case the marker reported
+    # zero bytes dropped while real bytes had gone — a log that lies about its own losses.
+    log = tmp_path / "command-center.log"
+    sink, fd = _sink_over(log, max_bytes=32 * 1024, keep_bytes=1024)
+    try:
+        sink.write("2026-09-09T09:45:01-0700 " + "q" * (48 * 1024) + "\n")
+    finally:
+        os.close(fd)
+    marker = [l for l in log.read_text().splitlines() if "log capped" in l][0]
+    dropped = int(re.search(r"dropped the oldest (\d+) bytes", marker).group(1))
+    kept = int(re.search(r"kept the most recent (\d+)", marker).group(1))
+    assert dropped > 0, "bytes really were dropped: %s" % marker
+    assert dropped + kept == 48 * 1024 + len("2026-09-09T09:45:01-0700 ") + 1, marker
+    assert log.stat().st_size <= 32 * 1024
