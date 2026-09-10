@@ -139,6 +139,7 @@ import queue_lint
 import reorient
 import report
 import runner_home
+import runner_log
 import stack_doctor
 import tidy as tidy_lib
 # The triage flight (#448 state contract + trigger, #449 the acts). Imported
@@ -918,6 +919,24 @@ def cmd_run(args):
     # unit test or a one-shot CLI command must not silently acquire a machine's launch posture.
     _arm_machine_env()
     cfg = _load_config(args.repo)
+    # A runner must never exit without leaving a reason (issue #480, from #477 item 2). On
+    # 2026-09-09 the eApp runner exited at 09:43:31 and left nothing behind — no line in
+    # logs/runner.log, no journal record, a watchdog still reporting "healthy" eleven seconds after
+    # the last heartbeat — because its stderr went to the cmux pane and nowhere else, and the pane
+    # died with it. From here on, this process's stderr is also written to logs/runner.log, and an
+    # uncaught exception or a terminating signal writes one `runner_exit` journal act naming the
+    # reason before the process goes.
+    #
+    # HERE, at the LIVE runner's process entrypoint and above the home fork below — for exactly the
+    # reasons `_arm_machine_env` and `gh.set_telemetry` sit where they do. It mutates process-global
+    # state (sys.stderr, sys.excepthook, an atexit hook), so only the one long-lived runner should
+    # carry it; a Runner built inside a unit test or a one-shot CLI verb must not silently acquire
+    # it. Above the fork because BOTH homes owe the same guarantee — and the login-item home already
+    # half-had it (launchd points StandardErrorPath at that exact file), which is why arming asks
+    # whether stderr ALREADY lands in the log rather than branching on the home. Above the
+    # required_checks refusal, too: a boot that FAILS is a runner exit an operator has to explain
+    # later, and the 2026-09-09 morning had two of them.
+    runner_log.arm(str(config_lib.state_home(cfg)))
     # The D7 rule below, aimed at the MERGE gate instead of the launch channel (issue #401). §C.4
     # step 5 folds an EMPTY required list to vacuously GREEN — a deliberate design this does not
     # reopen — so a runner booted against a fresh or mis-edited config merges every PR it opens with

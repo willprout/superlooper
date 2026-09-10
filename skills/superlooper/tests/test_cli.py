@@ -12,6 +12,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import select
 import subprocess
 import time
@@ -3398,3 +3399,69 @@ def test_a_healthy_sl_pr_list_says_nothing_about_completeness(rig):
     doc = json.loads(cli(rig, "janitor", "--json", "--repo", str(rig.repo)).stdout)
     assert doc["merged_open_swept"] is True
     assert "INCOMPLETE" not in cli(rig, "upkeep", "--repo", str(rig.repo)).stdout
+
+
+# --------------------------- exit visibility (issue #480) ---------------------------
+# #477 item 2: the eApp runner exited at 09:43:31 leaving NOTHING behind — its stderr went to the
+# cmux pane and nowhere else. These drive the real CLI and read what is on disk afterwards.
+
+def _runner_log(rig):
+    p = rig.tmp / "slhome" / "o__r" / "logs" / "runner.log"
+    return p.read_text() if p.exists() else ""
+
+
+def _exit_records(rig):
+    p = rig.tmp / "slhome" / "o__r" / "journal.jsonl"
+    if not p.exists():
+        return []
+    recs = [json.loads(x) for x in p.read_text().splitlines() if x.strip()]
+    return [r for r in recs if r.get("act") == "runner_exit"]
+
+
+def test_a_boot_refusal_survives_the_pane_it_was_printed_in(rig):
+    # The pane-home gap, at the doorway an operator actually hits: the D7 pane refusal is a FATAL on
+    # stderr, and before #480 it existed only in the tab. It must now also be in runner.log.
+    r = cli(rig, "run", "--repo", str(rig.repo), "--pane", "ghost", "--ticks", "1",
+            env_over={"SL_CMUX": _cmux_stub(rig, resolve=False)})
+    assert r.returncode != 0
+    assert "FATAL" in r.stderr                       # the operator at the tab still sees it
+    assert "FATAL" in _runner_log(rig)               # ...and so does anyone reading the log later
+    assert "resolve pane" in _runner_log(rig).lower()
+
+
+def test_a_clean_run_still_records_why_it_exited(rig):
+    r = cli(rig, "run", "--repo", str(rig.repo), "--pane", "p1", "--ticks", "1",
+            env_over={"SL_CMUX": _cmux_stub(rig, resolve=True)})
+    assert r.returncode == 0, r.stdout + r.stderr
+    rec = _exit_records(rig)
+    assert len(rec) == 1 and rec[0]["reason"] == "clean"
+    assert isinstance(rec[0].get("pid"), int)
+
+
+def test_a_signalled_runner_records_the_signal_that_killed_it(rig):
+    # The whole point of the issue, driven for real: a live runner, a real SIGTERM, and a durable
+    # record of WHY afterwards. Backgrounded with Popen so only THIS pid is ever signalled.
+    env = {**rig.env, "SL_CMUX": _cmux_stub(rig, resolve=True)}
+    # Output to FILES, not pipes: this child is unbounded (no --ticks), and an undrained pipe that
+    # fills is the classic Popen deadlock. Files cannot fill.
+    out, err = rig.tmp / "live.out", rig.tmp / "live.err"
+    fo, fe = out.open("w"), err.open("w")
+    p = subprocess.Popen([sys.executable, str(CLI), "run", "--repo", str(rig.repo),
+                          "--pane", "p1"], env=env, stdout=fo, stderr=fe, text=True)
+    hb = rig.tmp / "slhome" / "o__r" / "state" / "runner.heartbeat"
+    try:
+        deadline = time.time() + 60
+        while not hb.exists() and time.time() < deadline and p.poll() is None:
+            time.sleep(0.2)
+        assert hb.exists(), "the runner never completed a tick"
+        os.kill(p.pid, signal.SIGTERM)               # this pid only — never a pattern
+        p.wait(timeout=90)
+    finally:
+        if p.poll() is None:
+            p.kill()
+            p.wait(timeout=30)
+        fo.close()
+        fe.close()
+    rec = _exit_records(rig)
+    assert len(rec) == 1, rec
+    assert rec[0]["reason"] == "signal" and rec[0]["signal"] == "SIGTERM"

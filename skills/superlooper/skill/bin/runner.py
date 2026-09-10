@@ -44,6 +44,7 @@ import panes as panes_lib
 import phase as phase_mod
 import published_view
 import runner_home
+import runner_log
 import session_host
 import tidy
 import usage as usage_mod
@@ -429,6 +430,20 @@ def _short_repr(exc, limit=500):
     except Exception:
         return f"<unrepresentable {type(exc).__name__}>"
     return r if len(r) <= limit else r[:limit] + f"...<+{len(r) - limit} chars truncated>"
+
+
+def _joined(proc):
+    """A finished subprocess's stdout and stderr as ONE piece of text, separated by a newline.
+
+    Concatenating them raw (what this used to do) welds stdout's last line onto stderr's first
+    whenever stdout does not end in one — and macOS libmalloc prints its chatter as a child's FIRST
+    stderr output, so exactly that weld hid a chatter line from the pattern that exists to drop it
+    (issue #480, fresh-agent review round 2). The incident was a DRIP, one line per child per tick;
+    a fold and a cap cannot answer a drip, so a hole in the pattern is the whole cost. It also
+    stops two unrelated lines being read as one sentence, which was a small lie either way.
+    """
+    parts = [s for s in (getattr(proc, "stdout", ""), getattr(proc, "stderr", "")) if s]
+    return "\n".join(parts)
 
 
 def _read_json(path):
@@ -1045,6 +1060,16 @@ class Runner:
                 _rm(path)
 
     def _handle_signal(self, signum, frame):
+        # Leave a reason BEFORE the flag (issue #480). A runner that is signalled away used to go
+        # exactly as quietly as one that crashed — the 2026-09-09 eApp exit left no log line, no
+        # journal record, and a watchdog still reading "healthy". This writes ONE `runner_exit` act
+        # naming the signal; it is a no-op in any process that never armed (a unit test's Runner, a
+        # one-shot CLI verb), and it is guarded, because observability must never become a new way
+        # for the loop to die inside a signal handler.
+        try:
+            runner_log.record_signal(signum)
+        except Exception:
+            pass
         # Fail-stopped by design: in-flight sessions untouched, nothing merges while down.
         self.stop = True
 
@@ -1413,6 +1438,12 @@ class Runner:
     def run(self, max_ticks=None, sleep=time.sleep):
         if not self.acquire_singleton():
             print("another runner is live for this state home — exiting", file=sys.stderr)
+            # This process is NOT the runner, so it must leave no exit record in the live runner's
+            # journal (issue #480, fresh-agent review): arming happens at the CLI entrypoint, which
+            # is above this check, and an operator's diagnostic second start would otherwise write
+            # "the runner exited" against a runner that is perfectly healthy. The line above still
+            # reaches the log — that somebody tried is worth knowing.
+            runner_log.stand_down()
             return 1
         # Hygiene (fresh-agent review): consume any lingering re-exec adopt token so it can never be
         # inherited by a worker subprocess. acquire_singleton already pops it on the adoption path;
@@ -1466,6 +1497,10 @@ class Runner:
                       "ALERT and the notification. Fix it (check gh auth / re-run `superlooper "
                       "adopt`, both idempotent) and restart the runner.", file=sys.stderr)
                 return 2
+            # Past every boot refusal: from here a clean exit is a runner that RAN and stopped, not
+            # one that never started (issue #480, fresh-agent review). Both are recorded; recording
+            # them under the same word would make "the runner exited" unreadable.
+            runner_log.note_started()
             while not self.stop and (max_ticks is None or ticks < max_ticks):
                 try:
                     self.tick()
@@ -2556,11 +2591,12 @@ class Runner:
 
     # ------------------------- executors -------------------------
 
+
     def _run_script(self, args, env=None, timeout=LAUNCH_TIMEOUT):   # injectable
         try:
             r = subprocess.run([str(a) for a in args], env={**os.environ, **(env or {})},
                                capture_output=True, text=True, timeout=timeout)
-            self._log((r.stdout or "") + (r.stderr or ""))
+            self._log(_joined(r))
             # Carry the stderr — the ONLY account of WHY (issue #152). It used to stop here, at
             # `return r.returncode`: runner.log kept the reason and every caller got a bare int, so
             # the 07-09 storm's "Pane or workspace not found" was written to a file nobody read
@@ -2576,7 +2612,7 @@ class Runner:
         try:
             r = subprocess.run(["bash", "-lc", cmd], cwd=cwd, capture_output=True,
                                text=True, timeout=timeout)
-            self._log((r.stdout or "") + (r.stderr or ""))
+            self._log(_joined(r))
             return r.returncode
         except subprocess.TimeoutExpired:
             return 124
@@ -2584,13 +2620,25 @@ class Runner:
             return 127
 
     def _log(self, text):
+        """The ONE doorway into runner.log — and therefore where the bound lives (issue #480).
+
+        Bounding here rather than at each spawn helper in turn is the point: #477 item 1c is a child
+        that printed thousands of identical lines, and a rule enforced at the door cannot be routed
+        around by the next executor somebody adds. `runner_log.bounded` folds identical runs to one
+        line and a count, caps the rest head-and-tail, and drops the one known-benign runtime
+        chatter pattern outright — so a call whose entire content was chatter writes NOTHING, which
+        is the only bound that actually holds when the noise arrives one line per tick forever.
+        Short ordinary lines (every other caller here) pass through untouched. The write itself
+        moves to `runner_log.append_log` for the encoding reason named there: this used to catch
+        OSError alone, and a UnicodeEncodeError (a launchd-started runner inherits an ASCII locale,
+        and a script's stderr is full of em-dashes) is not one — it would leave the logger and land
+        in the tick that called it.
+        """
+        text = runner_log.bounded(text)
         if not text:
             return
-        try:
-            with open(os.path.join(self.home, "logs", "runner.log"), "a") as f:
-                f.write(text if text.endswith("\n") else text + "\n")
-        except OSError:
-            pass
+        runner_log.append_log(runner_log.log_path(self.home),
+                              text if text.endswith("\n") else text + "\n")
 
     def _script_env(self, model, effort=""):
         # SL_EFFORT is empty by default; a value comes from a per-issue effort:* label or the

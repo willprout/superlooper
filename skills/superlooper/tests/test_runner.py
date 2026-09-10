@@ -7638,3 +7638,145 @@ def test_absorb_on_a_freshly_launched_lane_closes_its_merged_issue(rig, monkeypa
     assert rig.r._execute({"act": "absorb_merged", "id": "i5", "num": 5, "pr": 555}, NOW) == "ok"
     assert [m["num"] for m in mutations(rig) if m["kind"] == "close_issue"] == ["5"]
     assert issue_state(rig, "i5")["status"] == "merged"
+
+
+# --------------------------- exit visibility (issue #480) ---------------------------
+# The 2026-09-09 incident: a pane-home runner exited leaving NOTHING — no log line, no journal
+# record, a watchdog still reading "healthy". Two guarantees the SHELL owes, pinned here; the
+# machinery itself is tested in test_runner_log.py.
+
+@pytest.fixture
+def armed(rig):
+    """runner_log armed against this rig's state home, always disarmed afterwards (it wraps
+    sys.stderr and installs an excepthook — process-global state no test may leak)."""
+    import io as _io
+    import runner_log
+    runner_log.arm(str(rig.home), stream=_io.StringIO())
+    try:
+        yield runner_log
+    finally:
+        runner_log.disarm()
+
+
+def _exit_records(rig):
+    return [r for r in journal.read(str(rig.home)) if r.get("act") == "runner_exit"]
+
+
+def test_sigterm_records_its_reason_before_the_fail_stop(rig, armed):
+    rig.r._handle_signal(signal.SIGTERM, None)
+    assert rig.r.stop is True                       # unchanged: fail-stopped, in-flight untouched
+    rec = _exit_records(rig)
+    assert len(rec) == 1
+    assert rec[0]["reason"] == "signal" and rec[0]["signal"] == "SIGTERM"
+
+
+def test_sigint_records_its_own_signal(rig, armed):
+    rig.r._handle_signal(signal.SIGINT, None)
+    assert _exit_records(rig)[0]["signal"] == "SIGINT"
+
+
+def test_a_signal_on_an_unarmed_runner_is_still_a_clean_fail_stop(rig):
+    # Nothing armed (a Runner built by a test, a one-shot CLI): the handler must behave exactly as
+    # it always did. Observability is never a new way for the loop to break.
+    rig.r._handle_signal(signal.SIGTERM, None)
+    assert rig.r.stop is True
+    assert _exit_records(rig) == []
+
+
+def _runner_log_text(rig):
+    p = rig.home / "logs" / "runner.log"
+    return p.read_text() if p.exists() else ""
+
+
+def test_a_noisy_child_cannot_flood_the_runner_log(rig):
+    # #477 item 1c: a per-tick child emitted thousands of identical lines. The bound lives at
+    # _log — the ONE doorway into runner.log — so no spawn helper can route around it.
+    rig.r._log("\n".join(["worker: retrying"] * 5000))
+    text = _runner_log_text(rig)
+    assert len(text.splitlines()) < 5
+    assert "worker: retrying" in text and "5000" in text
+
+
+def test_malloc_chatter_from_a_child_never_reaches_the_runner_log(rig):
+    rig.r._log("Python(3938) MallocStackLogging: can't turn off malloc stack logging "
+               "because it was not enabled.\n")
+    assert _runner_log_text(rig) == ""
+
+
+def test_a_scripts_real_stderr_still_reaches_the_log_beside_the_chatter(rig):
+    rig.r._log("Python(3938) MallocStackLogging: not enabled.\nFATAL: Pane or workspace not found\n")
+    text = _runner_log_text(rig)
+    assert "FATAL: Pane or workspace not found" in text
+    assert "MallocStackLogging" not in text
+
+
+def test_ordinary_short_log_lines_are_untouched(rig):
+    rig.r._log("morning report 2026-09-09: notify [imessage ok=True rc=0]")
+    assert _runner_log_text(rig) == "morning report 2026-09-09: notify [imessage ok=True rc=0]\n"
+
+
+def test_a_scripts_captured_output_goes_through_the_bound(rig, monkeypatch):
+    # The spawn helper's own path, end to end: subprocess.run is stubbed (no real binary), and what
+    # the child screamed reaches the log only in its bounded form.
+    class _Ran:
+        returncode = 3
+        stdout = ""
+        stderr = "\n".join(["stack smashing"] * 4000)
+
+    monkeypatch.setattr(runner_mod.subprocess, "run", lambda *a, **k: _Ran())
+    r = runner_mod.Runner(repo=str(rig.repo), config=make_config(), state_home=str(rig.home),
+                          pane="p", fetch_usage=lambda: {})
+    out = r._run_script(["/nonexistent/launch-session.py"])
+    assert int(out) == 3 and "stack smashing" in out.stderr_tail   # caller evidence intact
+    text = _runner_log_text(rig)
+    assert len(text.splitlines()) < 5 and "4000" in text
+
+
+def test_a_runner_that_loses_the_singleton_leaves_no_exit_record(rig, armed):
+    # #480 fresh-agent review: arming happens at the CLI entrypoint, ABOVE acquire_singleton — so a
+    # second `superlooper run` against a live home (a diagnostic tab, the Liftoff button, a watchdog
+    # kickstart racing a recovered runner) would write "the runner exited" into the LIVE runner's
+    # journal while that runner is healthy. The exact false signal this feature exists to end.
+    rig.r.acquire_singleton()
+    other = runner_mod.Runner(repo=str(rig.repo), config=make_config(), state_home=str(rig.home),
+                              pane="p", run_script=lambda *a, **k: 0, fetch_usage=lambda: {})
+    assert other.run(max_ticks=1, sleep=lambda s: None) == 1     # loses the singleton
+    assert armed.record_clean() is False                        # every later hook is spent too
+    assert _exit_records(rig) == []
+
+
+def test_a_runner_that_reaches_its_tick_loop_records_a_finished_run(rig, armed):
+    rig.r.run(max_ticks=1, sleep=lambda s: None)
+    assert armed.record_clean() is True
+    assert _exit_records(rig)[0]["reason"] == "clean"
+
+
+def test_a_boot_that_never_ticked_is_not_recorded_as_a_finished_run(rig, armed, monkeypatch):
+    # A held boot migration returns before the first tick. "the runner exited" must not read the
+    # same for that as for a loop that ran all night.
+    monkeypatch.setattr(rig.r, "_apply_boot_migrations", lambda: False)
+    assert rig.r.run(max_ticks=1, sleep=lambda s: None) == 2
+    assert armed.record_clean() is True
+    assert _exit_records(rig)[0]["reason"] == "boot_refused"
+
+
+def test_a_childs_stdout_is_never_welded_onto_its_first_stderr_line(rig, monkeypatch):
+    # Review round 2: `_log(stdout + stderr)` glued stdout's last line onto stderr's first whenever
+    # stdout lacked a trailing newline — and macOS libmalloc prints its chatter as a child's FIRST
+    # stderr output, so exactly that weld hid a chatter line from the pattern that drops it. The
+    # incident was a DRIP (one line per child per tick); neither the fold nor the cap answers a drip.
+    class _Ran:
+        returncode = 0
+        stdout = "worktree ready"          # no trailing newline: the weld case
+        stderr = ("python3(9129) MallocStackLogging: can't turn off malloc stack logging "
+                  "because it was not enabled.\n")
+
+    monkeypatch.setattr(runner_mod.subprocess, "run", lambda *a, **k: _Ran())
+    # A fresh Runner: the rig injects a recording `run_script`, so `rig.r._run_script` is the stub.
+    r = runner_mod.Runner(repo=str(rig.repo), config=make_config(), state_home=str(rig.home),
+                          pane="p", fetch_usage=lambda: {})
+    r._run_script(["/nonexistent/launch-session.py"])
+    text = _runner_log_text(rig)
+    assert "worktree ready" in text
+    assert "MallocStackLogging" not in text
+    assert text.splitlines()[0] == "worktree ready"     # its own line, not a welded sentence
