@@ -138,7 +138,8 @@ write-only and never told it the path — so the marker line records the whole d
 starts clean. Copy an oversized log aside before restarting if you want to keep it.
 
 Override the two bounds with `CC_LOG_MAX_BYTES` / `CC_LOG_KEEP_BYTES` (bytes) if you want a
-longer or shorter memory.
+longer or shorter memory. The cap has a 4 KiB floor — the marker line alone is ~160 bytes, so a
+smaller cap could not be honoured by any rewrite.
 
 Why it works this way: on 2026-09-09 this log reached **331 MB / 3.4 million lines**, of which
 3.38 million were a single message repeating from short-lived child processes — with no timestamps,

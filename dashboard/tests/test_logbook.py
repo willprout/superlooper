@@ -565,3 +565,19 @@ def test_the_cap_marker_never_understates_what_it_dropped(tmp_path):
     assert dropped > 0, "bytes really were dropped: %s" % marker
     assert dropped + kept == 48 * 1024 + len("2026-09-09T09:45:01-0700 ") + 1, marker
     assert log.stat().st_size <= 32 * 1024
+
+
+def test_a_cap_smaller_than_the_marker_itself_is_floored_not_silently_breached(tmp_path):
+    # Fresh-agent review, round 3 (P2): the capping marker is a mandatory ~160-byte line, so a
+    # configured cap below that could not be honoured by ANY rewrite — `CC_LOG_MAX_BYTES=128` left
+    # a "capped" file of ~149 bytes, i.e. over its own bound. The documented promise is meant to be
+    # unconditional, so the cap has a floor instead of an exception.
+    log = tmp_path / "command-center.log"
+    sink, fd = _sink_over(log, max_bytes=128, keep_bytes=64)
+    try:
+        for i in range(200):
+            sink.write("2026-09-09T09:45:01-0700 line %d %s\n" % (i, "m" * 60))
+            assert log.stat().st_size <= logbook.MIN_MAX_BYTES, log.stat().st_size
+    finally:
+        os.close(fd)
+    assert "log capped at %d bytes" % logbook.MIN_MAX_BYTES in log.read_text()

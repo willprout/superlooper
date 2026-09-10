@@ -63,6 +63,11 @@ KEEP_BYTES = 256 * 1024          # 256 KiB of the most recent lines survive each
 COLLAPSE_SECONDS = 60.0          # at most one summary line per repeating message per minute
 MAX_KEYS = 512                   # distinct messages tracked for collapsing (bounded memory)
 MAX_PARTIAL = 16 * 1024          # a child writing without newlines is flushed at this length
+# A floor under the cap. The capping marker is a mandatory ~160-byte line, so a configured cap
+# below that could not be honoured by any rewrite — the bound would be a promise the code cannot
+# keep (fresh-agent review, issue #481). 4 KiB is the smallest cap that can hold a marker plus a
+# useful handful of lines; anything smaller is a typo, not a preference.
+MIN_MAX_BYTES = 4 * 1024
 
 # Local time with its UTC offset: the operator reads this log against his own clock and against the
 # runner's panes, and `time.localtime` is the house style (lib/digest, lib/replay). The offset makes
@@ -145,6 +150,7 @@ class BoundedSink:
     def __init__(self, fd, max_bytes=None, keep_bytes=None, clock=None):
         self._fd = fd
         self._max = max_bytes if max_bytes is not None else _env_int("CC_LOG_MAX_BYTES", MAX_BYTES)
+        self._max = max(self._max, MIN_MAX_BYTES)
         self._keep = keep_bytes if keep_bytes is not None else _env_int("CC_LOG_KEEP_BYTES",
                                                                        KEEP_BYTES)
         self._keep = min(self._keep, max(1, self._max // 2))
