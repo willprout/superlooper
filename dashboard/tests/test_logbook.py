@@ -31,6 +31,7 @@ beside the write path it fixes).
 """
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -427,3 +428,80 @@ def test_a_pump_that_dies_never_wedges_its_writers(tmp_path):
         subprocess.run([sys.executable, "-c", src], stdout=fh, stderr=subprocess.STDOUT,
                        timeout=60, check=True)      # a wedge shows up here as a TimeoutExpired
     assert "SURVIVED" in log.read_text(), "the writers were released but their output was lost"
+
+
+# =============================== fresh-agent review fixes (issue #481) ===============================
+
+def test_two_of_our_own_lines_differing_only_by_a_digit_stay_two_events():
+    # Fresh-agent review: fingerprint() scrubs every digit, so `[org/app-1]` and `[org/app-2]` —
+    # two DIFFERENT repos going down — shared one collapse key and the second was suppressed. The
+    # 247 RUNNER DOWN pushes in the 2026-09-09 log are real signal; merging two repos' down-pushes
+    # into one count would be a truth bug in the name of tidiness.
+    book, sink, _ = _book()
+    book.feed("command-center: RUNNER DOWN push [org/app-1] — sent")
+    book.feed("command-center: RUNNER DOWN push [org/app-2] — sent")
+    out = sink.lines()
+    assert len(out) == 2, out
+    assert "app-1" in out[0] and "app-2" in out[1]
+
+
+def test_our_own_line_repeating_verbatim_still_collapses():
+    # The other half of that rule: our lines DO repeat verbatim (282 identical disconnect lines),
+    # and those must still collapse — the exact-string key is a fence, not an exemption.
+    clock = _Clock()
+    book, sink, _ = _book(clock=clock, collapse_seconds=10.0)
+    for _ in range(300):
+        book.feed("command-center: client disconnected during GET /api/snapshot")
+        clock.advance(0.1)
+    book.flush()
+    assert len(sink.lines()) <= 6, sink.lines()
+    assert any("repeated" in l for l in sink.lines())
+
+
+def test_a_foreign_flood_still_collapses_across_its_varying_number():
+    # And a descendant's output — the thing we do not control — keeps the scrubbing that makes
+    # #477's varying-pid flood collapsible at all.
+    assert logbook.collapse_key(_FLOOD % 1) == logbook.collapse_key(_FLOOD % 99999)
+    assert logbook.collapse_key("command-center: a [x-1]") != logbook.collapse_key(
+        "command-center: a [x-2]")
+
+
+def test_one_oversized_line_cannot_push_the_rewritten_file_past_the_cap(tmp_path):
+    # Fresh-agent review: the retained tail always keeps at least one chunk, even one bigger than
+    # keep_bytes, and the post-truncation rewrite did not re-check the bound. With a small
+    # configured cap and a child writing a very long unbroken line, the "capped" file came back
+    # OVER the cap — breaking the one promise the README makes about this file.
+    log = tmp_path / "command-center.log"
+    sink, fd = _sink_over(log, max_bytes=32 * 1024, keep_bytes=1024)
+    try:
+        for _ in range(6):
+            sink.write("2026-09-09T09:45:01-0700 " + "q" * (48 * 1024) + "\n")
+            assert log.stat().st_size <= 32 * 1024, "cap breached: %d" % log.stat().st_size
+    finally:
+        os.close(fd)
+    assert "log capped" in log.read_text()
+
+
+def test_a_sigterm_still_leaves_the_suppressed_count_in_the_log(tmp_path):
+    # Fresh-agent review: atexit does NOT run for a default-disposition SIGTERM, and SIGTERM is how
+    # this process is normally stopped (`liftoff --restart-dashboard` signals the pid the dashboard
+    # published for itself; launchd stops a job the same way). A restart mid-flood was therefore
+    # dropping the current window's count silently.
+    log = tmp_path / "command-center.log"
+    src = ("import os, signal, sys, time\n"
+           "sys.path.insert(0, %r)\n"
+           "import logbook\n"
+           "logbook.install(max_bytes=8 * 1024 * 1024, collapse_seconds=600)\n"
+           "for i in range(300):\n"
+           "    sys.stderr.write('Noise(%%d) from a child\\n' %% i)\n"
+           "sys.stderr.flush()\n"
+           "time.sleep(0.5)\n"
+           "os.kill(os.getpid(), signal.SIGTERM)\n"
+           "time.sleep(5)\n" % str(_ROOT / "lib"))
+    with open(str(log), "a") as fh:
+        proc = subprocess.run([sys.executable, "-c", src], stdout=fh,
+                              stderr=subprocess.STDOUT, timeout=60)
+    # The exit status the supervisor sees is still a plain SIGTERM death, not a swallowed signal.
+    assert proc.returncode == -signal.SIGTERM, proc.returncode
+    text = log.read_text()
+    assert "repeated 299" in text, "the count was lost to the SIGTERM:\n%s" % text

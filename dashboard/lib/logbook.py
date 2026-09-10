@@ -44,6 +44,7 @@ import errno
 import os
 import re
 import select
+import signal
 import stat
 import sys
 import threading
@@ -77,6 +78,10 @@ _WS_RE = re.compile(r"\s+")
 
 _MAX_ECHO = 400   # how much of a repeating line a summary quotes back
 
+# Everything the dashboard itself writes carries this prefix (server.py, the launcher,
+# the cap marker). It is what tells our own sentences apart from a descendant's output.
+OWN_PREFIX = "command-center: "
+
 
 def _env_int(name, default):
     try:
@@ -87,16 +92,30 @@ def _env_int(name, default):
 
 
 def fingerprint(line):
-    """The identity of a log *message*, ignoring its per-occurrence noise.
+    """The identity of a *foreign* log message, ignoring its per-occurrence noise.
 
     #477's flood was ``Python(59258) MallocStackLogging: …`` then ``Python(59261) …`` then
     ``Python(59264) …`` — three million lines that were the same message and no two of them equal
-    as strings. Scrubbing digits and hex addresses is what makes them one key; keeping the words is
-    what stops ``RUNNER DOWN push [a/b]`` and ``RUNNER DOWN push [c/d]`` (real, distinct signal)
-    from collapsing into each other."""
+    as strings. Scrubbing digits and hex addresses is what makes them one key.
+
+    Scrubbing numbers is lossy by design, so it is applied only to output the dashboard did not
+    write (see :func:`collapse_key`): a foreign line's numbers are noise we have to bound, but two
+    of OUR sentences that differ by a digit are two different events."""
     s = _HEX_RE.sub("0x#", line)
     s = _NUM_RE.sub("#", s)
     return _WS_RE.sub(" ", s).strip()
+
+
+def collapse_key(line):
+    """What the collapser actually keys on — and the one place the lossy half is fenced off.
+
+    The dashboard's own lines are prefixed ``command-center: ``, and they repeat *verbatim* when
+    they repeat at all (282 identical client-disconnect lines, 247 ``RUNNER DOWN push`` lines). So
+    they are keyed on the exact string: two repos whose slugs differ only by a digit —
+    ``[org/app-1]`` and ``[org/app-2]`` — stay two events, never one merged count (fresh-agent
+    review, issue #481). Everything else is a descendant's output we do not control, which is
+    exactly where number-scrubbing has to happen for a varying-pid flood to collapse at all."""
+    return line if line.startswith(OWN_PREFIX) else fingerprint(line)
 
 
 # =============================== BoundedSink — the hard size cap ===============================
@@ -172,6 +191,22 @@ class BoundedSink:
         while self._tail_bytes > self._keep and len(self._tail) > 1:
             self._tail_bytes -= len(self._tail.popleft())
 
+    def _fit_tail(self, budget):
+        """Trim the retained tail to ``budget`` bytes, so marker + tail can never breach the cap.
+
+        ``_remember`` always keeps at least one chunk, even one larger than ``_keep`` (a child can
+        write a 16 KiB line with no newline), and a small configured ``CC_LOG_MAX_BYTES`` would
+        then let the rewrite land back over the bound. "Never exceeds MAX_BYTES" is the documented
+        promise, so it is enforced here rather than assumed (fresh-agent review, issue #481)."""
+        chunks = list(self._tail)
+        total = sum(len(c) for c in chunks)
+        while chunks and total > budget:
+            total -= len(chunks.pop(0))
+        if not chunks and budget > 0 and self._tail:
+            last = self._tail[-1]
+            chunks = [last[-budget:]]           # keep the newest bytes of an oversized line
+        return chunks
+
     def _cap(self):
         """Truncate to zero and rewrite the retained tail behind one honest marker line."""
         dropped = max(0, self._size - self._tail_bytes)
@@ -186,13 +221,20 @@ class BoundedSink:
             self._cappable = False   # cannot be capped after all; stop pretending it can
             self._size = 0
             return
-        marker = ("%s command-center: log capped at %d bytes — dropped the oldest %d bytes, kept "
-                  "the most recent %d (bound: CC_LOG_MAX_BYTES)\n"
-                  % (stamp(self._clock()), self._max, dropped, self._tail_bytes))
+        stamped = stamp(self._clock())
+        # Size the marker first, then give the tail whatever the cap has left over — the rewrite is
+        # what has to fit under the bound, not just the truncation.
+        head = ("%s command-center: log capped at %d bytes — dropped the oldest %d bytes, kept "
+                "the most recent " % (stamped, self._max, dropped))
+        chunks = self._fit_tail(max(0, self._max - len(head.encode("utf-8", "replace")) - 64))
+        kept = sum(len(c) for c in chunks)
+        marker = "%s%d (bound: CC_LOG_MAX_BYTES)\n" % (head, kept)
         self._size = 0
         self._raw_write(marker.encode("utf-8", "replace"))
-        for chunk in list(self._tail):
+        for chunk in chunks:
             self._raw_write(chunk)
+        self._tail = deque(chunks)
+        self._tail_bytes = kept
 
     def size(self):
         return self._size
@@ -235,7 +277,7 @@ class Collapser:
 
     def feed(self, line):
         now = self._clock()
-        key = fingerprint(line)
+        key = collapse_key(line)
         entry = self._seen.get(key)
         if entry is None:
             out = []
@@ -404,15 +446,25 @@ class _Pump(threading.Thread):
         self._buf = b""
 
     def run(self):
+        clean = False
         try:
-            self._loop()
+            clean = self._loop()
         except Exception:
-            self._bail_out()
-        finally:
-            try:
-                self._handle.logbook.flush()
-            except Exception:
-                pass
+            clean = False
+        try:
+            if clean:
+                # EOF: every writer is gone, the process is on its way out. Putting the original
+                # fds back costs nothing and covers the case where the pipe closed but the process
+                # lives on — a writer must never be left pointing at a pipe nobody reads.
+                self._handle.restore()
+            else:
+                self._bail_out()
+        except Exception:
+            pass
+        try:
+            self._handle.logbook.flush()
+        except Exception:
+            pass
 
     def _bail_out(self):
         """The one failure that could actually wedge the dashboard, answered.
@@ -445,12 +497,18 @@ class _Pump(threading.Thread):
                 break
 
     def _loop(self):
+        """Read until EOF. Returns ``True`` for a clean end-of-pipe, ``False`` for a fault.
+
+        The distinction is load-bearing, not cosmetic: a fault means fds 1 and 2 still point at a
+        pipe this thread has stopped draining, and the next writer to fill it would block forever.
+        Only the caller can tell those apart, so every fault path must come back as ``False``
+        rather than a bare ``return`` (fresh-agent review, issue #481)."""
         book = self._handle.logbook
         while True:
             try:
                 ready, _, _ = select.select([self._fd], [], [], self._tick)
             except (OSError, ValueError):
-                return
+                return False
             if not ready:
                 book.tick()
                 continue
@@ -459,10 +517,10 @@ class _Pump(threading.Thread):
             except OSError as e:
                 if e.errno in (errno.EINTR, errno.EAGAIN):
                     continue
-                return
+                return False
             if not chunk:
                 self._drain()
-                return          # every writer is gone: the process is on its way out
+                return True     # every writer is gone: the process is on its way out
             self._buf += chunk
             self._consume()
 
@@ -526,7 +584,42 @@ def install(target_fds=(1, 2), max_bytes=None, keep_bytes=None,
     handle.pump = pump
     pump.start()
     atexit.register(_shutdown, handle)
+    _catch_termination(handle)
     return handle
+
+
+def _catch_termination(handle):
+    """Flush the log on SIGTERM/SIGHUP too, not only on a clean exit.
+
+    ``atexit`` does not run for a default-disposition SIGTERM — and SIGTERM is exactly how this
+    process is normally stopped: ``bin/liftoff``'s ``--restart-dashboard`` signals the pid the
+    dashboard published for itself, and launchd stops a job the same way. Without this, a restart
+    during a flood drops the current window's suppressed count on the floor and the log's last word
+    about it is a lie by omission (fresh-agent review, issue #481).
+
+    The handler flushes, then re-raises the signal with its default disposition, so the exit status
+    the supervisor sees is unchanged. Signals can only be installed from the main thread; anywhere
+    else this is simply a no-op."""
+    def _on_signal(signum, frame):
+        try:
+            _shutdown(handle)
+        except Exception:
+            pass
+        try:
+            signal.signal(signum, signal.SIG_DFL)
+            os.kill(os.getpid(), signum)
+        except Exception:                        # pragma: no cover — the kill above ends us
+            os._exit(1)
+
+    for name in ("SIGTERM", "SIGHUP"):
+        sig = getattr(signal, name, None)
+        if sig is None:
+            continue
+        try:
+            if signal.getsignal(sig) in (signal.SIG_DFL, None):
+                signal.signal(sig, _on_signal)
+        except (ValueError, OSError, RuntimeError):
+            pass          # not the main thread, or the platform refuses — the log is not worth a crash
 
 
 def _shutdown(handle):
