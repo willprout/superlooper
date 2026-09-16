@@ -349,7 +349,7 @@
      an absent verdict is not an all-clear, and rendering nothing is how this surface lied before. */
   function bindTruth(t) {
     t = t || {};
-    var tick = t.tick || {}, data = t.data || {}, eng = t.engine;
+    var tick = t.tick || {}, data = t.data || {}, eng = t.engine, tx = t.texts;
     // The level class colours the whole strip, so one glance at it summarises everything under it.
     fixedEls.truth.className = 'fld-truth lvl-' + esc(t.level || 'down');
     var rows = '<span class="r ' + esc(tick.state || 'down') + '">' +
@@ -360,6 +360,12 @@
     // the one time it matters he won't see it).
     if (eng && eng.text) {
       rows += '<span class="r eng ' + esc(eng.state || '') + '">' + esc(eng.text) + '</span>';
+    }
+    // When a text last reached the phone (issue #495). The morning report stopped texting quiet
+    // mornings and no heartbeat text replaced it, so this line is the channel's proof: calm when a
+    // text got through this week, and the strip's own notice level when none has.
+    if (tx && tx.text) {
+      rows += '<span class="r texts ' + esc(tx.state || '') + '">' + esc(tx.text) + '</span>';
     }
     fixedEls.truth.innerHTML = rows;
   }

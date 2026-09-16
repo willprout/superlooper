@@ -13,6 +13,8 @@ is an honest "could not parse" line, NEVER a silent green.
 """
 from pathlib import Path
 
+import pytest
+
 import nightly
 import report
 
@@ -1046,3 +1048,198 @@ def test_a_flight_that_died_before_finishing_still_reports_what_it_closed():
     assert "## Triage" in out and "#21" in out and "#30" in out
     summary = [ln for ln in out.splitlines() if ln.strip() and not ln.startswith("#")][0]
     assert "Triage: 1 merged · 1 closed · 0 escalated." in summary
+
+
+# --------------------------- the morning text only on news (issue #495) ---------------------------
+# The report FILE is written every day; the TEXT goes out only when the report has news. 43 of six
+# weeks' texts on this loop read "Nothing happened overnight — queue empty." News is an EVENT the
+# summary reports: a merge, a park or needs-owner hand-back, a bounce, an owner question, a conflict
+# regeneration, a wander, an unattended debugger, a runner resurrection, a triage-flight verdict, a
+# launch-queue hold, or a standing hold or freeze past its age threshold. A waiting queue is a
+# dashboard fact, not a morning event.
+
+_NEWS_NOW = 1_000_000
+_LAST_REPORT = _rec(_NEWS_NOW - DAY, "morning_report", date="2026-07-01", outcome="ok")
+_OVERNIGHT = _NEWS_NOW - 3600          # after the last report: tonight's window
+_LAST_WEEK = _NEWS_NOW - 3 * DAY       # before the last report, inside the 7-day trend window
+
+
+def _six_queued():
+    return [{"num": n, "title": "issue %d" % n} for n in range(40, 46)]
+
+
+_NEWS_TABLE = [
+    # (label, overnight records, view overrides, expected news classes)
+    ("an empty night", [], {}, []),
+    ("six queued and nothing else", [], {"queue": _six_queued()}, []),
+    ("a freeze younger than its threshold (the freeze already paged)",
+     [], {"frozen": {"reason": "dev checks red: tests (failure)", "since": _NEWS_NOW - 3600}}, []),
+    ("installed-engine drift (file only, never the text)",
+     [], {"engine_drift": {"status": "behind", "behind": 4, "ref": "main"}}, []),
+    ("a green nightly", [_rec(_OVERNIGHT, "nightly", date="2026-07-02", green=True, flakes=0,
+                             persistent=0, filed=[], parse_error=False, outcome="ok")], {}, []),
+    ("a watchdog countdown that launched nothing",
+     [_rec(_OVERNIGHT, "watchdog", outcome="notified", signals=["alert"], grace_seconds=1800,
+           authority="full", launch_due_at=_OVERNIGHT + 1800, texted=False)], {}, []),
+    ("a hold younger than its threshold",
+     [], {"issues_state": _held_state(i12=_launch_held(_NEWS_NOW - 60))}, []),
+    ("a regeneration from before the last report (still in the 7-day trend section)",
+     [_rec(_LAST_WEEK, "regenerate", id="i7", num=7, new_branch="sl/i7-r2", conflicts=1,
+           outcome="ok")], {}, []),
+    ("a park the owner already closed on GitHub",
+     [_rec(_OVERNIGHT, "park", id="i9", num=9, memo="retry cap", outcome="ok"),
+      _rec(_OVERNIGHT + 60, "absorb_close", id="i9", num=9, outcome="ok")], {}, []),
+    ("a merge", [_rec(_OVERNIGHT, "merge", id="i7", num=7, pr=12, outcome="ok")], {}, ["merge"]),
+    ("an absorbed out-of-band merge",
+     [_rec(_OVERNIGHT, "absorb_merged", id="i8", num=8, outcome="ok")], {}, ["merge"]),
+    ("a park", [_rec(_OVERNIGHT, "park", id="i9", num=9, memo="retry cap", outcome="ok")], {},
+     ["park"]),
+    ("a needs-owner hand-back",
+     [_rec(_OVERNIGHT, "park", id="i10", num=10, needs_william=True, memo="conflict cap",
+           outcome="ok")], {}, ["park"]),
+    ("a bounce", [_rec(_OVERNIGHT, "bounce", id="i11", num=11, memo="BOUNCED: x", outcome="ok")],
+     {}, ["bounce"]),
+    ("an owner question",
+     [_rec(_OVERNIGHT, "post_question", id="i13", num=13, question="A or B?", outcome="ok")], {},
+     ["owner_question"]),
+    ("a conflict regeneration tonight",
+     [_rec(_OVERNIGHT, "regenerate", id="i7", num=7, new_branch="sl/i7-r2", conflicts=1,
+           outcome="ok")], {}, ["regeneration"]),
+    ("a wander", [_rec(_OVERNIGHT, "hold", id="i12", num=12, wander=True, outcome="ok")], {},
+     ["wander"]),
+    ("an unattended debugger launch",
+     [_rec(_OVERNIGHT, "watchdog", outcome="launched", id="d1", signals=["heartbeat_stale"],
+           authority="full")], {}, ["unattended_debugger"]),
+    ("an unattended debugger that failed to launch",
+     [_rec(_OVERNIGHT, "watchdog", outcome="launch_failed", id="d1", rc="no_pane",
+           signals=["alert"])], {}, ["unattended_debugger"]),
+    ("a runner resurrection",
+     [_rec(_OVERNIGHT, "runner_resurrect", outcome="resurrected", id="r1",
+           signals=["heartbeat_stale"])], {}, ["runner_resurrection"]),
+    ("a triage-flight verdict",
+     [_rec(_OVERNIGHT, "triage_close", num=30, date="2026-07-02", verdict="overtaken",
+           commit="abc1234", detail="overtaken", outcome="ok")], {}, ["triage"]),
+    ("a launch-queue hold",
+     [], {"queue_hold": {"reasons": ["auth_dead"], "since": _NEWS_NOW - 600}}, ["queue_hold"]),
+    ("a hold past its age threshold",
+     [], {"issues_state": _held_state(i12=_launch_held(_NEWS_NOW - 2 * DAY))}, ["aged_hold"]),
+    ("a freeze past its age threshold",
+     [], {"frozen": {"reason": "dev checks red: tests (failure)", "since": _NEWS_NOW - 2 * DAY}},
+     ["aged_hold"]),
+]
+
+
+@pytest.mark.parametrize("label,records,over,expected", _NEWS_TABLE,
+                         ids=[row[0] for row in _NEWS_TABLE])
+def test_news_is_exactly_the_event_classes_the_summary_reports(label, records, over, expected):
+    view = _view(now=_NEWS_NOW, queue=[], usage=None)
+    view.update(over)
+    assert report.morning_news([_LAST_REPORT] + records, view, config=_cfg()) == expected
+
+
+def test_every_news_class_in_the_table_is_one_the_module_names():
+    covered = {c for row in _NEWS_TABLE for c in row[3]}
+    assert covered == set(report.NEWS_CLASSES)
+
+
+def test_news_lists_every_class_present_in_the_modules_order():
+    records = [_LAST_REPORT,
+               _rec(_OVERNIGHT, "bounce", id="i11", num=11, memo="BOUNCED: x", outcome="ok"),
+               _rec(_OVERNIGHT, "merge", id="i7", num=7, pr=12, outcome="ok")]
+    view = _view(now=_NEWS_NOW, queue=_six_queued(), usage=None)
+    assert report.morning_news(records, view, config=_cfg()) == ["merge", "bounce"]
+
+
+def test_a_quiet_file_still_renders_the_queue_it_does_not_text():
+    # the report FILE is unchanged by the quiet rule: six queued still reads in its summary tally
+    view = _view(now=_NEWS_NOW, queue=_six_queued(), usage=None)
+    out = report.morning([_LAST_REPORT], view, ledger={}, config=_cfg())
+    assert report.morning_news([_LAST_REPORT], view, config=_cfg()) == []
+    summary = next(ln for ln in out.splitlines() if ln.strip() and not ln.startswith("#"))
+    assert "queue: 6" in summary
+
+
+def test_news_never_raises_on_garbage():
+    assert report.morning_news(None, None) == []
+    assert report.morning_news("nope", 5, config=[]) == []
+
+
+# --------------------------- the channel as a visible AGE (issue #495) ---------------------------
+# No heartbeat text (owner ruling 2026-09-16): a dead channel only matters when there is work, and the
+# owner looks at the dashboard when he approves work. So the proof becomes an age — the newest text of
+# ANY kind that reached the phone — and the report says plainly when nothing has in more than a week.
+
+def _canary(ts, ok=True, channel="cmd", rc=0, detail="", tier="waiting", caller="decide:park"):
+    return _rec(ts, "notify_canary", ok=ok, channel=channel, rc=rc, detail=detail, tier=tier,
+                caller=caller, outcome="ok")
+
+
+def _channel_line(records, now):
+    health = _gate_health_section(report.morning(records, _view(now=now), ledger={}, config=_cfg()))
+    return next(ln for ln in health.splitlines() if "notify channel" in ln.lower())
+
+
+def test_the_channel_line_states_the_age_of_the_last_delivered_text():
+    now = 1_000_000
+    line = _channel_line([_canary(now - 3 * 3600)], now)
+    assert "last text delivered 3h 0m ago" in line and "cmd" in line
+    assert "week" not in line                                    # a fresh delivery is stated calmly
+
+
+def test_any_tier_of_text_is_the_proof_not_only_the_morning_one():
+    now = 1_000_000
+    j = [_canary(now - 5 * DAY, tier="morning", caller="runner:morning_report"),
+         _canary(now - 2 * 3600, tier="down", caller="runner:tick_errors")]
+    assert "last text delivered 2h 0m ago" in _channel_line(j, now)
+
+
+def test_nothing_delivered_in_more_than_a_week_is_said_plainly():
+    now = 1_000_000
+    line = _channel_line([_canary(now - 9 * DAY)], now)
+    assert "more than a week" in line and "9d 0h ago" in line
+    assert "doctor --stack" in line
+
+
+def test_an_old_journal_with_no_delivery_at_all_says_more_than_a_week():
+    now = 1_000_000
+    line = _channel_line([_rec(now - 10 * DAY, "merge", id="i7", num=7, outcome="ok")], now)
+    assert "more than a week" in line and "doctor --stack" in line
+
+
+def test_a_young_journal_with_no_delivery_says_not_verified_without_claiming_a_week():
+    now = 1_000_000
+    line = _channel_line([_rec(now - 3600, "merge", id="i7", num=7, outcome="ok")], now)
+    assert "not verified" in line.lower() and "week" not in line
+
+
+def test_a_failed_text_after_a_delivery_is_dead_and_still_ages_the_last_delivery():
+    now = 1_000_000
+    j = [_canary(now - 2 * DAY), _canary(now - 60, ok=False, rc=2, detail="recipient file missing")]
+    line = _channel_line(j, now)
+    assert "DEAD" in line and "recipient file missing" in line
+    assert "last text delivered 2d 0h ago" in line
+
+
+def test_a_log_only_record_is_never_counted_as_a_delivery():
+    now = 1_000_000
+    j = [_canary(now - 60, channel="log-only")]
+    line = _channel_line(j, now)
+    assert "no channel configured" in line.lower() and "last text delivered" not in line
+    v = report.notify_canary(j, now=now)
+    assert v["last_delivered_at"] is None
+
+
+def test_the_verdict_carries_the_last_delivery_whatever_came_after():
+    j = [_canary(1000, channel="imessage"), _canary(2000, ok=False, channel="imessage", rc=1),
+         _canary(1500, channel="log-only")]
+    v = report.notify_canary(j)
+    assert v["status"] == "dead"
+    assert (v["last_delivered_at"], v["last_delivered_channel"]) == (1000, "imessage")
+
+
+def test_a_delivery_with_no_readable_time_proves_nothing():
+    now = 1_000_000
+    j = [_rec(None, "notify_canary", ok=True, channel="cmd", rc=0, outcome="ok")]
+    v = report.notify_canary(j, now=now)
+    assert v["last_delivered_at"] is None
+    assert "last text delivered" not in _channel_line(j, now)

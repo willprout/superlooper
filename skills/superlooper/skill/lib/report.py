@@ -347,15 +347,44 @@ def _questions(records, window_start):
     return lines, total
 
 
-def notify_canary(records, now=None, max_age_seconds=None):
-    """What the LATEST notify-channel canary says, as a verdict dict (issue #164).
+# The channel's proof is the newest text that reached the phone (issue #495). Past this age with none,
+# the report says so plainly: the channel is unproven, and a dead one would stay invisible until the
+# day there is work to page about.
+CHANNEL_STALE_SECONDS = WEEK_SECONDS
 
-    The daily morning push doubles as the channel heartbeat: the runner journals its delivery result
-    as `notify_canary`, and this reads the newest one back — so a SILENTLY dead channel (once dead
-    for days, found only by a human reading the journal) is visible on the surfaces a dead channel
-    could never itself reach. Returns
+# A canary on one of these "channels" delivered nothing to anyone: log-only is no channel configured,
+# and a refusal never reached a channel at all.
+_NOT_A_DELIVERY = frozenset({"log-only", "refused"})
+
+
+def _last_delivered(canaries):
+    """(ts, channel) of the newest canary that DELIVERED a text, or (None, None). A delivery with no
+    readable ts proves nothing about when the channel last worked, so it is skipped — never read as
+    fresh."""
+    best = (None, None)
+    for r in canaries:
+        ts, channel = _since(_ts(r)), r.get("channel")
+        if (ts is None or r.get("ok") is not True or not isinstance(channel, str) or not channel
+                or channel in _NOT_A_DELIVERY):
+            continue
+        if best[0] is None or ts >= best[0]:
+            best = (ts, channel)
+    return best
+
+
+def notify_canary(records, now=None, max_age_seconds=None):
+    """What the notify-channel canary says, as a verdict dict (issues #164, #495).
+
+    Every text the notify doorway attempts is journaled as `notify_canary` — delivered, failed or
+    log-only, whatever its tier and sender — and this reads them back, so a SILENTLY dead channel
+    (once dead for days, found only by a human reading the journal) is visible on the surfaces a
+    dead channel could never itself reach. Returns
     ``{"status": "unverified"|"unconfigured"|"healthy"|"dead", "channel": str, "rc": int|None,
-    "detail": str}``.
+    "detail": str, "last_delivered_at": epoch|None, "last_delivered_channel": str|None}``.
+
+    `status` is the LATEST attempt's word: the channel as it stood when something last tried it.
+    `last_delivered_at` is the newest attempt that actually reached a channel, whatever came after —
+    the AGE the owner reads (issue #495), which a later failure does not erase.
 
     Fail closed: a wrong-typed/absent record reads as `unverified`, never a false green; a
     `log-only` result is `unconfigured`, never 'healthy'; and `ok` must be EXACTLY True (a truthy
@@ -367,12 +396,15 @@ def notify_canary(records, now=None, max_age_seconds=None):
     a channel nothing has exercised in a week is not "healthy", it is unproven. Only a DELIVERED
     canary is aged out; a `dead`/`unconfigured` one stays as-is (its warning does not go stale).
 
-    Structured rather than pre-rendered because there are now two readers with different shapes —
-    the morning report's markdown bullet (``_notify_channel`` below) and ``superlooper upkeep``'s
-    one-line weekly census. One verdict, two renderings; the verdict lives here."""
+    Structured rather than pre-rendered because there are several readers with different shapes —
+    the morning report's markdown bullet (``_notify_channel`` below), ``superlooper upkeep``'s
+    one-line weekly census and the stack doctor's evidence clause. One verdict, several renderings;
+    the verdict lives here."""
     canaries = [r for r in _records(records) if r.get("act") == "notify_canary"]
+    delivered_at, delivered_channel = _last_delivered(canaries)
+    last = {"last_delivered_at": delivered_at, "last_delivered_channel": delivered_channel}
     if not canaries:
-        return {"status": "unverified", "channel": "?", "rc": None, "detail": ""}
+        return {"status": "unverified", "channel": "?", "rc": None, "detail": "", **last}
     latest = max(canaries, key=lambda r: _ts(r) if _ts(r) is not None else float("-inf"))
     channel = latest.get("channel")
     channel = channel if isinstance(channel, str) and channel else "?"
@@ -381,7 +413,7 @@ def notify_canary(records, now=None, max_age_seconds=None):
     detail = latest.get("detail")
     detail = detail.strip() if isinstance(detail, str) and detail.strip() else ""
     if channel == "log-only":
-        return {"status": "unconfigured", "channel": channel, "rc": rc, "detail": detail}
+        return {"status": "unconfigured", "channel": channel, "rc": rc, "detail": detail, **last}
     if latest.get("ok") is True:               # `is True`: a truthy string must never read as green
         # Age-out a stale delivery for a windowed (weekly) reader. A missing/corrupt ts fails
         # CLOSED — it cannot prove freshness, so it cannot read as healthy.
@@ -392,33 +424,61 @@ def notify_canary(records, now=None, max_age_seconds=None):
                 why = ("last delivery was %dd ago — older than the report window"
                        % int((now - ts) // 86400)) if ts is not None else \
                       "last delivery has no readable timestamp — cannot confirm it is recent"
-                return {"status": "unverified", "channel": channel, "rc": rc, "detail": why}
-        return {"status": "healthy", "channel": channel, "rc": rc, "detail": detail}
+                return {"status": "unverified", "channel": channel, "rc": rc, "detail": why, **last}
+        return {"status": "healthy", "channel": channel, "rc": rc, "detail": detail, **last}
     return {"status": "dead", "channel": channel, "rc": rc,
-            "detail": detail or "(no error captured)"}
+            "detail": detail or "(no error captured)", **last}
 
 
-def _notify_channel(records):
-    """The notify-channel canary line (issue #164) — the morning report's rendering of
-    `notify_canary`'s verdict."""
+def _delivered_age(v, now):
+    """The age of the verdict's last delivered text as the report speaks it ("3h 12m"), or None when
+    there is none or its age cannot be rendered honestly."""
+    at = v.get("last_delivered_at")
+    return None if at is None else _age(now - at)
+
+
+def _notify_channel(records, now):
+    """The notify-channel line (issues #164, #495) — the morning report's rendering of
+    `notify_canary`'s verdict. It states the AGE of the last text that reached the phone, of any
+    kind: with no daily heartbeat text, that age IS the channel's proof, and past a week without one
+    the line says so plainly."""
     v = notify_canary(records)
     channel = v["channel"]
-    if v["status"] == "unverified":
-        return "- Notify channel: not verified this cycle (no canary recorded)."
+    age = _delivered_age(v, now)
+    last = (f"last text delivered {age} ago (via {v['last_delivered_channel']})" if age is not None
+            else None)
     if v["status"] == "unconfigured":
         return ("- Notify channel: **no channel configured** — pushes go to the journal only; set "
                 "`notify.imessage_to` or `notify.cmd` so alerts can reach your phone.")
-    if v["status"] == "healthy":
-        return f"- Notify channel: healthy (last push delivered via {channel})."
-    # dead -> the last push did NOT deliver. Say so loudly, naming the channel + reason: this line
-    # is the whole point — the owner reads it here even when the channel can't reach them.
-    rc_s = f", rc={v['rc']}" if v["rc"] is not None else ""
-    return (f"- Notify channel: **DEAD** — the last push did not deliver via {channel}{rc_s}: "
-            f"{v['detail']}. Pushes are **not reaching you**; fix the channel and re-run "
-            "`superlooper doctor --stack`.")
+    if v["status"] == "dead":
+        # the last attempt did NOT deliver. Say so loudly, naming the channel + reason: this line is
+        # the whole point — the owner reads it here even when the channel can't reach them.
+        rc_s = f", rc={v['rc']}" if v["rc"] is not None else ""
+        since = f" The {last}." if last else " No delivered text is on record."
+        return (f"- Notify channel: **DEAD** — the last push did not deliver via {channel}{rc_s}: "
+                f"{v['detail']}. Pushes are **not reaching you**; fix the channel and re-run "
+                f"`superlooper doctor --stack`.{since}")
+    at = v["last_delivered_at"]
+    if last and now - at <= CHANNEL_STALE_SECONDS:
+        return f"- Notify channel: {last}."
+    test = "`superlooper doctor --stack` sends a live test"
+    if at is not None and last is None:
+        # a delivery stamped in the future (a clock jump): neither fresh nor a week old, provably
+        return f"- Notify channel: not verified — the last delivered text's time cannot be read; {test}."
+    if last:
+        return (f"- Notify channel: **nothing delivered in more than a week** — the {last}. A dead "
+                f"channel would stay invisible until there is work to page about; {test}.")
+    stamps = [t for t in (_since(_ts(r)) for r in records) if t is not None]
+    if stamps and now - min(stamps) > CHANNEL_STALE_SECONDS:
+        return ("- Notify channel: **nothing delivered in more than a week** — no delivered text is "
+                f"in the journal. A dead channel would stay invisible until there is work to page "
+                f"about; {test}.")
+    # A journal too young to say "a week", or a delivery whose time cannot be read: unproven, and
+    # saying no more than that.
+    return f"- Notify channel: not verified — no delivered text is on record yet; {test}."
 
 
-def _gate_health(records, window_start, ledger, config):
+def _gate_health(records, window_start, ledger, config, now):
     nightlies = [r for r in records if r.get("act") == "nightly"
                  and (_ts(r) is None or _ts(r) >= window_start)]
     quarantine = _dict(config).get("qa", {})
@@ -457,7 +517,7 @@ def _gate_health(records, window_start, ledger, config):
     else:
         lines.append("- Nightly: no runs recorded in the last 7 days.")
     lines.append(f"- Quarantine: {q_size} test(s). Accepted known failures: {accepted}.")
-    lines.append(_notify_channel(records))     # issue #164: the channel canary rides the health block
+    lines.append(_notify_channel(records, now))   # #164/#495: the channel's age rides the health block
     truncated = _notify_truncations(records, window_start)
     if truncated:                               # issue #493: silent on a window with none
         lines.append(truncated)
@@ -997,6 +1057,85 @@ def _section(title, lines, empty="None."):
 
 # --------------------------- the report ---------------------------
 
+def _facts(journal_records, gh_view, config):
+    """Every derived piece the morning report is built from, computed ONCE — the rendering below and
+    the send decision (``morning_news``) read the same pass, so the text can never go out on a
+    different reading of the night than the file it summarizes. Coerces every arg."""
+    records = _records(journal_records)
+    view = _dict(gh_view)
+    cfg = _dict(config)
+    repo = _repo(cfg)
+    now = _reference_now(view, records)
+    week_start = now - WEEK_SECONDS         # the 7-day trend window (regenerations, gate health)
+    overnight_start = _overnight_start(records, now)   # since the last report (overnight sections)
+
+    # Reconcile park records against final outcomes (#37): a park that later merged this window is
+    # resolved, so it leaves the open-ask Parked section and is annotated on its Merged line. A
+    # park/bounce the owner CLOSED on GitHub (#108, an absorb_close) is likewise no longer an open
+    # ask — it drops from Parked/Bounces but is NOT a landing, so it never renders under Merged.
+    resolved_parks = _reconciled_parks(records, overnight_start)
+    owner_closed = _owner_closed(records, overnight_start)
+    questions, q_total = _questions(records, overnight_start)   # owner-question rate (#163)
+    holds = standing_holds(view.get("issues_state"), records)   # standing holds + ages (#405)
+    return {
+        "records": records, "view": view, "cfg": cfg, "repo": repo, "now": now,
+        "week_start": week_start, "overnight_start": overnight_start,
+        "merged": _merged(records, repo, overnight_start, resolved_parks),
+        "parked": _parked(records, overnight_start, resolved_parks | owner_closed),
+        "bounces": _bounces(records, overnight_start, owner_closed),
+        "regens": _regenerations(records, week_start),
+        # The SAME regenerations, since the last report: the section and its tally keep the 7-day
+        # tuning trend, but a regeneration is news only on the morning after it happened (#495) —
+        # else one rebuild would text the owner seven mornings running.
+        "regens_overnight": _regenerations(records, overnight_start),
+        "wanders": _wanders(records, overnight_start),
+        "watchdog": _watchdog(records, overnight_start),
+        "countdowns": _watchdog_countdowns(records, overnight_start),  # never a quiet-breaker (#494)
+        "resurrections": _resurrection(records, overnight_start),      # runner auto-restarts (#208)
+        "questions": questions, "q_total": q_total,
+        "triage_lines": _triage(records, repo, overnight_start),       # the triage flight (#449)
+        "holds": holds,
+        "hold_alerts": _hold_alerts(holds, view, now),
+        "queue_hold": _queue_hold(view, now),                          # the PAUSED queue (#320)
+        "frozen": isinstance(view.get("frozen"), dict) and bool(view.get("frozen")),
+        "queue": [q for q in view.get("queue") if isinstance(q, dict)]
+        if isinstance(view.get("queue"), list) else [],
+    }
+
+
+# The event classes that make a morning report worth a TEXT (issue #495), in the order the summary
+# line reports them. Each maps to the derived section that carries it. Deliberately ABSENT:
+#   * the queue — six approved issues waiting is a dashboard fact, not a morning event;
+#   * a freeze younger than FREEZE_ALERT_SECONDS — every freeze already texts on its own edge
+#     (actions: "every freeze emits notify"), so the morning would only say it twice; past the
+#     threshold it is a stall and rides `aged_hold`;
+#   * installed-engine drift — a standing nudge for the file, never the phone;
+#   * a routine green nightly and a watchdog countdown that launched nothing (already never news).
+NEWS_CLASSES = ("merge", "park", "bounce", "owner_question", "regeneration", "wander",
+                "unattended_debugger", "runner_resurrection", "triage", "queue_hold", "aged_hold")
+_NEWS_FACTS = (("merge", "merged"), ("park", "parked"), ("bounce", "bounces"),
+               ("owner_question", "questions"), ("regeneration", "regens_overnight"),
+               ("wander", "wanders"), ("unattended_debugger", "watchdog"),
+               ("runner_resurrection", "resurrections"), ("triage", "triage_lines"),
+               ("queue_hold", "queue_hold"), ("aged_hold", "hold_alerts"))
+
+
+# Why a quiet morning sent no text — the journaled reason on the skip record both morning-report entry
+# points write, so the journal says the push was withheld by rule, not lost.
+QUIET_SKIP_REASON = ("quiet report — no merge, park, bounce, owner question, regeneration, wander, "
+                     "unattended debugger, runner resurrection, triage verdict, queue hold or aged "
+                     "hold since the last report (a waiting queue is not news); the file is written, "
+                     "no text sent")
+
+
+def morning_news(journal_records, gh_view, config=None):
+    """The news classes present in this morning's report, in NEWS_CLASSES order — [] means QUIET: the
+    report file is still written, but no text goes out (issue #495). Same args as morning() (minus
+    the ledger, which carries no news). PURE; never raises."""
+    f = _facts(journal_records, gh_view, config)
+    return [cls for cls, key in _NEWS_FACTS if f[key]]
+
+
 def morning(journal_records, gh_view, ledger, config):
     """Render the morning report markdown. Args:
       journal_records  list of journal.read() dicts (the overnight action log).
@@ -1013,37 +1152,16 @@ def morning(journal_records, gh_view, ledger, config):
       ledger           the known-failure ledger dict {fingerprint: {...}} (accepted-failure count).
       config           the per-repo config (repo for links, qa.quarantine size).
     Never raises; every arg is coerced to a safe empty shape."""
-    records = _records(journal_records)
-    view = _dict(gh_view)
-    cfg = _dict(config)
-    repo = _repo(cfg)
-    now = _reference_now(view, records)
-    week_start = now - WEEK_SECONDS         # the 7-day trend window (regenerations, gate health)
-    overnight_start = _overnight_start(records, now)   # since the last report (overnight sections)
+    f = _facts(journal_records, gh_view, config)
+    records, view, cfg, repo, now = f["records"], f["view"], f["cfg"], f["repo"], f["now"]
+    week_start, overnight_start = f["week_start"], f["overnight_start"]
+    merged, parked, bounces, regens = f["merged"], f["parked"], f["bounces"], f["regens"]
+    wanders, watchdog, countdowns = f["wanders"], f["watchdog"], f["countdowns"]
+    resurrections, questions, q_total = f["resurrections"], f["questions"], f["q_total"]
+    triage_lines, holds, hold_alerts = f["triage_lines"], f["holds"], f["hold_alerts"]
+    queue_hold, frozen, queue = f["queue_hold"], f["frozen"], f["queue"]
     date = view.get("date")
     date = date if isinstance(date, str) and date.strip() else "(date unknown)"
-
-    # Reconcile park records against final outcomes (#37): a park that later merged this window is
-    # resolved, so it leaves the open-ask Parked section and is annotated on its Merged line. A
-    # park/bounce the owner CLOSED on GitHub (#108, an absorb_close) is likewise no longer an open
-    # ask — it drops from Parked/Bounces but is NOT a landing, so it never renders under Merged.
-    resolved_parks = _reconciled_parks(records, overnight_start)
-    owner_closed = _owner_closed(records, overnight_start)
-    merged = _merged(records, repo, overnight_start, resolved_parks)
-    parked = _parked(records, overnight_start, resolved_parks | owner_closed)
-    bounces = _bounces(records, overnight_start, owner_closed)
-    regens = _regenerations(records, week_start)
-    wanders = _wanders(records, overnight_start)
-    watchdog = _watchdog(records, overnight_start)
-    countdowns = _watchdog_countdowns(records, overnight_start)   # never a quiet-breaker (#494)
-    resurrections = _resurrection(records, overnight_start)     # runner auto-restarts (#208)
-    questions, q_total = _questions(records, overnight_start)   # owner-question rate (#163)
-    triage_lines = _triage(records, repo, overnight_start)      # the triage flight (#449)
-    holds = standing_holds(view.get("issues_state"), records)   # standing holds + ages (#405)
-    hold_alerts = _hold_alerts(holds, view, now)
-    queue_hold = _queue_hold(view, now)                         # the PAUSED queue (#320)
-    frozen = isinstance(view.get("frozen"), dict) and bool(view.get("frozen"))
-    queue = [q for q in view.get("queue") if isinstance(q, dict)] if isinstance(view.get("queue"), list) else []
 
     # A routine (green) nightly is the system working, not activity that needs William — and one
     # runs EVERY night, so counting it here would mean no night is ever quiet. A RED nightly shows
@@ -1060,6 +1178,8 @@ def morning(journal_records, gh_view, ledger, config):
     # A triage flight breaks quiet unconditionally: it is an autonomous session that CLOSED and
     # MERGED the owner's issues on a standing delegation, and "nothing happened overnight" over a
     # night when six issues were shut is the one sentence that would retire the delegation.
+    # This `quiet` words the FILE's summary line and is unchanged by #495; whether a TEXT goes out is
+    # morning_news's narrower question (no queue, no young freeze, tonight's regenerations only).
     quiet = not any((merged, parked, bounces, regens, wanders, watchdog, resurrections,
                      questions, queue, frozen, hold_alerts, queue_hold, triage_lines))
     summary = ("Nothing happened overnight — queue empty." if quiet else
@@ -1114,7 +1234,7 @@ def morning(journal_records, gh_view, ledger, config):
         # section above, which renders its own "None." line. A delegation that did not fly is not a
         # standing item on the owner's morning.
         *([_section("Triage", triage_lines)] if triage_lines else []),
-        _section("Gate health", _gate_health(records, week_start, ledger, cfg)),
+        _section("Gate health", _gate_health(records, week_start, ledger, cfg, now)),
         _section("Standing holds", _standing_holds(holds, now), "None — nothing is held."),
         "## Freeze state\n" + "\n".join(_freeze(view, now)) + "\n",
         _section("Usage / queue", _usage_queue(view)),

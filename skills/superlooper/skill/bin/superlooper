@@ -20,7 +20,7 @@
   doctor          preflight: config, required_checks (FAILS HARD when empty), gh, labels,
                   accidental issue closes (COMPLETED with no merged PR behind it, issue #229),
                   cmux, jq, launch shim, activity hooks; --stack checks machine-level blocks
-  morning-report  render reports/morning-<date>.md from the journal + notify (Task 11)
+  morning-report  render reports/morning-<date>.md from the journal; text it only on news (Task 11)
   nightly         fresh worktree of origin/<dev> -> qa.nightly_cmd -> flake/persistent triage;
                   a persistent failure freezes merges + files a scoped fix issue (Task 12)
   triage-flight   launch today's TRIAGE FLIGHT (`t<N>`, issue #449) — the queue-hygiene session
@@ -2573,28 +2573,31 @@ def cmd_morning_report(args):
             # checkout, so a plain adopted repo simply carries no drift notice.
             "engine_drift": stack_doctor.engine_drift(
                 repo_path=args.repo, dev_branch=cfg.get("dev_branch"))}
-    text = report.morning(journal.read(home), view, _ledger_map(home), cfg)
+    records = journal.read(home)
+    text = report.morning(records, view, _ledger_map(home), cfg)
     out_dir = os.path.join(home, "reports")
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, f"morning-{date}.md")
     with open(out_path, "w") as f:
         f.write(text)
+    # The same quiet rule as runner.py's _morning_report_hook (issue #495): a report with no news is
+    # written but not texted, and the skip is journaled. `--always-send` is the operator asking for
+    # the text anyway — the one case a quiet report still reaches the phone.
+    if not args.always_send and not report.morning_news(records, view, cfg):
+        try:
+            journal.append(home, {"act": "morning_push_skipped", "date": date,
+                                  "reason": report.QUIET_SKIP_REASON,
+                                  "caller": "cli:morning_report", "outcome": "ok"}, time.time())
+        except (OSError, ValueError):
+            pass
+        print(f"wrote {out_path}\nnotify: not sent — the report has no news "
+              "(pass --always-send to text it anyway)")
+        return 0
     summary = next((ln for ln in text.splitlines()
                     if ln.strip() and not ln.startswith("#")), "morning report ready")
-    # The push doubles as the notify-channel canary (issue #164) — send_test sends the SAME message
-    # and returns its delivery result, journaled as `notify_canary` so the next report surfaces a
-    # silently dead channel. Kept in parity with runner.py's _morning_report_hook.
-    r = notify.send_test(cfg, notify.render(cfg, notify.MORNING, summary,
-                                            caller="cli:morning_report"), home=home)
-    try:
-        journal.append(home, {"act": "notify_canary", "date": date, "ok": bool(r.ok),
-                              "channel": r.channel, "rc": r.rc,
-                              "detail": (r.stderr or "")[:200], "outcome": "ok"}, time.time())
-    except (OSError, ValueError):
-        pass
-    outcome = ("log-only" if r.channel == "log-only"
-               else "sent via %s" % r.channel if r.ok
-               else "%s send failed (rc=%s)" % (r.channel, r.rc))
+    # The doorway journals this send as the channel canary (issue #495), like every other text.
+    outcome = notify.send(cfg, notify.render(cfg, notify.MORNING, summary,
+                                             caller="cli:morning_report"), home=home)
     print(f"wrote {out_path}\nnotify: {outcome}")
     return 0
 
@@ -4557,15 +4560,15 @@ def cmd_upkeep(args):
     records = journal.read(home)
 
     # WEEK_SECONDS window: a delivered canary older than the report window is not "healthy", it is
-    # unproven — the weekly cadence is what makes that freshness bound necessary (the morning
-    # report's canary is minutes old, so it passes no window). Read once, used twice: as the notify
+    # unproven — every text journals a canary (issue #495), but a quiet loop can send none for days,
+    # so a weekly reader needs the freshness bound. Read once, used twice: as the notify
     # ROW below, and as the evidence the stack's notify block cites when no channel is configured
     # (issue #406) — the same freshness discipline, so a months-old delivery is never cited as proof.
     notify_view = report.notify_canary(records, now=now, max_age_seconds=upkeep_lib.WEEK_SECONDS)
 
     # SKIP_SEND: doctor --stack proves the notify channel by SENDING one live message; upkeep must
     # not, so the block reports "configured, not sent" and the notify ROW below leans on the canary
-    # the morning push already journaled. announce is silenced for the same reason — there is no
+    # the last real text already journaled. announce is silenced for the same reason — there is no
     # side effect to announce.
     stack = stack_doctor.check_stack(cfg, sender=stack_doctor.SKIP_SEND,
                                      announce=lambda *a, **k: None, repo_path=args.repo,
@@ -6335,7 +6338,13 @@ def main(argv=None):
             "honestly — and so the morning report and the run log can never disagree."),
         **{"--json": dict(action="store_true",
                           help="emit a single JSON object (for a UI over the loop to parse)")})
-    add("morning-report", cmd_morning_report)
+    add("morning-report", cmd_morning_report,
+        description=(
+            "Render today's morning report into the state home's reports/ now, instead of waiting\n"
+            "for report_time. Like the scheduled report, it texts its summary only when the report\n"
+            "has news; a quiet report is written and not texted."),
+        **{"--always-send": dict(action="store_true",
+                                 help="text the summary even when the report is quiet")})
     add("promote-report", cmd_promote_report,
         **{"--use-latest-nightly": dict(action="store_true",
            help="reuse the latest nightly's results instead of running the suite now")})

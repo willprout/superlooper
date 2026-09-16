@@ -256,3 +256,35 @@ def test_boring_modes_levels_are_visually_distinct_without_animation():
             ".btruth.%s must paint its own ground/border — it cannot read as the healthy state" % lvl)
         assert "animation" not in block.group(1), (
             "boring mode is fully static (owner ruling) — the strip earns the eye without motion")
+
+
+# ============ the texts line reaches both strips (issue #495) ============
+# The morning report stopped texting quiet mornings and no heartbeat text replaced it, so "when did a
+# text last reach the phone?" is answered HERE — lib/texts decides, lib/truth words it, and these guard
+# the seam: both strips render the server's sentence, escaped, and a quiet channel never paints calm.
+
+def test_the_field_strip_renders_the_texts_line():
+    binder = re.search(r"function bindTruth\(t\)\s*\{(.*?)\n  \}", _FIELD, re.S)
+    body = binder.group(1)
+    assert re.search(r"t\.texts\b", body), "bindTruth must read the server's texts line"
+    assert re.search(r"esc\(tx\.text\)", body), "the texts line must be RENDERED, and escaped"
+    assert re.search(r"esc\(tx\.state", body), "the texts line must carry its state class"
+
+
+def test_boring_modes_strip_renders_each_repos_texts_line():
+    body = _boring_binder()
+    assert re.search(r"r\.texts\b", body), "each boring-mode row must read its repo's texts line"
+    assert re.search(r"esc\(tx\.text\)", body), "the texts line must be RENDERED, and escaped"
+
+
+def test_every_texts_state_but_delivered_has_its_own_boring_mode_ink():
+    # Same ratchet as the data states: the base `.btruth .r` IS the calm ink, so a quiet channel state
+    # with no rule would read as a working one. The vocabulary is lib/texts' own, never retyped here.
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+    import texts
+
+    for state in sorted(set(texts.STATES) - {texts.DELIVERED}):
+        rule = re.search(r"\.btruth \.r\.texts\.%s\b[^{]*\{([^}]*)\}" % re.escape(state), _CSS)
+        assert rule, ".btruth has no rule for texts state %r — it would read as a working channel" % state
+        assert re.search(r"color|font-weight", rule.group(1)), (
+            ".btruth .r.texts.%s must paint its own ink/weight" % state)

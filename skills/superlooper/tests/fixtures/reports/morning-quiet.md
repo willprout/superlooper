@@ -29,7 +29,7 @@ None — the runner did not go down.
 ## Gate health
 - Nightly: no runs recorded in the last 7 days.
 - Quarantine: 1 test(s). Accepted known failures: 0.
-- Notify channel: not verified this cycle (no canary recorded).
+- Notify channel: not verified — no delivered text is on record yet; `superlooper doctor --stack` sends a live test.
 
 ## Standing holds
 None — nothing is held.

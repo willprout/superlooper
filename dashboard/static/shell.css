@@ -605,6 +605,9 @@ html, body {
    quiet accent — "re-run the installer to switch them on" is an instruction, and an instruction
    the eye slides past is not one. */
 .fld-truth .r.eng { color: #E0B860; }
+/* A text that FAILED to send (issue #495) is the one texts reading that names a broken channel, so it
+   keeps a warm accent even on the notice ground; the other quiet-channel readings ride the level. */
+.fld-truth .r.texts.dead { color: #F2A48F; }
 
 /* NOTICE — something is drifting; nothing is broken. Amber, the field's existing caution colour
    (.fld-fmt owns it for the same register: a data-integrity caution, not an outage). */
@@ -813,6 +816,13 @@ html, body {
    precisely so the next state added server-side cannot reach the browser unpainted. */
 .btruth .r.unvouched { color: #8A5A12; font-weight: 700; }
 .btruth .r.eng { color: #8A5A12; }
+/* The texts line (issue #495): when a text last reached the phone. A text this week is the calm base
+   ink. Every other reading is a channel nothing has proven — amber, the degraded-not-broken register
+   — except a send that FAILED, which is the one where pages are known not to be arriving. Scoped
+   under .texts so its state names can never collide with the tick/data states above. */
+.btruth .r.texts.stale, .btruth .r.texts.unproven, .btruth .r.texts.unconfigured {
+  color: #8A5A12; font-weight: 700; }
+.btruth .r.texts.dead { color: #A3301C; font-weight: 700; }
 /* Level = the worst repo's. One glance at the strip's ground summarises everything under it. */
 .btruth.lvl-notice { background: #FDF6E6; border-color: #D9BE7E; border-left-color: #C08A22; }
 .btruth.lvl-down { background: #FDECE8; border-color: #E2A899; border-left-color: #C0341C; }

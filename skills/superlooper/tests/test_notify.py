@@ -349,7 +349,8 @@ def test_send_delivers_exactly_the_rendered_envelope(tmp_path, monkeypatch):
                       url="https://github.com/willprout/superlooper/issues/7")
     assert notify.send(cfg, t, home=tmp_path) == "sent via cmd"
     assert out.read_text() == t.text          # title = line 1, body = the rest: one message
-    assert _journal(tmp_path) == []           # nothing truncated -> nothing journaled
+    # nothing truncated -> no truncation record; the delivery itself is the canary act (issue #495)
+    assert [r["act"] for r in _journal(tmp_path)] == ["notify_canary"]
 
 
 def test_send_journals_a_truncation_and_never_delivers_more_than_the_cap(tmp_path, monkeypatch):
@@ -381,7 +382,7 @@ def test_send_defaults_the_truncation_journal_to_the_configured_state_home(tmp_p
     cfg = {"repo": "willprout/superlooper", "notify": {"machine_label": "mini"}}
     notify.send(cfg, notify.render(cfg, notify.DOWN, "x", ask="y" * 5000, caller="c"))
     assert [r["act"] for r in _journal(tmp_path / "slhome" / "willprout__superlooper")] == \
-        ["notify_truncated"]
+        ["notify_truncated", "notify_canary"]
 
 
 def test_send_and_send_test_refuse_anything_the_renderer_did_not_produce(tmp_path, monkeypatch):
@@ -414,6 +415,94 @@ def test_send_test_returns_the_delivery_result_for_a_rendered_text(tmp_path, mon
     r = notify.send_test(cfg, t, home=tmp_path)
     assert (r.channel, r.ok, r.rc) == ("cmd", True, 0)
     assert out.read_text() == "🧪 superlooper@mini · notify channel test\n"
+
+
+# --- every send is the channel canary (issue #495) ----------------------------------------------------
+# The daily morning text used to be the one proof the channel worked. It now goes out only on news, so
+# the proof is whatever text last went out: the doorway journals EVERY attempt as `notify_canary`, and
+# the report + dashboard read "last text delivered <age>" from the newest delivered one.
+
+def _canaries(home):
+    return [r for r in _journal(home) if r.get("act") == "notify_canary"]
+
+
+@pytest.mark.parametrize("tier", [notify.DOWN, notify.WAITING, notify.RECOVERED, notify.MORNING,
+                                  notify.TEST])
+def test_a_delivered_text_of_any_tier_is_journaled_as_the_canary(tier, tmp_path, monkeypatch):
+    monkeypatch.setenv("SL_CMUX", str(tmp_path / "no-cmux"))
+    cfg, out = _cmd_cfg(tmp_path)
+    assert notify.send(cfg, notify.render(cfg, tier, "x", caller="decide:park"),
+                       home=tmp_path) == "sent via cmd"
+    (rec,) = _canaries(tmp_path)
+    assert (rec["ok"], rec["channel"], rec["rc"]) == (True, "cmd", 0)
+    assert rec["tier"] == tier and rec["caller"] == "decide:park"
+    assert isinstance(rec["ts"], (int, float))          # the age the surfaces render hangs off this
+
+
+def test_send_test_journals_its_delivery_as_the_canary_too(tmp_path, monkeypatch):
+    # doctor --stack's live test and the hand-run paths use send_test: a text that reached the phone
+    # proves the channel whichever function sent it.
+    monkeypatch.setenv("SL_CMUX", str(tmp_path / "no-cmux"))
+    cfg, out = _cmd_cfg(tmp_path)
+    r = notify.send_test(cfg, notify.render(cfg, notify.TEST, "t", caller="doctor:notify_channel"),
+                         home=tmp_path)
+    assert r.ok is True
+    (rec,) = _canaries(tmp_path)
+    assert (rec["ok"], rec["channel"], rec["caller"]) == (True, "cmd", "doctor:notify_channel")
+
+
+def test_a_failed_send_is_journaled_as_a_failed_canary_with_its_reason(tmp_path, monkeypatch):
+    monkeypatch.setenv("SL_CMUX", str(tmp_path / "no-cmux"))
+    cfg, out = _cmd_cfg(tmp_path, cmd='printf "recipient file missing" 1>&2; exit 2')
+    assert notify.send(cfg, notify.render(cfg, notify.DOWN, "x"), home=tmp_path).startswith(
+        "cmd notify failed")
+    (rec,) = _canaries(tmp_path)
+    assert (rec["ok"], rec["channel"], rec["rc"]) == (False, "cmd", 2)
+    assert "recipient file missing" in rec["detail"]
+
+
+def test_a_log_only_send_is_journaled_as_log_only_never_as_a_delivery(tmp_path, monkeypatch):
+    monkeypatch.setenv("SL_CMUX", str(tmp_path / "no-cmux"))
+    cfg = {"repo": "willprout/superlooper", "notify": {"machine_label": "mini"}}
+    assert notify.send(cfg, notify.render(cfg, notify.WAITING, "x"), home=tmp_path) == "log-only"
+    (rec,) = _canaries(tmp_path)
+    assert rec["channel"] == "log-only"
+
+
+def test_a_refused_text_journals_no_canary(tmp_path, monkeypatch):
+    # nothing was attempted, so nothing was proven either way
+    monkeypatch.setenv("SL_CMUX", str(tmp_path / "no-cmux"))
+    cfg, out = _cmd_cfg(tmp_path)
+    assert notify.send(cfg, "superlooper ALERT", home=tmp_path).startswith("refused")
+    assert notify.send_test(cfg, "raw", home=tmp_path).ok is False
+    assert _canaries(tmp_path) == []
+
+
+def test_the_canary_defaults_to_the_configured_state_home(tmp_path, monkeypatch):
+    # doctor --stack hands its sender no home: its live test still lands in the repo's own journal
+    monkeypatch.setenv("SL_CMUX", str(tmp_path / "no-cmux"))
+    monkeypatch.setenv("SL_HOME", str(tmp_path / "slhome"))
+    cfg, out = _cmd_cfg(tmp_path)
+    notify.send_test(cfg, notify.render(cfg, notify.TEST, "t"))
+    assert [r["channel"] for r in _canaries(tmp_path / "slhome" / "willprout__superlooper")] == ["cmd"]
+
+
+def test_a_canary_journal_that_cannot_be_written_never_stops_the_text(tmp_path, monkeypatch):
+    monkeypatch.setenv("SL_CMUX", str(tmp_path / "no-cmux"))
+    cfg, out = _cmd_cfg(tmp_path)
+    blocker = tmp_path / "a-file"
+    blocker.write_text("not a directory")
+    assert notify.send(cfg, notify.render(cfg, notify.DOWN, "x"), home=blocker / "home") == \
+        "sent via cmd"
+    assert out.exists()
+
+
+def test_the_suite_never_journals_into_the_real_state_home():
+    # conftest points SL_HOME at a tmp dir for every test (issue #495): a doorway send with no home
+    # would otherwise write a DELIVERED canary into the live loop's journal, and the owner's report and
+    # dashboard would then show a text that never reached his phone.
+    assert os.environ.get("SL_HOME")
+    assert Path(os.environ["SL_HOME"]).resolve() != Path("~/.superlooper").expanduser().resolve()
 
 
 def test_imessage_channel_receives_the_envelope_as_one_message(tmp_path, monkeypatch):

@@ -125,6 +125,18 @@ def _clear_worker_launch_env(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _never_write_the_real_state_home(monkeypatch, tmp_path_factory, _clear_worker_launch_env):
+    # The per-repo state home defaults to ~/.superlooper/<owner>__<repo> — on this machine, the LIVE
+    # loop's own journal. Since issue #495 every notify send journals its delivery as the channel
+    # canary, into that default when the caller names no home (doctor --stack does not). A test that
+    # sent through the real doorway would then write a DELIVERED record into the live journal, and the
+    # owner's morning report and dashboard would show a text that never reached his phone. So the base
+    # is a tmp dir unless a test sets its own (monkeypatch.setenv wins) or asks for the real default
+    # explicitly (`monkeypatch.delenv("SL_HOME")`, as the state_home default test does).
+    monkeypatch.setenv("SL_HOME", str(tmp_path_factory.mktemp("slhome")))
+
+
+@pytest.fixture(autouse=True)
 def _telemetry_off_by_default():
     # GitHub API-burn telemetry (issue #15) is a process-global sink the LIVE runner turns ON at its
     # entrypoint (superlooper `cmd_run` -> gh.set_telemetry(state_home)). A CLI test that goes through

@@ -422,8 +422,43 @@ def test_morning_report_seam_writes_the_file_and_pushes(rig, tmp_path):
     assert (rig.home / "state" / "last_morning_report").read_text() == "2026-07-02"  # due stamp
     # push fired, through the doorway: the morning tier, the identity, the report's own tally line
     assert marker.exists() and marker.read_text().startswith("☀️ r@mini · 1 merged")
+    # the doorway journals the delivery as the channel canary (issue #495) — exactly one, not a
+    # second copy from the hook
     canary = [j for j in _journal(rig) if j.get("act") == "notify_canary"]
-    assert canary and canary[-1]["channel"] == "cmd" and canary[-1]["ok"] is True
+    assert len(canary) == 1 and canary[0]["channel"] == "cmd" and canary[0]["ok"] is True
+    assert canary[0]["tier"] == "morning" and canary[0]["caller"] == "runner:morning_report"
+    assert not [j for j in _journal(rig) if j.get("act") == "morning_push_skipped"]
+
+
+def _texting_morning(rig, tmp_path):
+    marker = tmp_path / "notified.txt"
+    rig.r.config["notify"]["cmd"] = f'printf "%s" {{title}} > {marker}'
+    rig.r.config["notify"]["machine_label"] = "mini"
+    return marker
+
+
+def test_a_quiet_morning_writes_and_stamps_the_report_but_texts_nothing(rig, tmp_path):
+    # issue #495: 43 texts in six weeks said "Nothing happened overnight" — the file stays, the text goes
+    marker = _texting_morning(rig, tmp_path)
+    assert rig.r._exec_morning_report({"act": "morning_report", "date": "2026-07-02"}, NOW) == "ok"
+    assert (rig.home / "reports" / "morning-2026-07-02.md").exists()           # file still written
+    assert (rig.home / "state" / "last_morning_report").read_text() == "2026-07-02"   # day stamped
+    assert not marker.exists()                                                # nothing texted
+    assert not [j for j in _journal(rig) if j.get("act") == "notify_canary"]  # nothing attempted
+    (skip,) = [j for j in _journal(rig) if j.get("act") == "morning_push_skipped"]
+    assert skip["date"] == "2026-07-02" and "quiet" in skip["reason"]         # journaled, with why
+
+
+def test_six_queued_issues_and_nothing_else_is_not_a_morning_text(rig, tmp_path):
+    marker = _texting_morning(rig, tmp_path)
+    rig.r._parsed_by_id = {"i%d" % n: {"num": n, "title": "issue %d" % n,
+                                       "labels": ["agent-ready", "type:build"]}
+                           for n in range(40, 46)}
+    rig.r._exec_morning_report({"act": "morning_report", "date": "2026-07-02"}, NOW)
+    text = (rig.home / "reports" / "morning-2026-07-02.md").read_text()
+    assert "queue: 6" in text                                  # the FILE still reports the queue
+    assert not marker.exists()                                 # the phone does not
+    assert [j for j in _journal(rig) if j.get("act") == "morning_push_skipped"]
 
 
 def test_exec_notify_renders_the_act_through_the_doorway(rig, tmp_path):

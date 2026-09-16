@@ -71,7 +71,7 @@ only on their own schedule, or refuse rather than guess.
 | `superlooper resume` | re-enter an interrupted lane's conversation | launches a session |
 | `superlooper debug` | launch one sl-debugger session because **you** asked | launches a session |
 | `superlooper watchdog` | one mechanical health check (run on an interval, not by hand) | may launch a session |
-| `superlooper morning-report` | render today's report now, instead of waiting for `report_time` | writes the report |
+| `superlooper morning-report` | render today's report now, instead of waiting for `report_time`; texts it only on news, or always with `--always-send` | writes the report |
 | `superlooper nightly` | the nightly QA run (usually launchd-scheduled) | may freeze merges |
 | `superlooper promote-report` / `superlooper accept-failure` | Gate 2 evidence, and accepting a known failure | writes evidence / the ledger |
 | `superlooper adopt` | wire a new repo into the loop | writes config + labels |
@@ -359,9 +359,9 @@ named here that the running system no longer has shows up as a docs finding.
 ## The morning report
 
 Every day at **`report_time` (default 08:45, Mac-local)** the runner writes a report to
-`reports/morning-YYYY-MM-DD.md` in the repo's state home and pushes you a notification. It is the
-one batched, one-touch surface for everything that happened overnight — read it with coffee, act
-on the few items that need you, ignore the rest.
+`reports/morning-YYYY-MM-DD.md` in the repo's state home, and **texts you its summary line only when
+the report has news**. It is the one batched, one-touch surface for everything that happened
+overnight — read it with coffee, act on the few items that need you, ignore the rest.
 
 Sections:
 
@@ -376,10 +376,22 @@ Sections:
   every watchdog episode's debugger countdown (which no longer goes to your phone).
   **Owner-tapped sessions are deliberately absent from this section** — see `superlooper debug`.
 - **Runner resurrection** — every automatic restart of a provably-gone runner.
-- **Gate health** — nightly pass rate, flake count, quarantine size.
+- **Gate health** — nightly pass rate, flake count, quarantine size, and the **Notify channel** line:
+  how long ago a text last reached your phone (see "The channel's age" under Notifications).
 - **Freeze state, usage, queue depth + next up.**
 
 A quiet night renders "nothing happened, queue empty" honestly — no news is real news.
+
+**The text goes out only on news.** News is something the summary line reports: a merge, a park or
+needs-owner hand-back, a bounce, an owner question, a conflict regeneration since the last report, a
+wander, an unattended debugger, a runner resurrection, a triage-flight verdict, a held launch queue,
+or a standing hold or merge freeze past its age threshold. A queue of approved issues waiting is not
+news — six issues sitting there is something the dashboard shows, not something that happened. A
+freeze younger than its threshold isn't either, because every freeze already texts you when it
+starts. The installed-engine drift nudge stays in the file and never goes in the text. On a quiet
+morning the file is still written, the day still counts as reported, and the journal records
+`morning_push_skipped` with the reason. `superlooper morning-report` follows the same rule when you
+run it by hand; add `--always-send` to text the summary anyway.
 
 Routine owner-decision pages (a park, a bounce, a durable question) are **batched here instead of
 pushed** during `notify.quiet_hours` (default 21:00–08:00): nobody answers a 3am page and a park is
@@ -603,6 +615,15 @@ evidence); 🟢 recovered; ☀️ the morning report; 🧪 a test send from `doc
 half of `<repo>@<machine>` is the host's short hostname unless you set `notify.machine_label` in
 `.superlooper/config.json` (for example `"mini"` or `"laptop"`), which is how you tell two machines'
 loops apart on a lock screen.
+
+**The channel's age.** There is no daily "all fine" text proving the channel works — a dead channel
+only matters when there is work to page you about, and you look at the dashboard when you approve
+work. Instead, every text the loop tries to send, of any kind and from any sender, is journaled as
+`notify_canary` with whether it was delivered. The morning report's **Notify channel** line and the
+dashboard's truth strip show how long ago a text last reached your phone ("last text delivered 3h
+ago"), and both say plainly when nothing has been delivered in more than a week. A send that failed
+still reads as a dead channel, with its error. `superlooper doctor --stack` is the live test: it
+sends one real message, and that message counts as a delivery too.
 
 **One-time setup:** the first time it texts you, macOS asks permission to let the terminal control
 Messages — click **Allow** once. **Every launchd-started job** — the nightly, the watchdog, and (in

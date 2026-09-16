@@ -35,7 +35,7 @@ None — the runner did not go down.
 - Nightly (2026-07-02): 1 persistent failure(s), filed 1 fix issue(s).
 - 0/1 green over the last 7 nights; flakes last run: 2.
 - Quarantine: 1 test(s). Accepted known failures: 2.
-- Notify channel: not verified this cycle (no canary recorded).
+- Notify channel: not verified — no delivered text is on record yet; `superlooper doctor --stack` sends a live test.
 
 ## Standing holds
 - #17 (i17) — **held 3d 1h** · launch: no usage headroom (the meter is unreadable/unhealthy, or at-or-over a ceiling) — the restart waits for quota, exactly as a fresh launch does

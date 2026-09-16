@@ -7,8 +7,7 @@ CONFIDENT while blind, which is the only failure mode a monitoring surface has t
 being down. A dashboard that is obviously broken gets fixed in a minute. One that is quietly wrong
 gets believed for weeks.
 
-So this strip states, always and unasked, the three facts that decide how much of the screen to
-believe:
+So this strip states, always and unasked, the facts that decide how much of the screen to believe:
 
   * **is the loop alive?** — the runner's last tick, and the word "loop may be down" when it's stale
   * **whose truth is this, and did all of it land?** — the runner's own published view or a
@@ -17,6 +16,9 @@ believe:
     fresh, because the reachability probe is exempt from throttling, and a refused read and an empty
     one produce the same empty set — so the vouch is the only thing that can say it
   * **is the merged fix actually running?** — the engine's publish drift (``lib/engine``)
+  * **would a page reach the phone?** — the age of the last text the loop delivered (issue #495,
+    ``lib/texts``). The morning report stopped texting quiet mornings, and no heartbeat text replaced
+    it: the owner looks here when he approves work, so this is where an unproven channel is stated
 
 **It DERIVES nothing it could get wrong.** Whether the runner is silent is decided ONCE, in
 ``flights.source_mode``; whether the engine is behind is decided once, in ``engine.drift``. This
@@ -38,6 +40,7 @@ Design record B.1: pure semantics here, pixels in ``static/field.js``. The squin
 art and this dict still states the whole situation.
 """
 import flights
+import texts as texts_mod
 
 # Levels, worst-last. `down` is the loop itself; `notice` is something the owner should know but
 # nothing is broken (drift, a blind data source while the loop still ticks).
@@ -182,7 +185,44 @@ def _engine_line(eng):
             "remedy": eng.get("remedy")}
 
 
-def banner(source, engine=None, github=None, stopped=None):
+def _texts_line(verdict):
+    """When did a text last reach the phone? ``None`` only when no verdict was wired at all (an
+    embedder that reads no journal); the server always wires one.
+
+    Words only — the verdict is ``lib/texts``'s. A verdict that IS wired but unreadable is ``unproven``,
+    never silence: an absent reading here is exactly the channel nobody has proven.
+
+    The age is the server's own phrase (``format_duration`` → "3h ago"), so a week reads "168h" — the
+    design's numeral rule (hours never roll into days) — and the words beside it carry the conclusion.
+    """
+    if verdict is None:
+        return None
+    v = verdict if isinstance(verdict, dict) else {}
+    state = v.get("state")
+    state = state if isinstance(state, str) and state in texts_mod.STATES else texts_mod.UNPROVEN
+    age = v.get("delivered_age_text")
+    age = age if isinstance(age, str) and age else None
+    if state == texts_mod.DELIVERED and age:
+        text = "last text delivered %s" % age
+    elif state == texts_mod.STALE:
+        text = ("last text delivered %s — none in over a week" % age if age
+                else "no text delivered in over a week")
+    elif state == texts_mod.DEAD:
+        channel = v.get("channel")
+        rc = v.get("rc")
+        text = "last text FAILED via %s%s — texts are not reaching the phone%s" % (
+            channel if isinstance(channel, str) and channel else "its channel",
+            " (rc=%d)" % rc if isinstance(rc, int) and not isinstance(rc, bool) else "",
+            " · last delivered %s" % age if age else "")
+    elif state == texts_mod.UNCONFIGURED:
+        text = "no text channel configured — texts go to the journal only"
+    else:
+        state = texts_mod.UNPROVEN          # includes a "delivered" verdict with no age to show
+        text = "no text delivered yet"
+    return {"state": state, "text": text}
+
+
+def banner(source, engine=None, github=None, stopped=None, texts=None):
     """The standing truth strip for one repo's field.
 
     ``source``  that repo's ``flights.source_mode`` verdict (the snapshot's ``repo.source``).
@@ -190,8 +230,10 @@ def banner(source, engine=None, github=None, stopped=None):
     ``github``  that repo's ``repo.github`` facts — read only for its ``unreachable`` flag.
     ``stopped`` that repo's ``flights.stop_state`` verdict (the snapshot's ``repo.stopped``), or
                 ``None`` — it turns the tick line's conclusion from an alarm into a statement.
+    ``texts``   that repo's ``lib/texts.last_text`` verdict (the snapshot's ``repo.texts``), or ``None``
+                when no journal was read — then there is no texts line at all.
 
-    Returns ``{level, tick, data, engine}``. ``level`` is the worst of the lines, so one glance at
+    Returns ``{level, tick, data, engine, texts}``. ``level`` is the worst of the lines, so one glance at
     the strip's colour is a true summary of everything under it. Never raises: it is built on the
     2-second poll, and a strip that could 500 the snapshot would take down the field the owner
     actually came for.
@@ -200,6 +242,7 @@ def banner(source, engine=None, github=None, stopped=None):
     tick = _tick_line(src, stopped)
     data = _data_line(src, github)
     eng = _engine_line(engine)
+    txt = _texts_line(texts)
 
     level = LEVEL_OK
     if tick["state"] == "down":
@@ -214,9 +257,13 @@ def banner(source, engine=None, github=None, stopped=None):
     # issues correctly and journalling why (#172). It is a thing the owner should KNOW, because the
     # visible symptom is his queue standing still, and a strip that stayed green through it would be
     # the same confident blank this module exists to end.
-    elif data["state"] in ("blind", "dark", "unvouched") or eng is not None:
+    # A channel nothing has proven this week (#495) is a NOTICE too: nothing in the loop is broken, but
+    # a page sent now may not reach the phone, and this strip is where the owner looks before he
+    # approves work that would page him. A working channel says its age and changes nothing.
+    elif (data["state"] in ("blind", "dark", "unvouched") or eng is not None
+          or (txt is not None and txt["state"] != texts_mod.DELIVERED)):
         level = LEVEL_NOTICE
-    return {"level": level, "tick": tick, "data": data, "engine": eng}
+    return {"level": level, "tick": tick, "data": data, "engine": eng, "texts": txt}
 
 
 # =============================== the whole field's truth (issue #180) ===============================
@@ -282,8 +329,11 @@ def _row(repo):
     # level and the words contradicting each other on screen (raised in review).
     if not isinstance(t, dict) or not _spoken(t.get("tick")) or not _spoken(t.get("data")):
         t = banner(None)                  # no verdict is not an all-clear — degrade to the alarm
+    # The texts line (#495) is per-repo like the tick — each repo's journal, each repo's channel — so it
+    # rides the row by reference too. A strip that carries none renders none.
     return {"name": name, "level": _level(t.get("level")),
-            "tick": t["tick"], "data": t["data"]}
+            "tick": t["tick"], "data": t["data"],
+            "texts": t["texts"] if _spoken(t.get("texts")) else None}
 
 
 def whole_field(repos):
@@ -292,7 +342,7 @@ def whole_field(repos):
     ``repos``  the snapshot's repo slices, each read only for ``name``/``slug`` and its ``truth``
                block (this repo's ``banner`` above, already composed by the server).
 
-    Returns ``{level, repos: [{name, level, tick, data}, ...], engine}``.
+    Returns ``{level, repos: [{name, level, tick, data, texts}, ...], engine}``.
 
     **How the multi-repo case aggregates** (decided, not implied — DoD): *worst-of on the LEVEL,
     exact per-repo on the WORDS.*

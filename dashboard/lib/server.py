@@ -45,6 +45,7 @@ import replay as replay_mod
 import session_window as session_window_mod
 import tower as tower_mod
 import triage as triage_mod
+import texts as texts_mod
 import truth
 import version as version_mod
 
@@ -1802,6 +1803,11 @@ def _assemble_repo(repo, config, now, gh_mod, diff_reader, last_seen=None, concl
         # reload or a superseding open threw it away: on 2026-08-26 a tap during an auth
         # outage was consumed, attempted, failed and journaled, and the board said nothing.
         "fixer": _fixer_block(journal, now),
+        # When a text last reached the phone (issue #495): the morning report no longer texts quiet
+        # mornings and nothing texts a heartbeat, so the channel's proof is this AGE, read from the
+        # `notify_canary` records the engine journals on every send — the same journal read as above.
+        # The truth strip words it; this is the verdict it words.
+        "texts": texts_mod.last_text(journal, now, fmt=format_duration),
         # The triage flight (issue #451): the day's `t<N>` survey, its run's counts, and whether a
         # plane belongs on the field. Derived from the journal the tower log is already glossed from
         # and the `state/activity` scan every lane's liveness already comes out of — no new read of
@@ -2135,7 +2141,7 @@ def assemble_snapshot(config, *, now=None, gh_mod=None, usage=None, diff_reader=
     # single field-wide freshness line would be a lie the moment two repos disagreed.
     for rs in repo_snaps:
         rs["truth"] = truth.banner(rs.get("source"), engine=engine_state, github=rs.get("github"),
-                                   stopped=rs.get("stopped"))
+                                   stopped=rs.get("stopped"), texts=rs.get("texts"))
 
     # The same truth, for the view that has no field to hang a strip on (issue #180). Boring mode
     # shows every repo in ONE table, so it needs the whole field's verdict rather than one repo's:

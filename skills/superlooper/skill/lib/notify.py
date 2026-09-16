@@ -18,6 +18,12 @@ identity alone leaves no room for them — and send()/send_test() journal the ov
 reaching the phone unseen. send() and send_test() deliver only a Text the renderer produced; a raw
 string (the old free title) is refused.
 
+THE CANARY. Every attempt the doorway makes — delivered, failed, or log-only — is journaled as a
+`notify_canary` act (issue #495). The morning text used to be the channel's one daily proof; it now
+goes out only when there is news, so the proof is whatever text went out last, of any tier and from
+any sender. The morning report's gate health, `superlooper upkeep` and the dashboard read "last text
+delivered <age>" from the newest delivered record, and a failed attempt still reads as a dead channel.
+
 DELIVERY, by a fixed precedence (line 1 of the envelope rides as the title, the rest as the body):
 
     notify.imessage_to  → text via Messages.app (skill/bin/imessage-notify.sh, an osascript
@@ -245,24 +251,41 @@ def _shape_ok(text):
             and _int(text.dropped_bytes) and text.dropped_bytes >= 0)
 
 
-def _journal_truncation(config, text, home):
-    """Journal a truncated text as its own `notify_truncated` act — the class-killer: a verbose
-    caller can never reach the phone unseen, and the morning report's gate health lists it where the
-    defect can be fixed. Written whether or not the channel then delivers (the defect is the caller's
-    verbosity, not the channel). Never raises: a journal hiccup must not stop the text itself."""
-    if not text.truncated:
-        return
+def _journal(config, home, record):
+    """Append one doorway record into `home` (default: the configured state home). Never raises: a
+    journal hiccup must not stop the text itself."""
     try:
         import journal
         if home is None:
             import config as config_lib
             home = config_lib.state_home(config)
-        journal.append(home, {"act": "notify_truncated", "caller": text.caller, "tier": text.tier,
-                              "headline": text.lines[0], "full_bytes": text.full_bytes,
-                              "dropped_bytes": text.dropped_bytes, "cap_bytes": TEXT_MAX_BYTES,
-                              "outcome": "ok"})
+        journal.append(home, record)
     except Exception:
         pass
+
+
+def _journal_truncation(config, text, home):
+    """Journal a truncated text as its own `notify_truncated` act — the class-killer: a verbose
+    caller can never reach the phone unseen, and the morning report's gate health lists it where the
+    defect can be fixed. Written whether or not the channel then delivers (the defect is the caller's
+    verbosity, not the channel)."""
+    if not text.truncated:
+        return
+    _journal(config, home, {"act": "notify_truncated", "caller": text.caller, "tier": text.tier,
+                            "headline": text.lines[0], "full_bytes": text.full_bytes,
+                            "dropped_bytes": text.dropped_bytes, "cap_bytes": TEXT_MAX_BYTES,
+                            "outcome": "ok"})
+
+
+def _journal_canary(config, text, result, home):
+    """Journal one delivery attempt as the `notify_canary` act (issue #495) — the channel's proof now
+    that no daily text exists to be it. `ok` is the delivery (`outcome` is the record's own, as on
+    every journal act); a log-only result carries `ok` True and is read as NO channel, never as a
+    delivery. The detail is bounded: it is a channel's stderr, and the reason a send failed fits in a
+    line."""
+    _journal(config, home, {"act": "notify_canary", "ok": bool(result.ok), "channel": result.channel,
+                            "rc": result.rc, "detail": (result.stderr or "")[:200],
+                            "tier": text.tier, "caller": text.caller, "outcome": "ok"})
 
 
 # ------------------------------------------------------------------------------------------------
@@ -351,7 +374,8 @@ def send(config, text, home=None):
     """Deliver one rendered owner text by the configured precedence; return a short outcome string
     the caller journals. Never raises. `text` must come from render() — anything else (a raw title
     string, a tampered copy past the cap) is REFUSED, never delivered. A truncated text journals its
-    `notify_truncated` act into `home` (default: the configured state home) before it goes out.
+    `notify_truncated` act into `home` (default: the configured state home) before it goes out, and
+    the attempt itself is journaled there as `notify_canary` once the channel has answered.
 
     No compatibility shape for the pre-#493 (config, title, body) call is needed across the publish:
     a runner lives inside `superlooper run`, which imports this module at start-up, so a runner
@@ -360,6 +384,7 @@ def send(config, text, home=None):
         return _REFUSED
     _journal_truncation(config, text, home)
     r = _deliver(config, text)
+    _journal_canary(config, text, r, home)
     if r.channel == "log-only":
         return "log-only"
     ok_msg, fail_msg = _OUTCOME[r.channel]
@@ -375,12 +400,14 @@ def delivered(outcome):
 
 def send_test(config, text, home=None):
     """Deliver ONE rendered text through the configured precedence and return the full SendResult
-    (channel, ok, rc, stderr) — the stack doctor's hook for PROVING the channel works, and the
-    morning report's canary. Same precedence, same refusal, same truncation journal, same never-raise
+    (channel, ok, rc, stderr) — the stack doctor's hook for PROVING the channel works. Same
+    precedence, same refusal, same truncation journal, same canary record, same never-raise
     guarantee as send(); the only difference is the caller gets rc + stderr instead of a flattened
     string, so a failed send can be reported with its actual reason. A real message really goes out:
     callers announce the side effect first."""
     if not _rendered(text):
         return SendResult("refused", False, 2, _REFUSED)
     _journal_truncation(config, text, home)
-    return _deliver(config, text)
+    r = _deliver(config, text)
+    _journal_canary(config, text, r, home)
+    return r
