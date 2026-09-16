@@ -5346,9 +5346,13 @@ def cmd_watchdog(args):
                               f"episode open ({', '.join(ep['signals'])})" if ep else
                               # The machine just woke (issue #491): the heartbeat IS stale, and this
                               # check held it for the wake grace. "healthy" would be a claim the
-                              # check never made; the next check past the grace judges it.
-                              "machine woke from sleep — the stale runner heartbeat is held for the "
-                              "wake grace; a check after it judges the runner as usual"
+                              # check never made; the next check past the grace judges it. What was
+                              # OBSERVED is a gap in the watchdog's own checks, so that is what the
+                              # line names — a job booted out for an hour reads the same way.
+                              "no watchdog check for %dh %dm, read as the machine sleeping — the "
+                              "stale runner heartbeat is held for the wake grace; a check after it "
+                              "judges the runner as usual"
+                              % divmod(int(final["wake"]["slept_seconds"]) // 60, 60)
                               if res.get("wake_excused") else
                               # A runner that has not stamped its first tick is not healthy — it is
                               # unproven, and saying so is the difference between a summary a

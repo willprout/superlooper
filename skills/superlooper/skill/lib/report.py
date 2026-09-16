@@ -626,10 +626,15 @@ def _wakes(records, window_start):
     before held the stale heartbeat for the wake grace rather than paging, so the file says the machine
     slept — and whether the runner came back — instead of saying nothing. Deliberately NOT a quiet-
     breaker: a closed lid is not news. "Resumed" is only ever the watchdog's own `runner_resumed`
-    record (the heartbeat advanced after the wake); a runner that did not come back is the episode and
-    resurrection sections' to tell."""
-    resumed = {_ts({"ts": r.get("woke_at")}) for r in records
-               if r.get("act") == "watchdog_wake" and r.get("outcome") == "runner_resumed"} - {None}
+    record (the heartbeat advanced after the wake, with no restart attempted); a runner the watchdog
+    restarted after the wake says so, and one that did not come back is the episode and resurrection
+    sections' to tell."""
+    came_back = {}
+    for r in records:
+        woke = _ts({"ts": r.get("woke_at")})
+        if (r.get("act") == "watchdog_wake" and woke is not None
+                and r.get("outcome") in ("runner_resumed", "runner_restarted")):
+            came_back.setdefault(woke, r.get("outcome"))
     lines = []
     for r in records:
         if (r.get("act") != "watchdog_wake" or r.get("outcome") != "slept"
@@ -637,8 +642,11 @@ def _wakes(records, window_start):
             continue
         span = _age(r.get("slept_seconds"))
         slept = f"Machine slept {span}" if span else "Machine slept"
+        back = came_back.get(r.get("woke_at")) if _ts({"ts": r.get("woke_at")}) is not None else None
         lines.append(f"- {slept} (no watchdog check ran in that span); "
-                     + ("runner resumed." if r.get("woke_at") in resumed else
+                     + ("runner resumed." if back == "runner_resumed" else
+                        "the runner came back after a watchdog restart attempt — see Runner "
+                        "resurrection." if back == "runner_restarted" else
                         "the watchdog has not yet seen the runner complete a tick since."))
     return lines
 

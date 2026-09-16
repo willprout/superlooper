@@ -346,29 +346,42 @@ def _wrec(outcome, wake, **extra):
 
 def _wake(now, view, state, w):
     """(wake, journal) for this check (issue #491) — the machine-slept reading of the watchdog's own
-    run clock, and the one claim that follows it.
+    run clock, and the one claim that follows it. In this order:
 
-      * a check landing MORE than WAKE_GAP_INTERVALS × INTERVAL_SECONDS after the previous one is a
-        wake: recorded with the grace it opens (the runner's events.WAKE_GRACE_SECONDS, read here at
-        check time) and the heartbeat as it stood, and journaled `slept`;
-      * a later check that finds that heartbeat ADVANCED — and fresh — journals `runner_resumed`,
-        once. Advanced, not merely fresh: after a short sleep the pre-sleep heartbeat can still sit
-        inside the staleness bound, and "resumed" claims a tick completed after the wake.
-    A runner that never comes back leaves the wake unresumed; its stale heartbeat, once the grace is
+      * RESOLVE the last wake: a heartbeat that has ADVANCED past its value at that wake was stamped
+        by a tick completed after it, so the runner came back — journaled once, as `runner_resumed`,
+        or as `runner_restarted` when the watchdog attempted a restart after the wake (the reborn
+        process ticking is not the runner resuming, and the record must not say it is). Advanced,
+        not merely fresh: after a short sleep the pre-sleep heartbeat can sit inside the staleness
+        bound. Freshness is NOT required, so a tick landed between two sleeps still resolves the
+        first one when the second wake's check reads it (fresh-agent review).
+      * DETECT a new wake: a check landing MORE than WAKE_GAP_INTERVALS × INTERVAL_SECONDS after the
+        previous one, recorded with the grace it opens (the runner's events.WAKE_GRACE_SECONDS, read
+        here at check time) and journaled `slept`. `since` is the last check that JUDGED the
+        heartbeat — the previous check, unless that check was itself inside the grace of a wake the
+        runner has not come back from, in which case that wake's `since` carries over (fresh-agent
+        review P1: wake, one excused check, the lid closes again — measured from the excused check,
+        the pre-sleep heartbeat would read as stale before the gap and page a runner about to tick).
+        Bounded all the same: any check past a grace judges the heartbeat and breaks the chain.
+    A runner that never comes back leaves the wake unresolved; its stale heartbeat, once the grace is
     over, speaks through the episode and resurrection records exactly as before."""
     wake, journal = state.get("wake"), []
     last = state.get("last_run_at")
     hb = view.get("heartbeat") if _real(view.get("heartbeat")) else None
+    if wake is not None and not wake["resumed"] and hb is not None \
+            and (wake["heartbeat"] is None or hb > wake["heartbeat"]):
+        attempts = (state.get("resurrection") or {}).get("attempts") or []
+        restarted = any(_real(t) and t >= wake["woke_at"] for t in attempts)
+        wake = dict(wake, resumed=True)
+        journal.append(_wrec("runner_restarted" if restarted else "runner_resumed", wake,
+                             heartbeat=hb))
     if last is not None and now - last > WAKE_GAP_INTERVALS * INTERVAL_SECONDS:
-        wake = {"woke_at": now, "since": last, "slept_seconds": int(now - last),
+        carried = wake is not None and not wake["resumed"] and last < wake["grace_until"]
+        wake = {"woke_at": now, "since": wake["since"] if carried else last,
+                "slept_seconds": int(now - last),
                 "grace_until": now + events_lib.WAKE_GRACE_SECONDS, "heartbeat": hb,
                 "resumed": False}
         journal.append(_wrec("slept", wake, grace_until=wake["grace_until"]))
-    elif wake is not None and not wake["resumed"] and hb is not None \
-            and _hb_fresh(now, hb, w["heartbeat_stale_seconds"]) \
-            and (wake["heartbeat"] is None or hb > wake["heartbeat"]):
-        wake = dict(wake, resumed=True)
-        journal.append(_wrec("runner_resumed", wake, heartbeat=hb))
     return wake, journal
 
 
@@ -376,8 +389,9 @@ def _wake_excused(now, view, wake, w):
     """Is this check's stale heartbeat the sleep's artifact (issue #491)? Only inside the wake's
     grace, and only for a heartbeat the sleep could have made stale: one no older than the staleness
     bound as of the last check BEFORE the gap. A heartbeat already stale then was a runner that had
-    stalled before the lid closed, and waking up does not make it any less stalled."""
-    if wake is None or not now < wake["grace_until"]:
+    stalled before the lid closed, and waking up does not make it any less stalled. A check dated
+    before the wake it would belong to (the clock stepped back) is not inside its grace either."""
+    if wake is None or not wake["woke_at"] <= now < wake["grace_until"]:
         return False
     hb = view.get("heartbeat")
     return _real(hb) and hb >= wake["since"] - w["heartbeat_stale_seconds"]
@@ -805,6 +819,14 @@ def _check(now, config, view, state, w):
                 # (opened_at, grace clock, frozen no-progress clock all intact); a genuinely
                 # OBSERVED clear stands it down below. Quiet: no notify, no launch, no journal line
                 # (a long outage at a 5-min interval must not write a record per check).
+                new_state["episode"] = ep
+                return {"state": new_state, "journal": journal, "notify": notify,
+                        "launch": None, "resurrect": resurrect, "runner_down": runner_down,
+                        "wake_excused": excused}
+            if excused and HEARTBEAT_STALE in ep_signals:
+                # The same hold, for the heartbeat (issue #491): inside a wake grace it is not
+                # observable either — excused, not fresh — so an episode it opened is neither stood
+                # down nor greened on it. The first check that can see the heartbeat decides.
                 new_state["episode"] = ep
                 return {"state": new_state, "journal": journal, "notify": notify,
                         "launch": None, "resurrect": resurrect, "runner_down": runner_down,

@@ -791,6 +791,13 @@ def test_a_machine_sleep_the_watchdog_saw_reaches_the_report_without_breaking_qu
     line = [l for l in pending.splitlines() if "Machine slept" in l]
     assert len(line) == 1 and "runner resumed" not in line[0]
     assert "not yet seen the runner complete a tick" in line[0]
+    # a runner the watchdog RESTARTED after the wake did not resume on its own, and is not said to
+    restarted = [j[0], _rec(1090, "watchdog_wake", outcome="runner_restarted", woke_at=1030,
+                            slept_seconds=six_h, heartbeat=1080)]
+    rline = [l for l in report.morning(restarted, _view(queue=[], usage=None), ledger={},
+                                       config=_cfg()).splitlines() if "Machine slept" in l]
+    assert len(rline) == 1 and "runner resumed" not in rline[0]
+    assert "restart" in rline[0] and "Runner resurrection" in rline[0]
     # a wrong-typed record renders without a fabricated span and never raises
     odd = report.morning([_rec(1030, "watchdog_wake", outcome="slept", woke_at="x",
                                slept_seconds=None)], _view(queue=[], usage=None), ledger={},
