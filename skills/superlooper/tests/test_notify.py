@@ -491,20 +491,22 @@ def test_the_doctor_sender_seam_is_handed_a_rendered_text():
     assert got[0].lines[0].startswith("🧪 superlooper@mini · ")
 
 
-
-# --- inputs UTF-8 cannot carry (fresh review P2) ---------------------------------------------------
-# send()/send_test() never raise, whatever they are handed; render() never raises but for a tier.
-
 def test_the_pre_doorway_call_shape_is_refused_never_delivered(tmp_path, monkeypatch):
     # A runner started on the old engine never reaches this module (superlooper run imports notify at
     # start-up, so it keeps the old one until restarted); any (config, title, body) call is a bug.
+    # The refusal comes before anything is journaled, so the body is never used as a state home.
     monkeypatch.setenv("SL_CMUX", str(tmp_path / "no-cmux"))
+    monkeypatch.chdir(tmp_path)                           # a relative "home" would land here
     cfg, out = _cmd_cfg(tmp_path)
-    assert notify.send(cfg, "superlooper ALERT", "the old body").startswith("refused")
-    assert notify.send_test(cfg, "superlooper morning report — 2026-09-17", "summary").ok is False
+    long_title = "superlooper ALERT " * 100               # would truncate -> journal, if accepted
+    assert notify.send(cfg, long_title, "old-body").startswith("refused")
+    assert notify.send_test(cfg, long_title, "old-body").ok is False
     assert not out.exists()
-    assert not (tmp_path / "the old body").exists()          # the body never became a journal home
+    assert not (tmp_path / "old-body").exists()           # the body never became a journal home
 
+
+# --- inputs UTF-8 cannot carry (fresh review P2) ---------------------------------------------------
+# send()/send_test() never raise, whatever they are handed; render() never raises but for a tier.
 
 def test_a_hand_built_text_carrying_a_lone_surrogate_is_refused_not_raised(tmp_path, monkeypatch):
     monkeypatch.setenv("SL_CMUX", str(tmp_path / "no-cmux"))
@@ -514,6 +516,7 @@ def test_a_hand_built_text_carrying_a_lone_surrogate_is_refused_not_raised(tmp_p
     assert notify.send(cfg, bad, home=tmp_path).startswith("refused")
     assert notify.send_test(cfg, bad, home=tmp_path).ok is False
     assert not out.exists()
+
 
 def test_render_never_raises_on_a_lone_surrogate_in_a_memo(tmp_path, monkeypatch):
     # A memo decoded from a JSON "\\ud800" escape carries a lone surrogate, which UTF-8 cannot encode.
