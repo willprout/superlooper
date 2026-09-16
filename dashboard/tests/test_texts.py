@@ -93,7 +93,7 @@ def test_a_delivery_with_an_unusable_time_proves_nothing():
         assert v["state"] != texts.DELIVERED, bad
 
 
-def test_a_delivery_stamped_in_the_future_is_unproven_not_fresh():
+def test_a_delivery_stamped_far_in_the_future_is_unproven_not_fresh():
     v = texts.last_text([_canary(NOW + DAY)], NOW)
     assert v["state"] == texts.UNPROVEN and v["delivered_age"] is None
 
@@ -109,3 +109,10 @@ def test_junk_never_raises_into_the_two_second_poll():
 def test_every_state_is_named_in_the_vocabulary():
     assert set(texts.STATES) == {texts.DELIVERED, texts.STALE, texts.UNPROVEN, texts.DEAD,
                                  texts.UNCONFIGURED}
+
+
+def test_a_text_journaled_moments_after_the_snapshot_clock_is_just_delivered():
+    # the snapshot takes `now` before it reads the journal; a send landing in between is the same
+    # moment, not a clock jump, and must not flicker the strip to a notice for a poll
+    v = texts.last_text([_canary(NOW + 2)], NOW, fmt=_fmt)
+    assert v["state"] == texts.DELIVERED and v["delivered_age"] == 0

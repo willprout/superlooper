@@ -352,6 +352,13 @@ def _questions(records, window_start):
 # day there is work to page about.
 CHANNEL_STALE_SECONDS = WEEK_SECONDS
 
+# How far AFTER the report's clock a delivery may be stamped and still read as "just now". A tick takes
+# its `now` once, then executes its actions in order, and the notify doorway stamps each canary with the
+# wall clock as it sends — so a text sent earlier in the same tick than the morning report is stamped a
+# little after the report's clock (found by driving the runner). That is the same moment, not a clock
+# jump. A stamp further ahead than this IS one, and proves no age at all.
+CLOCK_SKEW_SECONDS = 3600
+
 # A canary on one of these "channels" delivered nothing to anyone: log-only is no channel configured,
 # and a refusal never reached a channel at all.
 _NOT_A_DELIVERY = frozenset({"log-only", "refused"})
@@ -432,9 +439,13 @@ def notify_canary(records, now=None, max_age_seconds=None):
 
 def _delivered_age(v, now):
     """The age of the verdict's last delivered text as the report speaks it ("3h 12m"), or None when
-    there is none or its age cannot be rendered honestly."""
+    there is none or its age cannot be rendered honestly. A stamp within CLOCK_SKEW_SECONDS after the
+    report's clock is the same tick's text, so it reads as "0m"."""
     at = v.get("last_delivered_at")
-    return None if at is None else _age(now - at)
+    if at is None:
+        return None
+    span = now - at
+    return _age(0 if -CLOCK_SKEW_SECONDS <= span < 0 else span)
 
 
 def _notify_channel(records, now):
@@ -463,7 +474,7 @@ def _notify_channel(records, now):
         return f"- Notify channel: {last}."
     test = "`superlooper doctor --stack` sends a live test"
     if at is not None and last is None:
-        # a delivery stamped in the future (a clock jump): neither fresh nor a week old, provably
+        # a delivery stamped far in the future (a clock jump): neither fresh nor a week old, provably
         return f"- Notify channel: not verified — the last delivered text's time cannot be read; {test}."
     if last:
         return (f"- Notify channel: **nothing delivered in more than a week** — the {last}. A dead "

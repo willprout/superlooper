@@ -1243,3 +1243,18 @@ def test_a_delivery_with_no_readable_time_proves_nothing():
     v = report.notify_canary(j, now=now)
     assert v["last_delivered_at"] is None
     assert "last text delivered" not in _channel_line(j, now)
+
+
+def test_a_text_sent_moments_after_the_reports_clock_reads_as_just_delivered():
+    # Found by driving the runner: one tick executes a notify, then renders the morning report with the
+    # tick's own `now` — and the doorway stamped the canary with the wall clock a few seconds LATER.
+    # That is the same tick, not a clock jump; it must read as fresh, never as "cannot be read".
+    now = 1_000_000
+    line = _channel_line([_canary(now + 40)], now)
+    assert "last text delivered 0m ago" in line
+
+
+def test_a_delivery_stamped_far_in_the_future_is_a_clock_jump_and_proves_no_age():
+    now = 1_000_000
+    line = _channel_line([_canary(now + 2 * DAY)], now)
+    assert "cannot be read" in line and "last text delivered" not in line

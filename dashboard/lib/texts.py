@@ -20,7 +20,7 @@ channel. It is mirrored rather than imported: the dashboard never imports the en
   * ``stale``        — nothing delivered in more than a week (with the last delivery's age when the
                        journal still holds one, without it when the journal is a week old and holds none)
   * ``unproven``     — no delivery on record, and the journal is too young to say "a week"; also a
-                       delivery whose time cannot be trusted (stamped in the future by a clock jump)
+                       delivery whose time cannot be trusted (stamped far in the future by a clock jump)
   * ``dead``         — the latest attempt failed
   * ``unconfigured`` — the latest attempt was log-only: no channel is configured at all
 
@@ -33,6 +33,11 @@ import math
 # Mirrors the engine's report.CHANNEL_STALE_SECONDS (a week). Past this with no delivered text, the
 # channel is unproven, and the strip says so.
 STALE_SECONDS = 7 * 24 * 3600
+
+# Mirrors the engine's report.CLOCK_SKEW_SECONDS. The snapshot takes `now` before it reads the journal,
+# so a text sent in between is stamped a moment AFTER the clock it is aged against — the same moment,
+# which reads as delivered just now. A stamp further ahead than this is a clock jump and proves no age.
+CLOCK_SKEW_SECONDS = 3600
 
 DELIVERED = "delivered"
 STALE = "stale"
@@ -96,8 +101,8 @@ def last_text(journal, now, fmt=None):
             delivered_ts, delivered_channel = ts, channel
 
     age = None
-    if delivered_ts is not None and clock is not None and clock - delivered_ts >= 0:
-        age = clock - delivered_ts
+    if delivered_ts is not None and clock is not None and clock - delivered_ts >= -CLOCK_SKEW_SECONDS:
+        age = max(0, clock - delivered_ts)
     rc = latest.get("rc") if isinstance(latest, dict) else None
     out = {"channel": _channel(latest) if isinstance(latest, dict) else None,
            "rc": rc if isinstance(rc, int) and not isinstance(rc, bool) else None,
