@@ -374,7 +374,10 @@ def _last_delivered(canaries):
     best = (None, None)
     for r in canaries:
         ts, channel = _since(_ts(r)), r.get("channel")
-        if ts is None or r.get("ok") is not True or channel not in _PHONE_CHANNELS:
+        # `isinstance` before the membership test: a corrupt channel can be an unhashable list, and
+        # `x in frozenset` RAISES on one — a bad canary is skipped, never fatal to the report.
+        if (ts is None or r.get("ok") is not True or not isinstance(channel, str)
+                or channel not in _PHONE_CHANNELS):
             continue
         if best[0] is None or ts >= best[0]:
             best = (ts, channel)

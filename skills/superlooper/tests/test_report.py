@@ -1332,3 +1332,14 @@ def test_the_untallied_news_clause_rides_after_the_alert_clauses():
     out = report.morning(j, view, ledger={}, config=_cfg())
     summary = next(ln for ln in out.splitlines() if ln.strip() and not ln.startswith("#"))
     assert summary.index("THE LAUNCH QUEUE IS HELD") < summary.index("Also:")
+
+
+@pytest.mark.parametrize("channel", [["cmd"], {"cmd": 1}, 7, None, True])
+def test_a_wrong_typed_channel_never_takes_the_report_down(channel):
+    # `x in frozenset` RAISES on an unhashable value: a corrupt canary must be skipped, never fatal
+    now = 1_000_000
+    j = [_canary(now - 60, channel=channel)]
+    v = report.notify_canary(j)
+    assert v["last_delivered_at"] is None
+    assert report.notify_canary(j, now=now, max_age_seconds=report.WEEK_SECONDS)
+    assert "Notify channel" in report.morning(j, _view(now=now), ledger={}, config=_cfg())
