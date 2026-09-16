@@ -603,15 +603,15 @@ report, the morning report and `doctor --stack` — is rendered by one doorway i
 lines: `<tier emoji> <repo>@<machine> · <what happened>`, then what is asked of you (when anything
 is), then the issue or PR URL (only when one exists). A text is capped at three lines and 280 bytes.
 Every sender writes a one-clause headline and at most one short ask line that fit that cap, so the
-explanation and the fix are never in the text: a park's memo, a bounce and a question are on the
-issue the URL points at, and an ALERT's remedy is printed by `superlooper doctor` and written into
-the morning report file. If a sender ever does overrun, the doorway cuts it to fit — the ask first,
+explanation and the fix are never in the text: a park's or a bounce's memo is on the dashboard's
+card (and normally on the issue the URL points at), a question is on the issue, and an ALERT's
+remedy is printed by `superlooper doctor` and written into the morning report file. If a sender ever does overrun, the doorway cuts it to fit — the ask first,
 then the headline, keeping the identity and the URL whenever they fit — and the cut is journaled as
 `notify_truncated`, which the morning report lists under **Gate health** by sender.
 
 ```
 🟠 superlooper@mini · i412 needs-owner
-your call; the memo is on the issue
+your call; the memo is on the dashboard
 https://github.com/willprout/superlooper/issues/412
 ```
 

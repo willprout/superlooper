@@ -964,8 +964,8 @@ def _standing_holds(holds, now):
 def _hold_alerts(holds, view, now):
     """The ALERT-tier lines a listing is not enough for (issue #405): a hold, or the freeze, that
     has stood past its threshold. Rendered above the sections, where the owner cannot coffee past
-    them. No new notification is earned — these ride the one daily push the report already sends,
-    via the summary line's own count."""
+    them. No new notification is earned — these ride the one morning text the report already sends
+    (morning_headline counts them), and the file's summary line counts them too."""
     # The threshold is tested against the age _age() would RENDER, never a raw span: an age this
     # module cannot render honestly (wrong-typed, negative, non-finite) is one it cannot alert on
     # either, and the two must agree or an alert could print "held None".
@@ -1197,7 +1197,9 @@ def morning_news(journal_records, gh_view, config=None):
 # The morning TEXT's clauses (issue #490), in the order they lead: the worst news first, so a headline
 # that has to count "+N more" drops the least urgent. Each is (facts key, how it reads).
 _HEADLINE_CLAUSES = (
-    ("queue_hold", lambda f: "launch queue HELD"),
+    ("queue_hold", lambda f: "ALERT marker unreadable, queue may be HELD"
+     if _dict(f["view"].get("queue_hold")).get("reasons") == [_ALERT_UNREADABLE]
+     else "launch queue HELD"),
     ("merged", lambda f: "%d merged" % len(f["merged"])),
     ("parked", lambda f: "%d parked" % len(f["parked"])),
     ("bounces", lambda f: "%d bounced" % len(f["bounces"])),

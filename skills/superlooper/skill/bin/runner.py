@@ -3788,7 +3788,8 @@ class Runner:
         # a same-cause retry must never re-stamp it (the bound would never elapse); it only repairs an
         # unusable value. `park_comment_posted` makes the verbatim memo comment once-per-episode,
         # retried while the bounce is still re-deriving; once the label lands (terminal) an unposted
-        # memo stays best-effort — the notify text and the journal already carried it to the owner.
+        # memo stays best-effort — the journal carries it, and the command center's card reads it
+        # there (the text points at the dashboard for it; since #490 the text carries no memo).
         # The marker fields are REUSED from the park path (a bounce and a park never overlap on one
         # issue), which also gets this path the `park_label_stuck` alert and the reapprove reset free.
         prev = self._issue_field(iid, "park_notify_cause")
@@ -3864,8 +3865,8 @@ class Runner:
         # so a same-cause retry must never re-stamp it (the bound would never elapse); it only
         # repairs an unusable value. park_comment_posted makes the memo comment once-per-episode
         # too (21 duplicate memos in the storm), retried while the park is still re-deriving;
-        # once the label lands (terminal) an unposted memo stays best-effort — the notify text
-        # and the journal already carried it to the owner.
+        # once the label lands (terminal) an unposted memo stays best-effort — the journal carries
+        # it, and the command center's card reads it there (since #490 the text carries no memo).
         prev = self._issue_field(iid, "park_notify_cause")
         if prev != cause:
             self._update_issue(iid, {"park_notify_cause": cause, "park_notify_at": now,
@@ -5659,8 +5660,8 @@ class Runner:
     def _morning_report_hook(self, date, now):
         """Task 11 seam (filled): report.morning() renders reports/morning-<date>.md from the
         journal + the live view assembled here, then — only when report.morning_news finds news
-        (issue #495) — the report's one-line summary is pushed as a MORNING-tier text through the
-        notify doorway (issue #493). A quiet report is written and stamped like any other; its skipped
+        (issue #495) — report.morning_headline is pushed as a MORNING-tier text through the notify
+        doorway (issues #493, #490). A quiet report is written and stamped like any other; its skipped
         text is journaled as `morning_push_skipped` with the reason. A
         render/write/notify failure is contained — the action record + the journal it reads are
         already durable, so the report can always be re-rendered by `superlooper morning-report`."""

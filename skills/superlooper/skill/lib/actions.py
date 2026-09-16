@@ -662,9 +662,20 @@ ALERT_UNREADABLE_HEADLINE = "ALERT marker unreadable"
 ALERT_ASK = "`superlooper doctor` prints the fix"
 _CLEARED = "cleared: "
 _STILL_DOWN = "still down: "
-# The asks decide's 🟠 texts carry. A hand-back's memo and a question are posted on the issue itself
-# (the runner's park/bounce/question executors), which the text's URL line points at.
-HANDBACK_ASK = "your call; the memo is on the issue"
+
+
+def _still_down(reasons):
+    """The 🟢's ask when something is still standing: its headlines when at least one fits whole, else
+    the count — never a headline cut mid-word. None when nothing stands."""
+    if not reasons:
+        return None
+    named = alert_headlines(reasons, _notify.ASK_MAX_BYTES - len(_STILL_DOWN), clip_first=False)
+    return _STILL_DOWN + named if named else "%d reason(s) still down" % len(reasons)
+# The asks decide's 🟠 texts carry, beside the issue URL. A hand-back's memo is journaled with its act,
+# which is where the command center's card reads it; the memo COMMENT on the issue is best-effort once
+# the label lands, so the ask does not promise it. A question is posted on the issue before its lane
+# is released (post_question retries until it lands).
+HANDBACK_ASK = "your call; the memo is on the dashboard"
 QUESTION_ASK = "the question is on the issue"
 FREEZE_ASK = "fix-forward filed; building continues"
 
@@ -708,12 +719,27 @@ def alert_headline(reason):
     return reason
 
 
-def alert_headlines(reasons, budget=_notify.HEADLINE_MAX_BYTES):
+def alert_headlines(reasons, budget=_notify.HEADLINE_MAX_BYTES, clip_first=True):
     """Every reason's headline in ONE line within `budget` bytes — "usage meter unreadable, runner's
     gh auth dead" — naming as many as fit and counting the rest (issue #490). Never the joined
-    remedies. Two reasons with the same words (two failed migrations) are named once."""
+    remedies. Two reasons with the same words (two failed migrations) are named once. clip_first as
+    notify.clauses: False returns "" rather than a headline cut mid-word."""
     rs = reasons if isinstance(reasons, (list, tuple)) else []
-    return _notify.clauses([alert_headline(r) for r in rs], budget=budget)
+    return _notify.clauses([alert_headline(r) for r in rs], budget=budget, clip_first=clip_first)
+
+
+# The reason prefixes whose id names ONE issue lane — the lane a page about them can point at.
+_LANE_REASON_PREFIXES = ("session_at_dialog", "session_logged_out", "park_label_stuck",
+                         "launch_runaway", "update_errors")
+
+
+def alert_issue_num(reasons):
+    """The issue number an ALERT page points at (issue #490): the one lane its reasons name, when they
+    name exactly one; None when they name none or several. Pure; never raises."""
+    nums = {_iid_num(_reason_parts(r)[1]) for r in (reasons if isinstance(reasons, list) else [])
+            if len(_reason_parts(r)) > 1 and _reason_parts(r)[0] in _LANE_REASON_PREFIXES}
+    nums.discard(None)
+    return nums.pop() if len(nums) == 1 else None
 
 
 def alert_remedy(reason):
@@ -766,10 +792,10 @@ def alert_remedy(reason):
         count = reason.split(":", 1)[1]
         return (f"the runner's own tick has raised {count} times in a row, so the loop is wedged: "
                 "nothing is launched, gated or merged while it lasts. Every crash is journaled as "
-                "`tick_error` with its exception, and the runner writes the same to "
-                "`logs/runner.log` in the state home — read the latest, fix the cause, and restart "
-                "the runner (`superlooper start`) if it does not recover. The alert clears on the "
-                "first tick that completes.")
+                "a `tick_error` record carrying its exception (`grep tick_error journal.jsonl` in "
+                "the state home) — read the latest, fix the cause, and restart the runner "
+                "(`superlooper start`) if it does not recover. The alert clears on the first tick "
+                "that completes.")
     if isinstance(reason, str) and reason.startswith("migration_hold:"):
         parts = reason.split(":", 2)
         kind = parts[1] if len(parts) > 1 else "?"
@@ -781,7 +807,9 @@ def alert_remedy(reason):
     if reason == ALERT_UNREADABLE:
         return ("state/ALERT exists but could not be read, so the loop's hold state is unknown — "
                 "treat the launch queue as HELD until you can read it. `superlooper status` prints "
-                "the file's raw contents; the runner rewrites it on its next clean tick.")
+                "the file's raw contents. The runner does NOT repair it on its own: it overwrites the "
+                "file only when it next raises a reason, so if nothing is actually wrong, delete "
+                "the damaged file by hand.")
     return ALERT_REMEDIES.get(reason, reason)
 
 
@@ -2470,15 +2498,15 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
         if pages["down"]:
             # ONE headline naming every reason in plain words, and the one place their remedies are
             # printed (issue #490). The codes ride this act's `pages` and the ALERT file.
-            notify(_notify.DOWN, alert_headlines(reasons), ALERT_ASK, "alert", pages=reasons)
+            notify(_notify.DOWN, alert_headlines(reasons), ALERT_ASK, "alert",
+                   num=alert_issue_num(reasons), pages=reasons)
     elif alert_on_disk:
         out.append({"act": "clear_alert"})
     if pages["recovered"]:
         notify(_notify.RECOVERED,
                _CLEARED + alert_headlines(pages["recovered"],
                                           _notify.HEADLINE_MAX_BYTES - len(_CLEARED)),
-               (_STILL_DOWN + alert_headlines(reasons, _notify.ASK_MAX_BYTES - len(_STILL_DOWN)))
-               if reasons else None, "alert_cleared")
+               _still_down(reasons), "alert_cleared")
 
     # ---- fail-open episode journaling (issue #46), bounded to ONE record per episode ----
     # The dark-meter episode IS the usage_stale-alert episode, so the ALERT-on-disk's usage_stale

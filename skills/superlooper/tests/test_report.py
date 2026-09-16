@@ -400,10 +400,12 @@ def test_a_hold_older_than_the_threshold_raises_an_alert_tier_line():
     # beyond the listing: an alert-tier line ABOVE the sections, where the owner cannot coffee past
     head = out.split("## ")[0]
     assert "#12" in head and "stall" in head.lower()
-    # ...and the daily push's own summary line says one is standing, so the alert rides the push
-    # that already goes out rather than earning a new one
+    # ...and the summary line says one is standing, and so does the morning text's headline, so the
+    # alert rides the text that already goes out rather than earning a new one (issue #490)
     summary = next(ln for ln in out.splitlines() if ln.strip() and not ln.startswith("#"))
     assert "hold" in summary.lower()
+    assert "1 aged hold(s)" in report.morning_headline([], _view(now=now, queue=[],
+                                                                  issues_state=state), _cfg())
 
 
 def test_a_young_hold_is_listed_but_never_alerted():

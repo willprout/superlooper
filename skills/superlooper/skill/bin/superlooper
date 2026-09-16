@@ -2163,9 +2163,11 @@ def _print_standing_alerts(cfg):
         return
     try:
         home = str(config_lib.state_home(cfg))
-    except Exception:
+        rows = actions_lib.standing_alerts(_alert_view(os.path.join(home, "state", "ALERT")))
+    except Exception as e:                    # a damaged marker must cost a line, never the doctor
+        print(f"  WARN standing alerts — state/ALERT could not be read ({type(e).__name__}); "
+              "treat the launch queue as HELD and read the file by hand")
         return
-    rows = actions_lib.standing_alerts(_alert_view(os.path.join(home, "state", "ALERT")))
     if not rows:
         return
     print(f"  ALERT standing — {len(rows)} reason(s) in {os.path.join(home, 'state', 'ALERT')}:")

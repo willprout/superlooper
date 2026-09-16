@@ -171,11 +171,12 @@ def clip(value, budget):
     return _cut(_one_line(value), budget)
 
 
-def clauses(items, budget=HEADLINE_MAX_BYTES, sep=", "):
+def clauses(items, budget=HEADLINE_MAX_BYTES, sep=", ", clip_first=True):
     """Several short clauses as ONE line within `budget` bytes (issue #490): as many as fit, in order,
     then "+N more" counting the rest — so a list of reasons, signals or issues names what it can and
     is honest about what it left out. Blanks are dropped and repeats named once. A first clause that
-    alone overruns the budget is clipped rather than dropped. Pure; never raises."""
+    alone overruns the budget is clipped (ending in "…") — or, with clip_first=False, the result is ""
+    so the caller can say something whole instead. Never over `budget`. Pure; never raises."""
     seen, parts = set(), []
     for item in items if isinstance(items, (list, tuple)) else []:
         s = _one_line(item)
@@ -187,10 +188,10 @@ def clauses(items, budget=HEADLINE_MAX_BYTES, sep=", "):
         line = sep.join(parts[:k]) + more
         if _nbytes(line) <= budget:
             return line
-    if not parts:
+    if not parts or not clip_first:
         return ""
     more = " +%d more" % (len(parts) - 1) if len(parts) > 1 else ""
-    return _cut(parts[0], budget - _nbytes(more)) + more
+    return _cut(_cut(parts[0], budget - _nbytes(more)) + more, budget)
 
 
 def machine(config):

@@ -80,9 +80,13 @@ def test_clauses_names_what_fits_and_counts_the_rest():
     assert len(s.encode("utf-8")) <= 60 and s.endswith(" more") and s.startswith("reason number 00")
     shown = s.split(" +")[0].split(", ")
     assert int(s.rsplit("+", 1)[1].split()[0]) == len(many) - len(shown)  # the count is honest
-    # one clause longer than the whole budget is clipped, never dropped
+    # one clause longer than the whole budget is clipped, never dropped...
     s1 = notify.clauses(["x" * 100, "y"], budget=40)
     assert len(s1.encode("utf-8")) <= 40 and s1.startswith("x") and s1.endswith("+1 more")
+    # ...unless the caller would rather say something whole; and no budget is ever exceeded
+    assert notify.clauses(["x" * 100, "y"], budget=40, clip_first=False) == ""
+    for budget in range(0, 12):
+        assert len(notify.clauses(["x" * 100, "y"], budget=budget).encode("utf-8")) <= budget
 
 
 # ============================ ALERT headlines and remedies ============================
@@ -132,6 +136,29 @@ def test_a_multi_reason_alert_is_one_line_of_plain_words_never_joined_remedies()
     _within_parts(everything, None, "all reasons")
     assert everything.endswith(" more")                                    # names what fits, counts the rest
     assert actions.alert_headlines([]) == ""
+
+
+def test_a_green_never_cuts_a_still_standing_headline_mid_word():
+    for standing in (["fence_down", "gh_unreachable"],
+                     ["claude_auth_dead_machine", "usage_stale"],
+                     ["session_logged_out:i12345:cloud_credentials", "auth_dead"]):
+        ask = actions._still_down(sorted(standing))
+        assert "…" not in ask, ask
+        assert len(ask.encode("utf-8")) <= notify.ASK_MAX_BYTES
+        assert ask.startswith("still down: ") or ask == "2 reason(s) still down"
+    assert actions._still_down([]) is None
+
+
+def test_an_alert_about_one_lane_points_at_its_issue():
+    assert actions.alert_issue_num(["session_logged_out:i5:login"]) == 5
+    assert actions.alert_issue_num(["park_label_stuck:i7", "usage_stale"]) == 7
+    assert actions.alert_issue_num(["park_label_stuck:i7", "session_at_dialog:i8"]) is None
+    assert actions.alert_issue_num(["usage_stale", "runner_tick_errors:4"]) is None
+    assert actions.alert_issue_num(["park_label_stuck:dx", 7, None]) is None
+    out = decide(dsk=disk(issues_state={"version": 1, "issues": {
+        "i5": ist("running", sensed_state="logged_out", sensed_auth="login")}}))
+    (a,) = [x for x in only(out, "notify") if x["caller"] == "decide:alert"]
+    assert a["url"] == "https://github.com/o/r/issues/5"
 
 
 def test_a_remedy_for_an_unknown_reason_is_its_code_never_nothing():
@@ -214,7 +241,7 @@ def test_every_decide_text_arrives_whole():
         for a in _decide_texts(out):
             _within_parts(a["headline"], a["ask"], a["caller"])
             _whole(a["tier"], a["headline"], a["ask"], a["url"], a["caller"])
-            assert HUGE[:40] not in (a["ask"] or ""), a["caller"]            # the memo is on the issue
+            assert HUGE[:40] not in (a["ask"] or ""), a["caller"]            # never the memo itself
             seen.add(a["caller"])
     assert seen == {c for c in COVERED if c.startswith("decide:")}
 
@@ -357,6 +384,18 @@ def test_the_morning_text_is_a_headline_that_arrives_whole_on_the_busiest_night(
     assert HUGE[:40] not in h
 
 
+def test_every_news_class_has_a_headline_clause():
+    # a news class with no clause would text "nothing new overnight" on a morning that has news
+    assert {key for _cls, key in report._NEWS_FACTS} == {key for key, _say in report._HEADLINE_CLAUSES}
+
+
+def test_an_unreadable_marker_headline_does_not_claim_a_hold_it_cannot_read():
+    view = {"date": "2026-07-02", "now": 2000, "queue": [],
+            "queue_hold": {"reasons": [actions.ALERT_UNREADABLE], "since": None}}
+    h = report.morning_headline([], view, {})
+    assert h == "ALERT marker unreadable, queue may be HELD"
+
+
 def test_a_quiet_morning_headline_still_says_something_true():
     h = report.morning_headline([], {"date": "2026-07-02", "now": 2000, "queue": []}, {})
     assert h and "nothing" in h.lower()
@@ -495,9 +534,19 @@ def test_doctor_prints_the_remedy_for_each_standing_reason(rig):
 
 def test_doctor_prints_no_remedy_when_nothing_stands(rig):
     r = cli(rig, "doctor", "--repo", str(rig.repo))
-    assert "standing alert" not in r.stdout.lower()
+    assert "ALERT standing" not in r.stdout and "standing alerts" not in r.stdout
     for reason in actions.ALERT_REMEDIES:
         assert actions.alert_remedy(reason)[:60] not in r.stdout
+
+
+def test_doctor_survives_an_alert_marker_that_is_not_text(rig):
+    home = rig.tmp / "slhome" / "o__r"
+    (home / "state").mkdir(parents=True, exist_ok=True)
+    (home / "state" / "ALERT").write_bytes(b"\xff\xfe\x00garbage")
+    for args in (["doctor"], ["doctor", "--stack"]):
+        r = cli(rig, *args, "--repo", str(rig.repo), env_over=_stack_env(rig))
+        assert "Traceback" not in r.stderr, r.stderr
+        assert "state/ALERT" in r.stdout and "config" in r.stdout
 
 
 def test_doctor_names_an_unreadable_alert_marker(rig):

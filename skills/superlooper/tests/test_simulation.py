@@ -799,7 +799,8 @@ def test_referee_path_pr_parks_needs_william_once_without_merging(sim_factory):
              if "diff reaches live referee path" in m["body"]]
     assert len(memos) == 1 and ".superlooper/config.json" in memos[0]["body"]
     notices = sim.notify_lines()
-    assert len(notices) == 1 and ".superlooper/config.json" in notices[0]
+    # the memo naming the file is on the issue (above); the text points there (issue #490)
+    assert len(notices) == 1 and "i1 needs-owner" in notices[0] and "issues/1" in notices[0]
 
 
 def test_touches_required_parks_a_no_touches_issue_before_launch(sim_factory):
@@ -2666,5 +2667,5 @@ def test_a_dark_meter_with_work_waiting_pages_once_and_greens_once(sim_factory):
     _dark_meter_episode(sim)
     down = [t for t in sim.notify_lines() if t.startswith("🔴")]
     up = [t for t in sim.notify_lines() if t.startswith("🟢")]
-    assert len(down) == 1 and "ALERT: usage_stale" in down[0], sim.notify_lines()
-    assert len(up) == 1 and "cleared: usage_stale" in up[0], sim.notify_lines()
+    assert len(down) == 1 and "usage meter unreadable" in down[0], sim.notify_lines()
+    assert len(up) == 1 and "cleared: usage meter unreadable" in up[0], sim.notify_lines()
