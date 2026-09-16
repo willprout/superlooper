@@ -1342,13 +1342,11 @@ class Runner:
             return
         try:
             import notify
+            # The headline and the doctor pointer (issue #490); the remedy naming each failed
+            # migration is actions.alert_remedy's, printed by `superlooper doctor`.
             outcome = notify.send(self.config, notify.render(
-                self.config, notify.DOWN, "HELD — a repo migration could not be applied",
-                f"a pending per-repo migration failed to apply at boot ({named}); the loop "
-                "is HELD rather than running against an un-migrated repo and storming a "
-                "failing write every tick. Check gh auth / re-run `superlooper adopt` "
-                "(idempotent), then restart the runner.", caller="runner:migration_hold"),
-                home=self.home)
+                self.config, notify.DOWN, actions.alert_headlines(reasons), actions.ALERT_ASK,
+                caller="runner:migration_hold"), home=self.home)
             self._record_own_page(reasons, delivered=notify.delivered(outcome))
         except Exception:
             pass
@@ -1594,8 +1592,7 @@ class Runner:
             try:
                 import notify
                 outcome = notify.send(self.config, notify.render(
-                    self.config, notify.DOWN, "ALERT: " + paged[0],
-                    f"runner tick has failed {count}x in a row — the loop is wedged",
+                    self.config, notify.DOWN, actions.alert_headline(paged[0]), actions.ALERT_ASK,
                     caller="runner:tick_errors"), home=self.home)
                 self._record_own_page(paged, delivered=notify.delivered(outcome))
             except Exception:
@@ -5579,8 +5576,8 @@ class Runner:
                 return
             import notify
             notify.send(self.config, notify.render(
-                self.config, notify.RECOVERED, "cleared: " + ", ".join(reasons),
-                "the runner is completing ticks again — the loop is serving its work",
+                self.config, notify.RECOVERED,
+                "cleared: " + actions.alert_headlines(reasons, notify.HEADLINE_MAX_BYTES - 9),
                 caller="runner:own_page_cleared"), home=self.home)
         except Exception as e:
             self._log(f"own page close skipped: {_short_repr(e)}")
@@ -5705,6 +5702,8 @@ class Runner:
                 "usage": self.usage_view(), "engine_drift": drift,
                 "queue_hold": {"reasons": held,
                                "since": (alert or {}).get("since")} if held else None,
+                # every standing ALERT reason with its remedy (issue #490) — what no text carries
+                "alerts": actions.standing_alerts(alert),
                 "issues_state": self._load_state()}
         text = report.morning(records, view, ledger, self.config)
         try:
@@ -5726,12 +5725,10 @@ class Runner:
                 pass                            # the report already rendered (contained failure)
             self._log(f"morning report {date}: written; quiet — no text sent")
             return
-        # First non-title, non-blank line is the summary tally — the push body.
-        summary = next((ln for ln in text.splitlines()
-                        if ln.strip() and not ln.startswith("#")), "morning report ready")
-        outcome = notify.send(self.config, notify.render(self.config, notify.MORNING, summary,
-                                                         caller="runner:morning_report"),
-                              home=self.home)
+        # The text is the report's news as one headline (issue #490); the file carries the rest.
+        outcome = notify.send(self.config, notify.render(
+            self.config, notify.MORNING, report.morning_headline(records, view, self.config),
+            caller="runner:morning_report"), home=self.home)
         self._log(f"morning report {date}: notify [{outcome}]")
 
     def _exec_notify(self, a, now):

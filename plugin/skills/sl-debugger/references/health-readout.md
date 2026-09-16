@@ -39,11 +39,18 @@ Fine when notify is the patient; skip it when the owner is asleep.
 - **Lock alive + heartbeat stale = alive-but-wedged** (the 2026-07-07 class — the stamp was
   deliberately moved to end-of-tick so a wedge reads stale, not healthy).
 - `<home>/state/ALERT` — existence = an active alert; JSON `{"reasons": [...], "since": epoch}`.
-  Reason codes (from `lib/actions.py` / `bin/runner.py`): `runner_tick_errors:<n>` (wedged
-  tick loop), `gh_unreachable` (≥10 failed polls), `usage_stale` (usage meter dark),
-  `launch_anchor_down` / `launch_systemic_failure` (launches failing as a class — queue held
-  intact behind one alert), `launch_runaway:<id>`, `update_errors:<id>`,
-  `park_label_stuck:<id>`. The runner clears the file itself on a clean tick.
+  Reason codes (from `lib/actions.py` / `bin/runner.py`), each with the headline the owner's text
+  used for it: `runner_tick_errors:<n>` ("runner ticks failing (<n>x in a row)" — wedged tick
+  loop), `gh_unreachable` ("GitHub unreachable" — ≥10 failed polls), `usage_stale` ("usage meter
+  unreadable" — meter dark), `launch_anchor_down` ("launch anchor gone") /
+  `launch_systemic_failure` ("launches failing to deliver") — launches failing as a class, queue
+  held intact behind one alert — `launch_runaway:<id>` ("<id> relaunching past its cap"),
+  `update_errors:<id>` ("<id> branch update failing"), `park_label_stuck:<id>` ("<id> hand-back
+  label not landing"). The full list, auth and environment holds included, is the "ALERT
+  headlines" table in the superlooper skill's `references/runner-ops.md`. The owner's text carries
+  only the headline; **`superlooper doctor --repo <repo>` prints each standing reason's full
+  remedy** — read it before diagnosing from scratch. The runner clears the file itself on a clean
+  tick.
 
 ## 2. What has the runner been doing — the journal
 

@@ -69,9 +69,9 @@ def test_every_held_class_names_its_own_cause_and_never_another_s_remedy():
     """The trap the issue calls out by name. The generic systemic body tells the owner to run
     `defaults write ... NSAppSleepDisabled` and relaunch cmux. For a dead credential or a poisoned
     env that is a confidently WRONG remedy the owner will spend a night on."""
-    generic = actions.ALERT_MESSAGES["launch_systemic_failure"]
+    generic = actions.ALERT_REMEDIES["launch_systemic_failure"]
     for ev_reason, alert_reason in actions.LAUNCH_ALERT_REASONS.items():
-        msg = actions._alert_message(alert_reason)
+        msg = actions.alert_remedy(alert_reason)
         assert msg != alert_reason, f"{alert_reason} falls back to its bare code"
         assert len(msg) > 80, alert_reason
         assert msg != generic, alert_reason
@@ -88,7 +88,7 @@ def test_every_held_class_names_its_own_cause_and_never_another_s_remedy():
     ("anchor_socket_lost", "socket"),               # the control socket, not App Nap
 ])
 def test_each_class_carries_its_own_real_remedy(ev_reason, needle):
-    msg = actions._alert_message(actions.LAUNCH_ALERT_REASONS[ev_reason]).lower()
+    msg = actions.alert_remedy(actions.LAUNCH_ALERT_REASONS[ev_reason]).lower()
     assert needle in msg, msg
 
 
@@ -96,8 +96,8 @@ def test_the_worker_gh_hold_is_not_confused_with_the_runner_gh_hold():
     """The asymmetric case is the motivating one: the runner's own gh is HEALTHY (the poll keeps
     working) while every worker's fresh env is de-authenticated. Telling the owner "the runner's
     own gh cannot say who it is" would send them to check the one thing that is fine."""
-    workers = actions._alert_message("gh_auth_dead_workers")
-    runner = actions._alert_message("gh_auth_dead_runner")
+    workers = actions.alert_remedy("gh_auth_dead_workers")
+    runner = actions.alert_remedy("gh_auth_dead_runner")
     assert workers != runner
     assert "worker" in workers.lower()
 
@@ -548,7 +548,7 @@ def test_no_held_class_claims_an_accounting_it_did_not_keep():
     assert "nothing is parked" not in shared and "nothing parked" not in shared
     assert "parks nothing" in shared
     for ev_reason in evidence.SYSTEMIC_ESCALATION_REASONS:
-        msg = actions._alert_message(actions.LAUNCH_ALERT_REASONS[ev_reason]).lower()
+        msg = actions.alert_remedy(actions.LAUNCH_ALERT_REASONS[ev_reason]).lower()
         assert "no issue charged" not in msg, ev_reason
         assert "nothing parked" not in msg, ev_reason
         assert "parks nothing" in msg, ev_reason
@@ -563,10 +563,11 @@ def test_the_morning_report_never_reads_a_held_queue_as_a_quiet_night():
             "queue_hold": {"reasons": ["gh_auth_dead_workers"], "since": NOW - 3600}}
     text = report_lib.morning([], view, {}, cfg())
     assert "Nothing happened overnight" not in text
-    # the push body (the first non-title line) must carry it: an owner who never opens the file
-    # still learns the loop stopped
+    # the summary line must carry it, and so must the text's headline: an owner who never opens
+    # the file still learns the loop stopped
     summary = next(ln for ln in text.splitlines() if ln.strip() and not ln.startswith("#"))
     assert "HELD" in summary, summary
+    assert report_lib.morning_headline([], view, cfg()).startswith("launch queue HELD")
 
 
 def test_the_morning_report_names_the_cause_and_says_the_hold_took_no_action():
@@ -826,10 +827,10 @@ def test_the_auth_death_class_is_held_named_and_carries_its_own_remedy():
     assert AUTH_DEATH in actions.QUEUE_HELD_ALERT_REASONS
     assert AUTH_DEATH not in actions.LAUNCH_HOLD_ALERT_REASONS, \
         "it owns an exit edge of its own; sharing the generic marker cost #320 its restart record"
-    msg = actions._alert_message(AUTH_DEATH)
+    msg = actions.alert_remedy(AUTH_DEATH)
     assert msg != AUTH_DEATH, "it falls back to its bare code"
     assert len(msg) > 80
-    assert msg != actions.ALERT_MESSAGES["launch_systemic_failure"]
+    assert msg != actions.ALERT_REMEDIES["launch_systemic_failure"]
     assert "NSAppSleepDisabled" not in msg and "defaults write" not in msg
     assert "held" in msg.lower() or "hold" in msg.lower()
     assert "parks nothing" in msg.lower()

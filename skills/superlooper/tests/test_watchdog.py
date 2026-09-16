@@ -76,8 +76,10 @@ def test_stale_heartbeat_trips_and_notifies_once():
     assert ep["signals"] == ["heartbeat_stale"]
     assert ep["opened_at"] == T0
     assert len(r["notify"]) == 1
-    title, body = r["notify"][0]["headline"], r["notify"][0]["ask"]
-    assert "watchdog" in title.lower() and "heartbeat" in body
+    title, ask = r["notify"][0]["headline"], r["notify"][0]["ask"]
+    assert "watchdog" in title.lower() and "heartbeat" in title       # the headline names the signal
+    assert "superlooper status" in ask                                # one ask line (issue #490)
+    assert "min" in r["journal"][0]["detail"]                         # the detail is the journal's
     # the debugger-launch countdown is the JOURNAL's (and the morning report's), not the phone's
     # (issue #494): the record names the grace, the authority and when the launch falls due
     assert _outcomes(r) == ["notified"]
@@ -117,7 +119,7 @@ def test_no_progress_trips_only_after_the_bound():
     r3 = _run(T0 + 30 * MIN, _view(T0 + 30 * MIN, eligible_nums=[42]), r2["state"])
     ep = r3["state"]["episode"]
     assert ep is not None and ep["signals"] == ["no_progress"]
-    assert "#42" in r3["notify"][0]["ask"]                  # names the waiting work
+    assert "#42" in r3["journal"][0]["detail"]                # the journal names the waiting work
 
 
 def test_no_progress_clock_survives_a_changing_queue_neighbour():
@@ -579,7 +581,7 @@ def test_after_resurrect_success_journals_a_distinct_act_and_texts_loudly():
     down = wd.record_delivered(r["state"], {"tier": "down", "marks": "runner"})
     loud = wd.after_resurrect(T0, _cfg(), down, r["resurrect"], rc=0)
     assert len(loud["notify"]) == 1
-    assert "r1" in loud["notify"][0]["ask"] or "runner" in loud["notify"][0]["ask"].lower()
+    assert "restarted" in loud["notify"][0]["headline"] and loud["notify"][0]["ask"] is None
 
 
 def test_dead_runner_with_a_fresh_heartbeat_is_not_resurrected():
@@ -648,9 +650,9 @@ def test_cap_of_zero_disables_resurrection_and_escalates_immediately():
     assert r["journal"][0]["max_per_hour"] == 0
     assert len(r["notify"]) == 1
     # the message must reflect DISABLED, never "restarted 0 time(s)" (misleading when never enabled)
-    body = r["notify"][0]["ask"]
-    assert "disabled" in body.lower()
-    assert "0 time" not in body
+    head = r["notify"][0]["headline"]
+    assert "disabled" in head.lower()
+    assert "0 time" not in head and "0 restart" not in head
 
 
 def test_cap_escalation_claims_attempts_never_asserted_restarts():
@@ -666,10 +668,10 @@ def test_cap_escalation_claims_attempts_never_asserted_restarts():
     later = T0 + 6 * MIN
     capped = _run(later, _dead(later), st, cfg=cfg)
     assert [j.get("outcome") for j in capped["journal"]] == ["resurrect_capped"]
-    body = capped["notify"][0]["ask"].lower()
-    assert "attempt" in body                          # honest: restart was TRIED
-    assert "been auto-restarted" not in body          # never assert a restart that did not happen
-    assert "restarted 1 time" not in body
+    head = capped["notify"][0]["headline"].lower()
+    assert "attempt" in head                          # honest: restart was TRIED
+    assert "been auto-restarted" not in head          # never assert a restart that did not happen
+    assert "restarted 1 time" not in head
 
 
 def test_attempts_age_out_of_the_rolling_window():
@@ -1003,7 +1005,8 @@ def _entries(*results):
 
 def _shape_ok(n):
     # `marks` (issue #494) rides on a 🔴 only: which record its delivery stamps
-    keys = {"tier", "headline", "ask", "caller"} | ({"marks"} if n.get("tier") == "down" else set())
+    keys = ({"tier", "headline", "ask", "url", "caller"}
+            | ({"marks"} if n.get("tier") == "down" else set()))
     return (set(n) == keys and n["tier"] in notify_mod.TIER_EMOJI
             and isinstance(n["headline"], str) and n["headline"].strip()
             and n["caller"].startswith("watchdog:"))
@@ -1013,7 +1016,7 @@ def test_an_opened_episode_texts_down_with_its_signals_as_the_headline():
     r = _run(T0, _view(heartbeat=T0 - 21 * MIN))
     (n,) = r["notify"]
     assert _shape_ok(n)
-    assert n["tier"] == notify_mod.DOWN and n["headline"] == "watchdog: heartbeat_stale"
+    assert n["tier"] == notify_mod.DOWN and n["headline"] == "watchdog: runner heartbeat stale"
     assert n["caller"] == "watchdog:episode"
 
 
@@ -1095,7 +1098,7 @@ def test_a_wedged_runner_with_no_work_opens_silently_and_pages_when_work_appears
     r3 = _run(T0 + 10 * MIN, _busy(_view(T0 + 10 * MIN, **wedged)), r2["state"])
     (n,) = r3["notify"]
     assert n["tier"] == notify_mod.DOWN and n["marks"] == "episode"
-    assert "heartbeat_stale" in n["headline"]
+    assert "heartbeat stale" in n["headline"]
     r4 = _run(T0 + 15 * MIN, _busy(_view(T0 + 15 * MIN, **wedged)), r3["state"])
     assert r4["notify"] == []                                        # paged once per episode
 
@@ -1159,7 +1162,7 @@ def test_a_delivered_episode_page_gets_one_green_when_the_signal_clears():
     cleared = _run(T0 + 10 * MIN, _idle(_view(T0 + 10 * MIN)), st)
     assert _outcomes(cleared) == ["stand_down"]
     (g,) = cleared["notify"]                                         # demand is irrelevant to a 🟢
-    assert g["tier"] == notify_mod.RECOVERED and "heartbeat_stale" in g["headline"]
+    assert g["tier"] == notify_mod.RECOVERED and "heartbeat stale" in g["headline"]
     # the undelivered twin stands down silently, as before
     silent = _run(T0 + 10 * MIN, _busy(_view(T0 + 10 * MIN)), r["state"])
     assert _outcomes(silent) == ["stand_down"] and silent["notify"] == []

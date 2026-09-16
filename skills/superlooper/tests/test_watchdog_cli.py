@@ -214,8 +214,8 @@ def test_the_watchdogs_texts_are_rendered_through_the_doorway(tmp_path):
     assert r.returncode == 0, r.stderr
     assert "notify: sent via cmd" in r.stdout
     title, body = sent.read_text().split("|", 1)
-    assert title == "🔴 r@mini · watchdog: heartbeat_stale"
-    assert body.count("\n") <= 2 and len((title + "\n" + body).rstrip("\n").encode()) <= 280
+    assert title == "🔴 r@mini · watchdog: runner heartbeat stale"
+    assert body == "check the loop: `superlooper status`\n"             # one ask line (issue #490)
 
 
 def test_grace_elapsed_launches_the_debugger_exactly_once(tmp_path):
@@ -863,10 +863,10 @@ def test_a_delivered_failed_restart_page_is_closed_by_the_restart_that_works(tmp
     rig.runner_lock(999999)
     rig.anchor()
     assert rig.run(STUB_RESURRECT_RC=2).returncode == 0
-    assert [t.split("|")[0] for t in texts()] == ["🔴 r@mini · could NOT restart the runner"]
+    assert [t.split("|")[0] for t in texts()] == ["🔴 r@mini · runner down, auto-restart failed"]
     assert rig.wstate()["resurrection"]["down_delivered"] is True
     assert rig.run().returncode == 0
-    assert [t.split("|")[0] for t in texts()][1:] == ["🟢 r@mini · runner was down — restarted it"]
+    assert [t.split("|")[0] for t in texts()][1:] == ["🟢 r@mini · runner was down, restarted it"]
     assert rig.wstate()["resurrection"]["down_delivered"] is False
 
 
@@ -898,7 +898,7 @@ def test_demand_falls_back_to_the_published_view_when_github_will_not_answer(tmp
                                                              {"name": "type:build"}]}},
                                 "closed_nums": [], "polled_at": time.time() - 900}))
     assert rig.run(GH_FAIL="1").returncode == 0
-    assert [t.split("|")[0] for t in texts()] == ["🔴 r@mini · watchdog: heartbeat_stale"]
+    assert [t.split("|")[0] for t in texts()] == ["🔴 r@mini · watchdog: runner heartbeat stale"]
 
 
 def test_unknowable_demand_fails_toward_the_page(tmp_path):

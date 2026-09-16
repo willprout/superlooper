@@ -1004,13 +1004,14 @@ def test_the_triage_section_never_raises_on_wrong_typed_records():
 
 
 def test_the_summary_tally_names_the_triage_run():
-    """The summary line IS the push body. A night on which a flight closed three issues must not
-    reach the owner's phone as "0 merged · 0 parked · queue: 1" — the one surface that would make
-    an autonomous delegation invisible is the one it has to be visible on."""
+    """A night on which a flight closed three issues must not read "0 merged · 0 parked · queue: 1" —
+    not in the file's summary, and not in the text's headline (issue #490)."""
     out = report.morning(_triage_night(), _view(queue=[], usage=None), ledger={}, config=_cfg())
     summary = [ln for ln in out.splitlines() if ln.strip() and not ln.startswith("#")][0]
     assert "triage" in summary.lower()
     assert "1 merged" in summary and "2 closed" in summary and "1 escalated" in summary
+    head = report.morning_headline(_triage_night(), _view(queue=[], usage=None), _cfg())
+    assert "triage: 1 merged, 2 closed, 1 escalated" in head
 
 
 def test_a_night_with_no_flight_leaves_the_summary_exactly_as_it_was():
@@ -1284,14 +1285,18 @@ def test_an_integer_timestamp_too_large_for_a_float_never_takes_the_report_down(
                           signals=["heartbeat_stale"]), "1 runner-resurrection event(s)"),
 ])
 def test_news_the_tally_does_not_count_is_still_named_in_the_text(act, rec, words):
-    # The summary line IS the text body. A night whose only news is a runner restart used to text
-    # "0 merged · 0 parked … queue: 0." — a text that now means "something happened" saying nothing did.
+    # A night whose only news is a runner restart used to text "0 merged · 0 parked … queue: 0." — a
+    # text that now means "something happened" saying nothing did. The file's summary names it, and
+    # so does the text's headline (issue #490), in its own shorter words.
     view = _view(now=_NEWS_NOW, queue=[], usage=None)
     j = [_LAST_REPORT, dict(ts=_OVERNIGHT, **rec)]
     assert report.morning_news(j, view, config=_cfg())                  # it is news…
     out = report.morning(j, view, ledger={}, config=_cfg())
     summary = next(ln for ln in out.splitlines() if ln.strip() and not ln.startswith("#"))
-    assert words in summary                                              # …and the text says which
+    assert words in summary                                              # …the file says which…
+    head = report.morning_headline(j, view, config=_cfg())
+    assert head == {"wander": "1 wander(s)", "debugger": "1 debugger event(s)",
+                    "resurrection": "1 runner restart event(s)"}[act]     # …and so does the text
 
 
 def test_a_desktop_toast_is_not_a_text_that_reached_the_phone():
@@ -1343,3 +1348,39 @@ def test_a_wrong_typed_channel_never_takes_the_report_down(channel):
     assert v["last_delivered_at"] is None
     assert report.notify_canary(j, now=now, max_age_seconds=report.WEEK_SECONDS)
     assert "Notify channel" in report.morning(j, _view(now=now), ledger={}, config=_cfg())
+
+
+# --------------------------- the remedies the text no longer carries (issue #490) ---------------------------
+
+def test_every_standing_alert_carries_its_remedy_in_the_file():
+    import actions
+    rows = actions.standing_alerts({"reasons": ["launch_anchor_down", "park_label_stuck:i9"]})
+    out = report.morning(_full_journal(), _view(alerts=rows), ledger={}, config=_cfg())
+    flat = " ".join(out.split())
+    for row in rows:
+        assert f"**ALERT standing: {row['headline']}** (`{row['reason']}`)" in out
+        assert " ".join(row["remedy"].split()) in flat
+    # above the sections, like every alert-tier line
+    assert out.index("ALERT standing") < out.index("## Merged")
+
+
+def test_standing_alert_rows_that_are_not_rows_are_skipped_never_raised():
+    for alerts in (None, "usage_stale", [None, 7, {"reason": "x"}, {"reason": "", "headline": "h",
+                                                                   "remedy": "r"}]):
+        out = report.morning([], _view(alerts=alerts), ledger={}, config=_cfg())
+        assert "ALERT standing" not in out
+
+
+def test_a_standing_alert_alone_is_not_morning_news():
+    # issue #495 decides WHEN the morning texts; the remedy lines only change what the file says
+    import actions
+    view = _view(queue=[], alerts=actions.standing_alerts({"reasons": ["usage_stale"]}))
+    assert report.morning_news([], view, _cfg()) == []
+
+
+def test_the_morning_headline_names_the_news_the_file_tallies():
+    out = report.morning(_full_journal(), _view(), ledger={}, config=_cfg())
+    h = report.morning_headline(_full_journal(), _view(), _cfg())
+    assert h.startswith("3 merged · 2 parked · 1 bounced · ") and "3 merged" in out
+    assert "question" in h and "regen" in h and "wander" in h
+    assert "queue" not in h                                   # a waiting queue is not news

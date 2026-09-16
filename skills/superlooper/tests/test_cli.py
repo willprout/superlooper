@@ -1953,7 +1953,8 @@ def test_nightly_unparseable_results_text_waiting_through_the_doorway(rig, tmp_p
     r = cli(rig, "nightly", "--repo", str(rig.repo), env_over={"SL_NIGHTLY_WORKTREE": str(wt)})
     assert r.returncode == 1
     (title, body), = _texts(sent)
-    assert title.startswith("🟠 r@mini · nightly — could not parse results (")
+    assert title.startswith("🟠 r@mini · nightly could not read its results (")
+    assert body.startswith("suite exited ") and body.count("\n") == 0
     assert len((title + "\n" + body).encode("utf-8")) <= 280
 
 
@@ -1968,8 +1969,8 @@ def test_promote_report_texts_waiting_through_the_doorway(rig, tmp_path):
     assert r.returncode == 0, r.stdout + r.stderr
     assert "notify: sent via cmd" in r.stdout
     (title, body), = _texts(sent)
-    assert title.startswith("🟠 r@mini · promotion evidence — ")
-    assert body == "promotion evidence ready — no verdict, your call (Gate 2)."
+    assert title.startswith("🟠 r@mini · promotion evidence ready (")
+    assert body == "no verdict; your call (Gate 2)"
 
 
 def test_morning_report_cli_texts_the_morning_tier_and_journals_the_canary(rig, tmp_path):

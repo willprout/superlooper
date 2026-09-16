@@ -99,6 +99,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import textwrap
 import time
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -2153,6 +2154,28 @@ def _notify_canary_verdict(cfg):
         return None
 
 
+def _print_standing_alerts(cfg):
+    """The remedy for every reason standing in this repo's state/ALERT (issue #490) — the paragraph an
+    owner text used to carry, printed where a keyboard is. Reads what the runner already recorded; it
+    probes nothing and changes no verdict, so a standing alert never turns the doctor red on its own.
+    Silent when nothing stands (or no config names a state home)."""
+    if cfg is None:
+        return
+    try:
+        home = str(config_lib.state_home(cfg))
+    except Exception:
+        return
+    rows = actions_lib.standing_alerts(_alert_view(os.path.join(home, "state", "ALERT")))
+    if not rows:
+        return
+    print(f"  ALERT standing — {len(rows)} reason(s) in {os.path.join(home, 'state', 'ALERT')}:")
+    for row in rows:
+        print(f"    {row['headline']}  [{row['reason']}]")
+        for line in textwrap.wrap(row["remedy"], width=92, break_on_hyphens=False,
+                                  break_long_words=False):
+            print(f"        {line}")
+
+
 def cmd_stack_doctor(args):
     cfg = None
     cfg_error = None
@@ -2162,6 +2185,7 @@ def cmd_stack_doctor(args):
         cfg_error = e
 
     print("superlooper doctor --stack")
+    _print_standing_alerts(cfg)
     # repo_path feeds the installed-engine drift row: in the dogfood loop args.repo (default: cwd) is
     # itself a superlooper source checkout, which is where publish drift can be measured (issue #39).
     # canary feeds the notify row: with no channel configured that row FAILs on CONFIGURATION, and
@@ -2282,6 +2306,7 @@ def cmd_doctor(args):
         check("config", True, "valid")
     except (FileNotFoundError, ValueError) as e:
         check("config", False, str(e))
+    _print_standing_alerts(cfg)
 
     pr_req, dev_req, rc_union = [], [], []
     if cfg is not None:
@@ -2564,6 +2589,9 @@ def cmd_morning_report(args):
             "queue": _ready_queue(), "usage": None,
             "queue_hold": {"reasons": _held,
                            "since": (_alert or {}).get("since")} if _held else None,
+            # Every standing ALERT reason with its remedy (issue #490): the paragraph the owner's
+            # text no longer carries, pre-shaped here as the runner's hook does.
+            "alerts": actions_lib.standing_alerts(_alert),
             # Standing holds (issue #405) are derived from the durable hold stamps in loopstate.
             # Read tolerantly (missing/corrupt -> {}): a hand-run report must still render, just
             # with no holds — in parity with runner.py's _morning_report_hook.
@@ -2593,10 +2621,10 @@ def cmd_morning_report(args):
         print(f"wrote {out_path}\nnotify: not sent — the report has no news "
               "(pass --always-send to text it anyway)")
         return 0
-    summary = next((ln for ln in text.splitlines()
-                    if ln.strip() and not ln.startswith("#")), "morning report ready")
-    # The doorway journals this send as the channel canary (issue #495), like every other text.
-    outcome = notify.send(cfg, notify.render(cfg, notify.MORNING, summary,
+    # The text is the report's news as one headline (issue #490); the file carries the rest. The
+    # doorway journals this send as the channel canary (issue #495), like every other text.
+    outcome = notify.send(cfg, notify.render(cfg, notify.MORNING,
+                                             report.morning_headline(records, view, cfg),
                                              caller="cli:morning_report"), home=home)
     print(f"wrote {out_path}\nnotify: {outcome}")
     return 0
@@ -3560,7 +3588,7 @@ def cmd_nightly(args):
                                   "note": "could not create nightly worktree", "outcome": "ok"}, now)
             notify.send(cfg, notify.render(
                 cfg, notify.WAITING, f"nightly could not start ({date})",
-                f"failed to create a fresh worktree of origin/{dev} — see the nightly log.",
+                f"checkout of {notify.clip(dev, 16)} failed; see its log",
                 caller="cli:nightly"), home=home)
             print("nightly: could not create the worktree", file=sys.stderr)
             return 1
@@ -3582,9 +3610,8 @@ def cmd_nightly(args):
                                   "green": False, "flakes": 0, "persistent": 0, "filed": [],
                                   "cmd_rc": rc1, "outcome": "ok"}, now)
             notify.send(cfg, notify.render(
-                cfg, notify.WAITING, f"nightly — could not parse results ({date})",
-                f"qa.nightly_cmd exited {rc1}; no parseable JUnit at {results_glob!r}. "
-                "The nightly could not confirm dev is green — check the nightly log.",
+                cfg, notify.WAITING, f"nightly could not read its results ({date})",
+                f"suite exited {notify.clip(rc1, 8)}, no JUnit found; see its log",
                 caller="cli:nightly"), home=home)
             print(f"nightly: could not parse results (cmd rc={rc1})", file=sys.stderr)
             return 1
@@ -3633,10 +3660,12 @@ def cmd_nightly(args):
                               "outcome": "ok"}, now)
 
         if to_file:
-            shown = ", ".join(f"#{n}" for n in filed) or "(dedup: already open)"
+            lead = f"{len(to_file)} persistent failure(s); fix: "
+            shown = (notify.clauses([f"#{n}" for n in filed],
+                                    budget=notify.ASK_MAX_BYTES - len(lead))
+                     or "already open")
             notify.send(cfg, notify.render(
-                cfg, notify.WAITING, f"nightly RED ({date})",
-                f"{len(to_file)} persistent failure(s); merges frozen, fix issue(s): {shown}",
+                cfg, notify.WAITING, f"nightly RED ({date}), merges frozen", lead + shown,
                 url=config_lib.issue_url(cfg, filed[0]) if filed else None,
                 caller="cli:nightly"), home=home)
             print(f"nightly RED: {len(to_file)} persistent, filed {filed or '(deduped)'}, "
@@ -3722,9 +3751,8 @@ def cmd_promote_report(args):
     with open(out_path, "w") as f:
         f.write(text)
     outcome = notify.send(cfg, notify.render(
-        cfg, notify.WAITING, f"promotion evidence — {date}",
-        "promotion evidence ready — no verdict, your call (Gate 2).",
-        caller="cli:promote_report"), home=home)
+        cfg, notify.WAITING, f"promotion evidence ready ({date})",
+        "no verdict; your call (Gate 2)", caller="cli:promote_report"), home=home)
     print(f"wrote {out_path}\nnotify: {outcome}")
     return 0
 
@@ -5157,7 +5185,7 @@ def _watchdog_resurrect(repo, cfg, home, state_dir, resurrect):
 
 def _send_watchdog_texts(cfg, home, entries, state):
     """Render each watchdog text through the one doorway (issue #493) and send it. The pure core
-    hands over tier/headline/ask/caller as data; an entry the renderer refuses (no closed tier) is
+    hands over tier/headline/ask/url/caller as data; an entry the renderer refuses (no closed tier) is
     printed as refused and never sent unshaped — a notification must not abort the check.
     Returns `state` with every DELIVERED entry recorded (issue #494, watchdog.record_delivered): a
     🔴 that reached the phone is what earns its recovery a 🟢, so the record rides the same save."""
@@ -5165,7 +5193,7 @@ def _send_watchdog_texts(cfg, home, entries, state):
     for n in entries:
         try:
             text = notify.render(cfg, n.get("tier"), n.get("headline"), ask=n.get("ask"),
-                                 caller=n.get("caller"))
+                                 url=n.get("url"), caller=n.get("caller"))
         except ValueError as e:
             print(f"notify: refused: {e}")
             continue

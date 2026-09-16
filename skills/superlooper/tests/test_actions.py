@@ -301,7 +301,7 @@ def test_usage_stale_alert_text_names_the_three_causes_and_the_remedy():
     # The usage_stale ALERT used to name no cause and no remedy, while the real fix lived only in a
     # code comment (issue #40). The alert text must now name the THREE proven causes and point at
     # where the remedy lives, so an operator can act off the push alone.
-    msg = actions._alert_message("usage_stale")
+    msg = actions.alert_remedy("usage_stale")
     low = msg.lower()
     # cause 1 — expired Claude auth (re-login):
     assert "re-login" in low or "re-log in" in low
@@ -321,7 +321,7 @@ def test_systemic_launch_failure_alert_names_app_nap_and_the_exact_remedy():
     # moment they most need the alert to name the real cause. The message must name macOS App Nap and
     # carry the exact `defaults write` command + the cmux-relaunch step, so a "walked away" breaker
     # trip is never silent about what to run.
-    msg = actions._alert_message("launch_systemic_failure")
+    msg = actions.alert_remedy("launch_systemic_failure")
     low = msg.lower()
     assert "app nap" in low or "app-nap" in low
     assert "defaults write com.cmuxterm.app nsappsleepdisabled -bool true" in low
@@ -1148,22 +1148,23 @@ def test_alerts_and_freezes_carry_their_tiers():
     alert = _notify_acts(decide(dsk=disk(auth_probe=_auth_dead()), parsed_issues=[parsed(5)]))[0]
     assert alert["tier"] == notify_mod.DOWN and alert["url"] is None
     freeze = _notify_acts(decide(gh_view=ghv(dev_checks=list(RED))))[0]
-    assert freeze["tier"] == notify_mod.WAITING and freeze["headline"] == "merges frozen"
+    assert freeze["tier"] == notify_mod.WAITING
+    assert freeze["headline"] == "merges frozen: 'ci' red on main"        # the check, in the headline
+    assert freeze["ask"] == actions.FREEZE_ASK
 
 
 def test_a_multi_reason_alert_renders_as_one_headline_line_not_joined_bodies():
     out = decide(parsed_issues=[parsed(5)],
                  dsk=disk(auth_probe=_auth_dead(), launch_anchor=_anchor_down()))
     act = _notify_acts(out)[0]
-    assert act["headline"] == "ALERT: auth_dead, launch_anchor_down"     # every reason, one clause
+    assert act["headline"] == "Claude auth dead, launch anchor gone"     # every reason, plain words
     t = notify_mod.render(cfg(notify={"machine_label": "mini"}), act["tier"], act["headline"],
                           ask=act["ask"], url=act["url"], caller=act["caller"])
-    assert t.lines[0] == "🔴 r@mini · ALERT: auth_dead, launch_anchor_down"
-    assert len(t.lines) <= notify_mod.TEXT_MAX_LINES
-    assert len(t.text.encode("utf-8")) <= notify_mod.TEXT_MAX_BYTES
-    second_body = actions._alert_message("launch_anchor_down")
+    assert t.lines == ("🔴 r@mini · Claude auth dead, launch anchor gone", actions.ALERT_ASK)
+    assert not t.truncated                             # written to fit, never cut (issue #490)
+    second_body = actions.alert_remedy("launch_anchor_down")
     assert second_body not in t.text                   # never the joined runbooks on the phone
-    assert act["ask"].count("; ") >= 1                 # ...which stay whole in the journaled act
+    assert act["pages"] == ["auth_dead", "launch_anchor_down"]   # the codes stay on the act
 
 
 # =========================== canary re-arm of the systemic hold (#115) ===========================
@@ -2931,8 +2932,8 @@ def test_merge_refused_to_the_cap_parks_needs_william_with_reason_and_one_notify
     p = only(out, "park")
     assert len(p) == 1 and p[0]["needs_william"] is True
     assert "2 approving reviews required" in p[0]["memo"]   # the refusal reason is surfaced
-    n = only(out, "notify")
-    assert len(n) == 1 and "2 approving reviews required" in n[0]["ask"]
+    n = only(out, "notify")                                  # ...on the issue; the text points there
+    assert len(n) == 1 and n[0]["ask"] == actions.HANDBACK_ASK and n[0]["url"]
 
 
 def test_corrupt_merge_refusal_counter_fails_closed_to_a_park():
@@ -3182,7 +3183,7 @@ def test_referee_path_gate_parks_needs_william_with_file_memo_and_one_notify():
     assert len(p) == 1 and p[0]["needs_william"] is True
     assert ".superlooper/config.json" in p[0]["memo"]
     notices = only(out, "notify")
-    assert len(notices) == 1 and ".superlooper/config.json" in notices[0]["ask"]
+    assert len(notices) == 1 and notices[0]["ask"] == actions.HANDBACK_ASK
 
 
 def test_declared_referee_area_still_parks_needs_william():
@@ -5401,9 +5402,11 @@ def test_logged_out_alert_says_what_the_owner_must_actually_do():
     stuck — only closing it worked), so the text must say so."""
     d = disk(issues_state={"version": 1, "issues": {"i5": ist("running", sensed_state="logged_out")}})
     out = decide(dsk=d)
-    body = [a for a in out if a["act"] == "notify"][0]["ask"]
+    body = _remedies(out)
     assert "i5" in body and "login" in body.lower()
     assert "session_logged_out:i5" != body            # not just the raw code echoed back
+    head = [a for a in out if a["act"] == "notify"][0]["headline"]
+    assert "i5" in head and "auth dead" in head       # the text names the lane and the fault
 
 
 def test_logged_out_alert_clears_once_the_session_is_sensed_healthy_again():
@@ -5527,8 +5530,9 @@ def test_the_stuck_dialog_alert_tells_the_owner_where_to_look():
                 sensed_since=NOW - actions.AT_DIALOG_ALERT_SECONDS - 1)
     out = decide(events=[{"type": "frozen", "id": "i5"}],
                  dsk=disk(issues_state={"version": 1, "issues": {"i5": stuck}}))
-    body = [x for x in out if x["act"] == "notify"][0]["ask"]
-    assert "i5" in body and "session_at_dialog:i5" != body
+    body = _remedies(out)
+    assert "i5" in body and "session_at_dialog:i5" != body and "tab" in body
+    assert "i5" in [x for x in out if x["act"] == "notify"][0]["headline"]
 
 
 def test_a_dialog_alert_needs_a_real_stamp_and_a_live_lane():
@@ -5689,10 +5693,16 @@ AUTH_REMEDY_CASES = [
 ]
 
 
+def _remedies(out):
+    """The remedy paragraphs for the ALERT decide raised — what `superlooper doctor` prints and the
+    morning report carries for it (issue #490; the text itself carries only the headline)."""
+    (alert,) = only(out, "alert")
+    return " ".join(actions.alert_remedy(r) for r in alert["reasons"])
+
+
 def _alert_body(**ist_over):
     d = disk(issues_state={"version": 1, "issues": {"i5": ist("running", **ist_over)}})
-    out = decide(dsk=d)
-    return [a for a in out if a["act"] == "notify"][0]["ask"]
+    return _remedies(decide(dsk=d))
 
 
 def test_each_auth_variant_gets_its_own_remedy_in_the_alert_body():
@@ -5751,7 +5761,7 @@ def test_an_unrecognised_banner_keeps_the_original_reason_and_a_generic_body():
     d = disk(issues_state={"version": 1, "issues": {"i5": ist("running", sensed_state="logged_out")}})
     out = decide(dsk=d)
     assert "session_logged_out:i5" in only(out, "alert")[0]["reasons"]
-    body = [a for a in out if a["act"] == "notify"][0]["ask"]
+    body = _remedies(out)
     assert "i5" in body and "login" in body.lower()
 
 
@@ -5878,7 +5888,7 @@ def test_a_dead_runner_gh_alerts_about_gh_not_about_the_cmux_anchor():
     # The body must carry the RIGHT INSTRUCTION. It may mention App Nap/cmux only to rule them out
     # (the owner has read the generic banner many times and needs to know this is not that), but it
     # must never carry the generic banner's actual remedy.
-    msg = actions._alert_message("gh_auth_dead_runner")
+    msg = actions.alert_remedy("gh_auth_dead_runner")
     assert "gh auth login" in msg
     assert "defaults write" not in msg, "must not send the owner to reconfigure App Nap"
     assert "NSAppSleepDisabled" not in msg and "relaunch cmux" not in msg
@@ -5945,10 +5955,10 @@ def test_every_gh_alert_reason_carries_a_real_body():
     # A channel fault HOLDS, and a held queue writes no park memo — so the alert body is the only
     # thing the owner is ever told. A reason falling back to its own bare code says nothing at all.
     for reason in ("gh_unreachable", "gh_auth_dead_runner"):
-        msg = actions._alert_message(reason)
+        msg = actions.alert_remedy(reason)
         assert msg != reason and len(msg) > 80, (reason, msg)
     # ...and the transient one must NOT send the owner to re-authenticate something that works.
-    assert "gh auth login" not in actions._alert_message("gh_unreachable")
+    assert "gh auth login" not in actions.alert_remedy("gh_unreachable")
 
 
 # ================= owner texts page only when there is work to serve (issue #494) =================
@@ -6057,7 +6067,7 @@ def test_the_page_fires_when_demand_appears_while_the_fault_still_stands():
     (a,) = only(out, "alert")
     assert a["reasons"] == ["usage_stale"] and a["paged"] == ["usage_stale"]
     (n,) = _texts(out, notify_mod.DOWN)
-    assert "usage_stale" in n["headline"] and n["pages"] == ["usage_stale"]
+    assert n["headline"] == "usage meter unreadable" and n["pages"] == ["usage_stale"]
 
 
 def test_a_delivered_page_gets_one_green_on_recovery_and_an_undelivered_one_gets_none():
@@ -6066,7 +6076,8 @@ def test_a_delivered_page_gets_one_green_on_recovery_and_an_undelivered_one_gets
     out = decide(usage=usage_ok(), dsk=delivered)            # recovery with the queue now empty
     assert only(out, "clear_alert") == [{"act": "clear_alert"}]
     (g,) = _texts(out)
-    assert g["tier"] == notify_mod.RECOVERED and "usage_stale" in g["headline"]
+    assert g["tier"] == notify_mod.RECOVERED and g["headline"] == "cleared: usage meter unreadable"
+    assert g["ask"] is None                                 # nothing else down, nothing asked
     assert "pages" not in g
     # paged but the send FAILED: no 🔴 reached the phone, so no 🟢 follows it
     failed = disk(alert={"reasons": ["usage_stale"], "since": NOW - 100,
@@ -6115,7 +6126,8 @@ def test_a_new_reason_joining_a_paged_alert_pages_and_a_shrink_does_not():
     (a2,) = only(shrunk, "alert")
     assert a2["reasons"] == ["usage_stale"] and a2["delivered"] == ["usage_stale"]
     (g,) = _texts(shrunk)                           # no second 🔴 for the smaller set
-    assert g["tier"] == notify_mod.RECOVERED and "gh_unreachable" in g["headline"]
+    assert g["tier"] == notify_mod.RECOVERED and g["headline"] == "cleared: GitHub unreachable"
+    assert g["ask"] == "still down: usage meter unreadable"
 
 
 def test_a_delivered_reason_that_leaves_is_greened_even_when_another_appears():
@@ -6132,7 +6144,7 @@ def test_a_delivered_reason_that_leaves_is_greened_even_when_another_appears():
     assert a["reasons"] == ["session_logged_out:i5:subscription"] and a["delivered"] == []
     assert [n["tier"] for n in _texts(out)] == [notify_mod.DOWN, notify_mod.RECOVERED]
     g = _texts(out, notify_mod.RECOVERED)[0]
-    assert "api_key" in g["headline"] and "subscription" in g["ask"]      # "still standing: ..."
+    assert "(api key)" in g["headline"] and "(subscription)" in g["ask"]      # "still down: ..."
     # ...and on an idle loop the unrelated newcomer is never greened later: it was never delivered
     corrupt = _state(i7=ist("merged", update_errors="x"))
     idle = disk(alert={"reasons": ["usage_stale"], "since": NOW - 100, "paged": ["usage_stale"],

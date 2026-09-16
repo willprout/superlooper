@@ -355,10 +355,32 @@ NUDGE_MESSAGES = {
                      "through an exit interview that arrives once the marker exists).",
 }
 
-# Human-readable ALERT notify bodies. The reason CODES (stable, sorted) are what the ALERT file
-# stores and what decide dedups on; these strings are only the push text. A reason not listed here
-# (launch_runaway:<id>, update_errors:<id>) falls back to its own code.
-ALERT_MESSAGES = {
+# WHAT EACH ALERT REASON SAYS, IN TWO PLACES (issue #490). The reason CODES (stable, sorted) are what
+# the ALERT file stores and what decide dedups on. Each one has:
+#   * a HEADLINE — one clause of plain words, the whole of what the owner's phone is told about it
+#     (a text is a pager, never a runbook: owner ruling 2026-09-16). A multi-reason page names them
+#     all in one line (alert_headlines), within the doorway's headline budget.
+#   * a REMEDY — the paragraph an operator reads next, at a keyboard: `superlooper doctor` prints it
+#     for every reason standing in state/ALERT, and the morning-report file carries it under the
+#     alert-tier lines. It used to ride the text; the doorway's cap cut it into nonsense.
+# The dynamic reasons (`<prefix>:<id>`) have their templates beside the prefix table below.
+ALERT_HEADLINES = {
+    "usage_stale": "usage meter unreadable",
+    "launch_anchor_down": "launch anchor gone",
+    "launch_systemic_failure": "launches failing to deliver",
+    "gh_unreachable": "GitHub unreachable",
+    "gh_auth_dead_runner": "runner's gh auth dead",
+    "gh_auth_dead_workers": "workers' gh auth dead",
+    "claude_auth_dead_machine": "no session can start on this machine",
+    "claude_identity_wrong_workers": "workers' Claude login wrong",
+    "env_poisoned_workers": "workers' environment poisoned",
+    "session_host_unreachable": "session host unreachable",
+    "fence_down": "fence check refusing every launch",
+    "claude_identity_wrong_runner": "runner's Claude login wrong",
+    "auth_dead": "Claude auth dead",
+}
+
+ALERT_REMEDIES = {
     "usage_stale": "usage meter unreadable past the grace — FAILING OPEN: launching normally so "
                    "work continues; real usage may be low, and sessions hit the wall themselves if "
                    "quota is genuinely gone. Three known causes, most→least common: (1) EXPIRED "
@@ -401,9 +423,10 @@ ALERT_MESSAGES = {
                            "owns the loop repo. This is the gh-side sibling of the claude-side "
                            "auth_dead banner.",
     # ---- the systemic-outage classes (issue #320) ----
-    # Each of these HOLDS the queue, and a held queue writes no park memo — so the body below is the
-    # entire account the owner ever gets. Every one names the component that actually failed and the
-    # command that actually repairs it; none of them may borrow another's remedy.
+    # Each of these HOLDS the queue, and a held queue writes no park memo — so the remedy below is the
+    # entire account the owner ever gets (in `superlooper doctor` and the morning report). Every one
+    # names the component that actually failed and the command that actually repairs it; none of
+    # them may borrow another's remedy.
     "gh_auth_dead_workers": "every WORKER's GitHub auth is dead while the runner's own is healthy "
                             "(issue #320): several distinct lanes in a row refused their flight "
                             "because `gh` inside the SESSION's fresh environment could not answer "
@@ -433,12 +456,8 @@ ALERT_MESSAGES = {
     # construction has not settled on one. The queue lanes' own park memos and the journal carry the
     # per-flight classification for whoever wants it. It also says the alternative reading out loud:
     # this is the widest net the layer casts, so it is the one most able to be wrong.
-    # The remedies lead, deliberately: this is the longest body the loop sends, and a push channel
-    # that truncates (Pushover caps at 1024 chars) must cut the explanation rather than the fix.
-    # NB that property is this body's alone — `auth_dead` can now stand beside it (a definitive dead
-    # reading arriving mid-episode no longer renames the hold), and reasons are sorted, so it goes
-    # first and eats the budget. Its own leading remedy is the right one for that reading, so the
-    # composition still opens with something true and actionable; only remedy (3) falls off.
+    # The remedies lead, deliberately: this is the longest paragraph the loop writes, and whoever
+    # reads it at a keyboard should meet the fix before the explanation.
     "claude_auth_dead_machine": "NOTHING ON THIS MACHINE CAN START A SESSION (issue #457). Every "
                                "refusal was the launcher saying the IDENTITY or the ENVIRONMENT a "
                                "session would run under is wrong, so the repair is one of three "
@@ -626,7 +645,81 @@ AUTH_DEATH_REMEDIES = {
 }
 
 
-def _alert_message(reason):
+# The dynamic reasons: `<prefix>:<id>[:<detail>]`. Each headline template names the lane (or the
+# count) the reason carries; its remedy is composed in alert_remedy below.
+AT_DIALOG_HEADLINE = "{iid} waiting at its own dialog"
+LOGGED_OUT_HEADLINE = "{iid} session auth dead"
+LOGGED_OUT_VARIANT_HEADLINE = "{iid} session auth dead ({variant})"
+PARK_LABEL_STUCK_HEADLINE = "{iid} hand-back label not landing"
+LAUNCH_RUNAWAY_HEADLINE = "{iid} relaunching past its cap"
+UPDATE_ERRORS_HEADLINE = "{iid} branch update failing"
+# The runner's own holds (bin/runner.py), which it raises outside decide and texts itself.
+RUNNER_TICK_ERRORS_HEADLINE = "runner ticks failing ({count}x in a row)"
+MIGRATION_HOLD_HEADLINE = "repo migration failed, loop held"
+ALERT_UNREADABLE_HEADLINE = "ALERT marker unreadable"
+
+# The one ask a 🔴 ALERT page carries: where the remedy it no longer holds is printed.
+ALERT_ASK = "`superlooper doctor` prints the fix"
+_CLEARED = "cleared: "
+_STILL_DOWN = "still down: "
+# The asks decide's 🟠 texts carry. A hand-back's memo and a question are posted on the issue itself
+# (the runner's park/bounce/question executors), which the text's URL line points at.
+HANDBACK_ASK = "your call; the memo is on the issue"
+QUESTION_ASK = "the question is on the issue"
+FREEZE_ASK = "fix-forward filed; building continues"
+
+_DETAIL_BUDGET = 28          # bytes a free-text detail (an auth variant, a lane id) may take in a headline
+
+
+def _reason_parts(reason):
+    return reason.split(":") if isinstance(reason, str) else []
+
+
+def alert_headline(reason):
+    """The one-clause headline for one ALERT reason code (issue #490) — plain words, within the
+    doorway's headline budget. A code this engine has no words for reads as itself: an owner told
+    the raw code has lost nothing, an owner told nothing has lost the page. Pure; never raises."""
+    if not isinstance(reason, str):
+        return str(reason)
+    if reason in ALERT_HEADLINES:
+        return ALERT_HEADLINES[reason]
+    if reason == ALERT_UNREADABLE:
+        return ALERT_UNREADABLE_HEADLINE
+    parts = _reason_parts(reason)
+    iid = _notify.clip(parts[1], _DETAIL_BUDGET) if len(parts) > 1 else "?"
+    if parts[0] == "session_at_dialog":
+        return AT_DIALOG_HEADLINE.format(iid=iid)
+    if parts[0] == "session_logged_out":
+        variant = ":".join(parts[2:]).replace("_", " ")
+        if variant.strip():
+            return LOGGED_OUT_VARIANT_HEADLINE.format(iid=iid,
+                                                      variant=_notify.clip(variant, _DETAIL_BUDGET))
+        return LOGGED_OUT_HEADLINE.format(iid=iid)
+    if parts[0] == "park_label_stuck":
+        return PARK_LABEL_STUCK_HEADLINE.format(iid=iid)
+    if parts[0] == "launch_runaway":
+        return LAUNCH_RUNAWAY_HEADLINE.format(iid=iid)
+    if parts[0] == "update_errors":
+        return UPDATE_ERRORS_HEADLINE.format(iid=iid)
+    if parts[0] == "runner_tick_errors":
+        return RUNNER_TICK_ERRORS_HEADLINE.format(count=iid)
+    if parts[0] == "migration_hold":
+        return MIGRATION_HOLD_HEADLINE
+    return reason
+
+
+def alert_headlines(reasons, budget=_notify.HEADLINE_MAX_BYTES):
+    """Every reason's headline in ONE line within `budget` bytes — "usage meter unreadable, runner's
+    gh auth dead" — naming as many as fit and counting the rest (issue #490). Never the joined
+    remedies. Two reasons with the same words (two failed migrations) are named once."""
+    rs = reasons if isinstance(reasons, (list, tuple)) else []
+    return _notify.clauses([alert_headline(r) for r in rs], budget=budget)
+
+
+def alert_remedy(reason):
+    """The remedy paragraph for one ALERT reason code — what `superlooper doctor` prints for a
+    standing reason and the morning-report file carries (issue #490). A code with no paragraph reads
+    as itself. Pure; never raises."""
     if isinstance(reason, str) and reason.startswith("session_at_dialog:"):
         iid = reason.split(":", 1)[1]
         return (f"{iid}'s session has been sitting at its OWN question dialog in-window for "
@@ -653,7 +746,58 @@ def _alert_message(reason):
                 "was batched to the morning report if it happened in quiet hours — #164); the label "
                 "retries continue silently. Check GitHub availability / rate limits "
                 "(`gh api rate_limit`).")
-    return ALERT_MESSAGES.get(reason, reason)
+    if isinstance(reason, str) and reason.startswith("launch_runaway:"):
+        iid = reason.split(":", 1)[1]
+        return (f"{iid}'s retry counter has reached {RUNAWAY_THRESHOLD} — past the retry cap — so "
+                "the lane is cycling through relaunches instead of reaching a verdict. Read its "
+                f"journal records (`superlooper status` names the lane; grep the journal for "
+                f"\"{iid}\") for what each attempt died of and fix that cause. The alert clears once "
+                "the counter is back under the threshold; re-approving a parked issue zeroes it.")
+    if isinstance(reason, str) and reason.startswith("update_errors:"):
+        iid = reason.split(":", 1)[1]
+        return (f"{iid}'s PR branch could not be brought up to date with the dev branch "
+                f"{UPDATE_ERROR_ALERT}+ times running, and every failure was INFRASTRUCTURE — a git "
+                "error or a refused push, never a merge conflict (a real conflict regenerates "
+                "instead), or the failure counter itself is unreadable. The runner keeps retrying and "
+                "never regenerates over it. Check the lane's worktree and that the branch can be "
+                "pushed (`gh auth status`, the repo's branch rules); the first update that lands "
+                "zeroes the count and clears this alert.")
+    if isinstance(reason, str) and reason.startswith("runner_tick_errors:"):
+        count = reason.split(":", 1)[1]
+        return (f"the runner's own tick has raised {count} times in a row, so the loop is wedged: "
+                "nothing is launched, gated or merged while it lasts. Every crash is journaled as "
+                "`tick_error` with its exception, and the runner writes the same to "
+                "`logs/runner.log` in the state home — read the latest, fix the cause, and restart "
+                "the runner (`superlooper start`) if it does not recover. The alert clears on the "
+                "first tick that completes.")
+    if isinstance(reason, str) and reason.startswith("migration_hold:"):
+        parts = reason.split(":", 2)
+        kind = parts[1] if len(parts) > 1 else "?"
+        label = parts[2] if len(parts) > 2 else "?"
+        return (f"a pending per-repo migration failed to apply at boot ({kind} of '{label}'), so "
+                "the loop is HELD rather than running against an un-migrated repo and storming a "
+                "failing write every tick. Check `gh auth status`, re-run `superlooper adopt` "
+                "(idempotent), then restart the runner.")
+    if reason == ALERT_UNREADABLE:
+        return ("state/ALERT exists but could not be read, so the loop's hold state is unknown — "
+                "treat the launch queue as HELD until you can read it. `superlooper status` prints "
+                "the file's raw contents; the runner rewrites it on its next clean tick.")
+    return ALERT_REMEDIES.get(reason, reason)
+
+
+def standing_alerts(alert):
+    """Every reason a state/ALERT read names, as [{reason, headline, remedy}] in the marker's order —
+    what `superlooper doctor` prints and the morning report carries (issue #490). Takes the marker
+    tri-state queue_hold_reasons does: None (no marker) is [], a readable marker lists its string
+    reasons, and a marker that exists but cannot be read is the one ALERT_UNREADABLE row. Pure and
+    total: a damaged file costs a hedged row, never a raise."""
+    if alert is None:
+        return []
+    if not isinstance(alert, dict) or not isinstance(alert.get("reasons"), list):
+        rows = [ALERT_UNREADABLE]
+    else:
+        rows = [r for r in alert["reasons"] if isinstance(r, str) and r.strip()]
+    return [{"reason": r, "headline": alert_headline(r), "remedy": alert_remedy(r)} for r in rows]
 
 
 # ---- "the queue is PAUSED, not idle" (issue #320) -----------------------------------------------
@@ -1721,10 +1865,12 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
 
     def notify(tier, headline, ask, caller, num=None, pages=None):
         # decide() never composes a text (issue #493). It names a TIER from the closed set, a
-        # one-clause headline, the ask (the memo or runbook — the doorway cuts it to fit and journals
-        # the overflow) and the issue it concerns; the runner's executor renders the text through
-        # notify.render, the one doorway. `title` repeats the headline for the journal's existing
-        # readers, which render a notify record by its title; nothing sends it.
+        # one-clause headline, at most one short ask line and the issue it concerns; the runner's
+        # executor renders the text through notify.render, the one doorway. Headline and ask are
+        # written to the doorway's part budgets (issue #490), so nothing here is ever cut: a memo, a
+        # question or a runbook is never the ask — it lives on the issue, in the journal and in
+        # `superlooper doctor`, and the text points there. `title` repeats the headline for the
+        # journal's existing readers, which render a notify record by its title; nothing sends it.
         # `pages` (issue #494) names the ALERT reasons a systemic 🔴 carries: the executor records
         # them as DELIVERED on the ALERT only when the send reaches the phone, which is what later
         # earns their recovery a 🟢.
@@ -1768,7 +1914,7 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
         # failing GitHub write IS a systemic problem. The notify-once marker is stamped by the
         # executor regardless of whether we paged, so this park never re-pages once day breaks.
         if not notify_quiet:
-            notify(_notify.WAITING, f"{iid} {who}", memo, "park", num=num)
+            notify(_notify.WAITING, f"{iid} {who}", HANDBACK_ASK, "park", num=num)
         out.append(act)
 
     def start_ok(p, resume=True):
@@ -2322,16 +2468,17 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
             out.append({"act": "alert", "reasons": reasons, "paged": pages["paged"],
                         "delivered": pages["delivered"]})
         if pages["down"]:
-            # ONE headline naming every reason; the per-reason runbooks ride as the ask, which the
-            # doorway cuts to the cap (issue #493) — they stay whole in this journaled act.
-            notify(_notify.DOWN, "ALERT: " + ", ".join(reasons),
-                   "; ".join(_alert_message(r) for r in reasons), "alert", pages=reasons)
+            # ONE headline naming every reason in plain words, and the one place their remedies are
+            # printed (issue #490). The codes ride this act's `pages` and the ALERT file.
+            notify(_notify.DOWN, alert_headlines(reasons), ALERT_ASK, "alert", pages=reasons)
     elif alert_on_disk:
         out.append({"act": "clear_alert"})
     if pages["recovered"]:
-        notify(_notify.RECOVERED, "cleared: " + ", ".join(pages["recovered"]),
-               ("still standing: " + ", ".join(reasons)) if reasons else
-               "nothing else is down — the loop is serving its work again", "alert_cleared")
+        notify(_notify.RECOVERED,
+               _CLEARED + alert_headlines(pages["recovered"],
+                                          _notify.HEADLINE_MAX_BYTES - len(_CLEARED)),
+               (_STILL_DOWN + alert_headlines(reasons, _notify.ASK_MAX_BYTES - len(_STILL_DOWN)))
+               if reasons else None, "alert_cleared")
 
     # ---- fail-open episode journaling (issue #46), bounded to ONE record per episode ----
     # The dark-meter episode IS the usage_stale-alert episode, so the ALERT-on-disk's usage_stale
@@ -2426,9 +2573,9 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
             if not frozen:
                 out.append({"act": "freeze", "reason": f"dev checks red: {name} ({concl})",
                             "fingerprint": fp})
-                notify(_notify.WAITING, "merges frozen",
-                       f"required check '{name}' is red on {dev_branch}; fix-forward filed, "
-                       "building continues", "freeze")
+                notify(_notify.WAITING,
+                       f"merges frozen: '{_notify.clip(name, 36)}' red on "
+                       f"{_notify.clip(dev_branch, 24)}", FREEZE_ASK, "freeze")
             # File ONCE per distinct breakage — but only for as long as the issue that filing
             # produced is actually standing (issue #294). A retired fingerprint re-arms, and the
             # executor reconciles against GitHub before creating, so a still-open fix issue is
@@ -3081,7 +3228,7 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                 # the journal, the report); only the 3am page waits. A stuck bounce-label still
                 # escalates via park_label_stuck (a failing GitHub write is systemic and pages).
                 if not notify_quiet:
-                    notify(_notify.WAITING, f"{iid} bounced (needs-owner)", blocked_text, "bounce",
+                    notify(_notify.WAITING, f"{iid} bounced (needs-owner)", HANDBACK_ASK, "bounce",
                            num=num)
                 out.append(act)
                 continue
@@ -3108,9 +3255,8 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                 # report); only the 3am page waits. Gated on the post-once stamp too, so a re-derived
                 # tick never re-pages.
                 if not ist.get("question_posted") and not notify_quiet:
-                    notify(_notify.WAITING, f"{iid} needs an answer",
-                           f"a worker exited on a question and is waiting for {operator}:\n\n"
-                           f"{blocked_text}", "question", num=num)
+                    notify(_notify.WAITING, f"{iid} needs an answer", QUESTION_ASK, "question",
+                           num=num)
                 out.append({"act": "post_question", "id": iid, "num": num, "question": blocked_text})
             continue
 
