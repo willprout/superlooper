@@ -474,8 +474,10 @@ def test_boot_migration_hold_texts_down_through_the_doorway(rig, tmp_path):
     title, body = marker.read_text().split("|", 1)
     assert title == "🔴 r@mini · HELD — a repo migration could not be applied"
     assert "awaiting-answer" in body and body.count("\n") <= 1
-    alert = _alert(rig)                                # ...and the page is on the record as delivered
-    assert alert["paged"] == alert["reasons"] and alert["delivered"] == alert["reasons"]
+    alert = _alert(rig)                                # ...and the page is on the record: paged on
+    assert alert["paged"] == alert["reasons"] and alert["delivered"] == []   # the ALERT, delivered in
+    own = json.loads((rig.home / "state" / "runner_paged.json").read_text())  # the runner's own record
+    assert own["reasons"] == alert["reasons"]
 
 
 # --------------------------- owner pages need work to serve (issue #494) ---------------------------
