@@ -579,15 +579,17 @@ safety layer.
 
 **Every text sends when it happens.** The loop doesn't know your sleep schedule, so it doesn't guess
 at one: a park, a bounce or a question at 3am texts you at 3am. Your phone's **Do Not Disturb** is the
-intended night filter — silence notifications there, and whatever arrived overnight is still waiting
-in the morning report.
+intended night filter — silence notifications there, and the parks, bounces and questions that
+arrived overnight are still listed in the morning report.
 
 **Quiet hours are opt-in.** `notify.quiet_hours` defaults to `null` (no window). A repo that wants
 batching sets a window, for example `{"start": "21:00", "end": "08:00"}` (Mac-local, `end` exclusive,
-may wrap midnight): a park, a bounce or a durable question raised inside it is not texted and is left
-to the morning report instead. The hand-back itself still happens — the label moves, a question is
-still posted on the issue — only the text is held. 🔴 ALERTs and the merge-freeze notice text you
-even inside a window.
+may wrap midnight): a park, a bounce or a durable question raised inside it is never texted and is
+left to the morning report instead. The hand-back itself still happens — the label moves, a question
+is still posted on the issue — only the text is skipped. 🔴 ALERTs and the merge-freeze notice text
+you even inside a window. `adopt` once wrote that 21:00–08:00 window into every new config, so a repo
+adopted before the default changed may still carry it: if `.superlooper/config.json` sets a window
+you didn't choose, set `notify.quiet_hours` to `null`.
 
 **A 🔴 means there is work waiting.** A "down" text goes out only while the loop has work it is
 trying to do: an approved (`agent-ready`) issue that is ready to launch, or an issue in progress. A

@@ -51,10 +51,10 @@ rest:
 
 The loop texts you when something needs you, the moment it happens, day or night. It
 doesn't know your sleep schedule, so it doesn't try to: silence your phone at night with
-Do Not Disturb, and anything that arrived overnight is also in the morning report. If you
-would rather a repo held parks, bounces and questions for the morning report during set
-hours, `notify.quiet_hours` in `.superlooper/config.json` is the opt-in; it is off by
-default.
+Do Not Disturb, and the parks, bounces and questions that arrived overnight are also in
+the morning report. If you would rather a repo held those for the morning report during
+set hours, `notify.quiet_hours` in `.superlooper/config.json` is the opt-in; there is no
+quiet window unless that file sets one.
 
 Everything else — building, reviewing, merging, freezing when the mainline goes red and
 unfreezing when it's green again — is the machine's job. A loop that is frozen but still

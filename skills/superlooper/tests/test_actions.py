@@ -5550,7 +5550,7 @@ def test_a_dialog_alert_needs_a_real_stamp_and_a_live_lane():
         assert only(decide(dsk=d), "alert") == [], status
 
 
-# ============ night-batching: routine owner decisions don't page at night (issue #164) ============
+# ====== night-batching (issue #164): opt-in since #492 — by default every hand-back texts at once ======
 # #164's founding standard was "nobody answers a 3am page": a routine owner-DECISION hand-back (park /
 # bounce / durable question) was BATCHED to the morning report during quiet hours instead of pushed,
 # and the window defaulted ON (21:00–08:00). Owner ruling 2026-09-16 (issue #492) reversed the
@@ -5692,7 +5692,7 @@ def test_systemic_stop_alert_still_pages_at_3am():
     assert has_notify(out), "a systemic stop pages regardless of the hour"
 
 
-def test_quiet_hours_null_restores_the_old_always_push_behaviour():
+def test_explicit_null_quiet_hours_pages_at_night_like_the_default():
     out = decide(config=cfg(notify={"imessage_to": None, "cmd": None, "quiet_hours": None}),
                  dsk=_recheck_park_dsk("23:30"))
     assert len(only(out, "park")) == 1 and has_notify(out), "explicit null disables night-batching"
