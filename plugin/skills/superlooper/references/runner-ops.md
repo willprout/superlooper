@@ -397,9 +397,11 @@ run it by hand; add `--always-send` to text it anyway.
 alert-tier line under the summary: the reason's headline, its code, and the full remedy — the
 paragraph the text no longer carries.
 
-Routine owner-decision pages (a park, a bounce, a durable question) are **batched here instead of
-pushed** during `notify.quiet_hours` (default 21:00–08:00): nobody answers a 3am page and a park is
-a safe state. Systemic-stop ALERTs and the merge-freeze notice always push.
+**Nothing waits for the report by default.** A park, a bounce or a durable question texts you when it
+happens, at any hour, and is still listed here the next morning — the report reads them from the
+journal, not from which texts went out. A repo that sets `notify.quiet_hours` holds the texts for
+those three raised inside its window and leaves them to this report (see "Quiet hours are opt-in"
+under Notifications).
 
 ---
 
@@ -574,6 +576,20 @@ transition to `parked` or `needs-owner`, every freeze, and every ALERT the loop 
 about — the standing rule that long-running work finishing, stalling, or needing input reaches you
 (spec §2). A send failure is journaled, never fatal; notifications are a convenience layer, never a
 safety layer.
+
+**Every text sends when it happens.** The loop doesn't know your sleep schedule, so it doesn't guess
+at one: a park, a bounce or a question at 3am texts you at 3am. Your phone's **Do Not Disturb** is the
+intended night filter — silence notifications there, and the parks, bounces and questions that
+arrived overnight are still listed in the morning report.
+
+**Quiet hours are opt-in.** `notify.quiet_hours` defaults to `null` (no window). A repo that wants
+batching sets a window, for example `{"start": "21:00", "end": "08:00"}` (Mac-local, `end` exclusive,
+may wrap midnight): a park, a bounce or a durable question raised inside it is never texted and is
+left to the morning report instead. The hand-back itself still happens — the label moves, a question
+is still posted on the issue — only the text is skipped. 🔴 ALERTs and the merge-freeze notice text
+you even inside a window. `adopt` once wrote that 21:00–08:00 window into every new config, so a repo
+adopted before the default changed may still carry it: if `.superlooper/config.json` sets a window
+you didn't choose, set `notify.quiet_hours` to `null`.
 
 **A 🔴 means there is work waiting.** A "down" text goes out only while the loop has work it is
 trying to do: an approved (`agent-ready`) issue that is ready to launch, or an issue in progress. A

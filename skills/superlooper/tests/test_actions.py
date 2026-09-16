@@ -5550,11 +5550,20 @@ def test_a_dialog_alert_needs_a_real_stamp_and_a_live_lane():
         assert only(decide(dsk=d), "alert") == [], status
 
 
-# ============ night-batching: routine owner decisions don't page at night (issue #164) ============
-# The founding standard: nobody answers a 3am page and a park is a safe state. So a routine
-# owner-DECISION hand-back (park / bounce / durable question) is BATCHED to the morning report
-# during quiet hours instead of pushed; only SYSTEMIC-STOP alerts (runner/auth dead, whole queue
-# stalled) keep paging. Quiet hours default on (21:00–08:00); an explicit `null` disables them.
+# ====== night-batching (issue #164): opt-in since #492 — by default every hand-back texts at once ======
+# #164's founding standard was "nobody answers a 3am page": a routine owner-DECISION hand-back (park /
+# bounce / durable question) was BATCHED to the morning report during quiet hours instead of pushed,
+# and the window defaulted ON (21:00–08:00). Owner ruling 2026-09-16 (issue #492) reversed the
+# DEFAULT: every text sends when it happens, and the phone's Do Not Disturb is the night filter. The
+# mechanism is kept as an adopter opt-in, so the batching tests below configure the window
+# EXPLICITLY (_WINDOW) — a configured window still batches exactly as before — and the default
+# tests pin that no window means a page at any hour. Systemic-stop alerts page either way.
+
+_NIGHT = {"start": "21:00", "end": "08:00"}          # #164's former default, now an explicit opt-in
+
+
+def _window_cfg():
+    return cfg(notify={"imessage_to": None, "cmd": None, "quiet_hours": dict(_NIGHT)})
 
 
 def _recheck_park_dsk(local_hhmm):
@@ -5565,82 +5574,137 @@ def _recheck_park_dsk(local_hhmm):
                 issues_state={"version": 1, "issues": {"i5": ist("running", recheck_failed=True)}})
 
 
+def _bounce_dsk(local_hhmm):
+    return disk(local_hhmm=local_hhmm,
+                blocked={"i7": "BOUNCED: already fixed on dev; propose closing"},
+                issues_state={"version": 1, "issues": {"i7": ist("running")}})
+
+
+def _question_dsk(local_hhmm):
+    return disk(local_hhmm=local_hhmm,
+                blocked={"i7": "QUESTION: approach A or B?\nRECOMMENDATION: A"},
+                issues_state={"version": 1, "issues": {"i7": ist("blocked")}})
+
+
+# (hand-back kind, its disk builder, the action that must still fire, a word its text must carry)
+_HANDBACKS = [("park", _recheck_park_dsk, "park", "needs-owner"),
+              ("bounce", _bounce_dsk, "bounce", "bounced"),
+              ("question", _question_dsk, "post_question", "needs an answer")]
+
+
+# ---- the default (issue #492): no window, so every hand-back texts the moment it happens ----
+
+def _loaded_default_cfg(tmp_path):
+    """A config the REAL loader filled: the repo's config.json names no quiet_hours at all, so what
+    decide sees is exactly the engine default an adopter who never touched the knob runs with."""
+    import json
+    import config as config_mod
+    (tmp_path / ".superlooper").mkdir()
+    (tmp_path / ".superlooper" / "config.json").write_text(json.dumps({"repo": "o/r"}))
+    loaded = config_mod.load(tmp_path)
+    assert loaded["notify"]["quiet_hours"] is None
+    return loaded
+
+
+@pytest.mark.parametrize("hhmm", ["21:00", "03:00", "07:59"])   # both edges of #164's former window
+@pytest.mark.parametrize("kind,dsk_for,act,word", _HANDBACKS, ids=[h[0] for h in _HANDBACKS])
+def test_default_handback_texts_immediately_at_any_hour(kind, dsk_for, act, word, hhmm, tmp_path):
+    # Both roads to "the default": the loader's filled config, and a hand-built notify block with no
+    # quiet_hours key (decide's fallback for a view that predates the key). Neither may batch.
+    for config in (_loaded_default_cfg(tmp_path), cfg()):
+        out = decide(config=config, dsk=dsk_for(hhmm))
+        assert len(only(out, act)) == 1, (kind, hhmm, out)
+        texts = only(out, "notify")
+        assert len(texts) == 1, f"a {kind} at {hhmm} must text immediately under the default: {out}"
+        assert word in texts[0]["title"], texts[0]
+
+
+def test_default_night_handbacks_still_land_in_the_morning_report():
+    # Sending earlier loses nothing: the morning report re-derives parks, bounces and questions from
+    # the JOURNAL, never from which pages were held. Drive decide at 03:00 under the default (each
+    # texts), journal exactly those actions the way the runner does (adds outcome + ts), then render.
+    import report
+    records = []
+    for _kind, dsk_for, act, _word in _HANDBACKS:
+        out = decide(dsk=dsk_for("03:00"))
+        assert has_notify(out)                              # texted at 3am ...
+        records += [dict(a, outcome="ok", ts=NOW) for a in only(out, act)]
+    md = report.morning(records, {"date": "2026-07-02", "now": NOW + 10}, ledger={},
+                        config={"repo": "o/r"})             # ... and still listed next morning
+    parked_section = md.split("## Parked / needs-owner")[1].split("\n## ")[0]
+    assert "#5" in parked_section and "needs-owner" in parked_section.lower()
+    assert "#7" in md.split("## Bounces")[1].split("\n## ")[0]
+    assert "#7" in md.split("## Owner questions")[1].split("\n## ")[0]
+
+
+# ---- a CONFIGURED window (the opt-in): batches exactly as #164 built it ----
+
 def test_routine_needs_owner_park_does_not_push_at_night():
-    out = decide(dsk=_recheck_park_dsk("23:30"))
+    out = decide(config=_window_cfg(), dsk=_recheck_park_dsk("23:30"))
     parks = only(out, "park")
     assert len(parks) == 1 and parks[0]["id"] == "i5" and parks[0]["needs_william"] is True
-    assert not has_notify(out), "a routine owner-decision park must NOT page at night"
+    assert not has_notify(out), "a routine owner-decision park must NOT page inside a configured window"
 
 
 def test_the_same_park_during_the_day_still_pushes_immediately():
-    out = decide(dsk=_recheck_park_dsk("12:00"))
+    out = decide(config=_window_cfg(), dsk=_recheck_park_dsk("12:00"))
     assert len(only(out, "park")) == 1
-    assert has_notify(out), "during the day the owner is awake — the park pages promptly"
+    assert has_notify(out), "outside the window the owner is awake — the park pages promptly"
 
 
 def test_park_early_morning_boundary_pushes_after_quiet_hours_end():
     # end is EXCLUSIVE: 08:00 is already daytime, so the park pages (and appears in the 08:45 report).
-    assert has_notify(decide(dsk=_recheck_park_dsk("08:00")))
-    assert not has_notify(decide(dsk=_recheck_park_dsk("07:59")))
+    assert has_notify(decide(config=_window_cfg(), dsk=_recheck_park_dsk("08:00")))
+    assert not has_notify(decide(config=_window_cfg(), dsk=_recheck_park_dsk("07:59")))
+    assert not has_notify(decide(config=_window_cfg(), dsk=_recheck_park_dsk("21:00")))   # start inclusive
 
 
 def test_bounce_does_not_push_at_night_but_still_hands_back():
-    dsk = disk(local_hhmm="02:00",
-               blocked={"i7": "BOUNCED: already fixed on dev; propose closing"},
-               issues_state={"version": 1, "issues": {"i7": ist("running")}})
-    out = decide(dsk=dsk)
+    out = decide(config=_window_cfg(), dsk=_bounce_dsk("02:00"))
     assert len(only(out, "bounce")) == 1, "the bounce (hand-back) still fires — only the page is held"
     assert not has_notify(out)
 
 
 def test_bounce_during_the_day_pushes():
-    dsk = disk(local_hhmm="14:00",
-               blocked={"i7": "BOUNCED: already fixed on dev; propose closing"},
-               issues_state={"version": 1, "issues": {"i7": ist("running")}})
-    out = decide(dsk=dsk)
+    out = decide(config=_window_cfg(), dsk=_bounce_dsk("14:00"))
     assert len(only(out, "bounce")) == 1 and has_notify(out)
 
 
 def test_owner_question_does_not_push_at_night_but_is_posted_durably():
-    dsk = disk(local_hhmm="03:15",
-               blocked={"i7": "QUESTION: approach A or B?\nRECOMMENDATION: A"},
-               issues_state={"version": 1, "issues": {"i7": ist("blocked")}})
-    out = decide(dsk=dsk)
+    out = decide(config=_window_cfg(), dsk=_question_dsk("03:15"))
     assert len(only(out, "post_question")) == 1, "the question is still posted durably to GitHub"
-    assert not has_notify(out), "but the owner is not paged at 3am — it batches to the report"
+    assert not has_notify(out), "inside a configured window the page batches to the report"
 
 
 def test_owner_question_during_the_day_pushes():
-    dsk = disk(local_hhmm="10:00",
-               blocked={"i7": "QUESTION: approach A or B?\nRECOMMENDATION: A"},
-               issues_state={"version": 1, "issues": {"i7": ist("blocked")}})
-    out = decide(dsk=dsk)
+    out = decide(config=_window_cfg(), dsk=_question_dsk("10:00"))
     assert len(only(out, "post_question")) == 1 and has_notify(out)
 
 
 def test_systemic_stop_alert_still_pages_at_3am():
     # dead account auth with a spend pending is a SYSTEMIC stop — nothing can run — so it MUST keep
-    # paging even in the dead of night. The safety layer is never quieted.
+    # paging even inside a configured window. The safety layer is never quieted.
     dsk = disk(local_hhmm="03:00", auth_probe={"valid": False},
                issues_state={"version": 1, "issues": {"i5": ist(None)}})
-    out = decide(parsed_issues=[parsed(5)], dsk=dsk)
+    out = decide(config=_window_cfg(), parsed_issues=[parsed(5)], dsk=dsk)
     alerts = only(out, "alert")
     assert alerts and "auth_dead" in alerts[0]["reasons"]
     assert has_notify(out), "a systemic stop pages regardless of the hour"
 
 
-def test_quiet_hours_null_restores_the_old_always_push_behaviour():
+def test_explicit_null_quiet_hours_pages_at_night_like_the_default():
     out = decide(config=cfg(notify={"imessage_to": None, "cmd": None, "quiet_hours": None}),
                  dsk=_recheck_park_dsk("23:30"))
     assert len(only(out, "park")) == 1 and has_notify(out), "explicit null disables night-batching"
 
 
 def test_park_at_night_still_journals_and_lands_in_the_morning_report():
-    # The end-to-end DoD assertion: a routine needs-owner park at night does NOT page AND does appear
-    # in the morning report. We drive decide() for the (silent) park, journal exactly that action the
-    # way the runner does (adds outcome + ts), then render the report from it.
+    # The #164 end-to-end assertion, for an adopter who opted into a window: a routine needs-owner
+    # park at night does NOT page AND does appear in the morning report. We drive decide() for the
+    # (silent) park, journal exactly that action the way the runner does (adds outcome + ts), then
+    # render the report from it.
     import report
-    out = decide(dsk=_recheck_park_dsk("23:30"))
+    out = decide(config=_window_cfg(), dsk=_recheck_park_dsk("23:30"))
     park = only(out, "park")[0]
     assert not has_notify(out)                              # no 3am page
     record = dict(park, outcome="ok", ts=NOW)               # what runner._journal_outcome persists
