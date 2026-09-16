@@ -41,8 +41,8 @@ _SOCKET_PROBE_SECONDS = 5.0
 
 # The one message the doctor actually sends to prove the channel. Static (no clock) so the check
 # is deterministic and the owner learns to recognize it. Reads as an explanation on arrival.
-NOTIFY_TEST_TITLE = "superlooper doctor: notify channel test"
-NOTIFY_TEST_BODY = (
+NOTIFY_TEST_HEADLINE = "doctor: notify channel test"
+NOTIFY_TEST_ASK = (
     "doctor --stack sent this to prove your notify channel delivers. "
     "Receiving it means overnight stall alerts can reach you here."
 )
@@ -748,13 +748,16 @@ def check_notify(config, config_error=None, sender=None, announce=None, canary=N
 
     announce = announce if announce is not None else print
     sender = sender if sender is not None else notify.send_test
+    # The proof send is an owner text like any other, so it goes through the one doorway (issue
+    # #493): the TEST tier, the identity line, the cap. The announce prints exactly those lines.
+    text = notify.render(config, notify.TEST, NOTIFY_TEST_HEADLINE, ask=NOTIFY_TEST_ASK,
+                         caller="doctor:notify_channel")
     announce(
         "  notify channel: sending one live test message via %s "
-        "(doctor --stack's one deliberate side effect)\n"
-        "      title: %s\n      body:  %s"
-        % (channel, NOTIFY_TEST_TITLE, NOTIFY_TEST_BODY)
+        "(doctor --stack's one deliberate side effect)\n%s"
+        % (channel, "\n".join("      " + line for line in text.lines))
     )
-    result = sender(config, NOTIFY_TEST_TITLE, NOTIFY_TEST_BODY)
+    result = sender(config, text)
 
     if getattr(result, "ok", False):
         return CheckResult(

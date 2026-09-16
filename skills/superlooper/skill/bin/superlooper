@@ -2584,7 +2584,8 @@ def cmd_morning_report(args):
     # The push doubles as the notify-channel canary (issue #164) — send_test sends the SAME message
     # and returns its delivery result, journaled as `notify_canary` so the next report surfaces a
     # silently dead channel. Kept in parity with runner.py's _morning_report_hook.
-    r = notify.send_test(cfg, f"superlooper morning report — {date}", summary)
+    r = notify.send_test(cfg, notify.render(cfg, notify.MORNING, summary,
+                                            caller="cli:morning_report"), home=home)
     try:
         journal.append(home, {"act": "notify_canary", "date": date, "ok": bool(r.ok),
                               "channel": r.channel, "rc": r.rc,
@@ -3554,8 +3555,10 @@ def cmd_nightly(args):
             journal.append(home, {"act": "nightly", "date": date, "parse_error": True,
                                   "green": False, "flakes": 0, "persistent": 0, "filed": [],
                                   "note": "could not create nightly worktree", "outcome": "ok"}, now)
-            notify.send(cfg, f"superlooper nightly could not start ({date})",
-                        f"failed to create a fresh worktree of origin/{dev} — see the nightly log.")
+            notify.send(cfg, notify.render(
+                cfg, notify.WAITING, f"nightly could not start ({date})",
+                f"failed to create a fresh worktree of origin/{dev} — see the nightly log.",
+                caller="cli:nightly"), home=home)
             print("nightly: could not create the worktree", file=sys.stderr)
             return 1
         made = True
@@ -3575,9 +3578,11 @@ def cmd_nightly(args):
             journal.append(home, {"act": "nightly", "date": date, "parse_error": True,
                                   "green": False, "flakes": 0, "persistent": 0, "filed": [],
                                   "cmd_rc": rc1, "outcome": "ok"}, now)
-            notify.send(cfg, f"superlooper nightly — could not parse results ({date})",
-                        f"qa.nightly_cmd exited {rc1}; no parseable JUnit at {results_glob!r}. "
-                        "The nightly could not confirm dev is green — check the nightly log.")
+            notify.send(cfg, notify.render(
+                cfg, notify.WAITING, f"nightly — could not parse results ({date})",
+                f"qa.nightly_cmd exited {rc1}; no parseable JUnit at {results_glob!r}. "
+                "The nightly could not confirm dev is green — check the nightly log.",
+                caller="cli:nightly"), home=home)
             print(f"nightly: could not parse results (cmd rc={rc1})", file=sys.stderr)
             return 1
 
@@ -3626,8 +3631,11 @@ def cmd_nightly(args):
 
         if to_file:
             shown = ", ".join(f"#{n}" for n in filed) or "(dedup: already open)"
-            notify.send(cfg, f"superlooper nightly RED ({date})",
-                        f"{len(to_file)} persistent failure(s); merges frozen, fix issue(s): {shown}")
+            notify.send(cfg, notify.render(
+                cfg, notify.WAITING, f"nightly RED ({date})",
+                f"{len(to_file)} persistent failure(s); merges frozen, fix issue(s): {shown}",
+                url=config_lib.issue_url(cfg, filed[0]) if filed else None,
+                caller="cli:nightly"), home=home)
             print(f"nightly RED: {len(to_file)} persistent, filed {filed or '(deduped)'}, "
                   f"merges frozen ({len(result['flakes'])} flake(s), "
                   f"{len(result['accepted'])} accepted, {len(result['quarantined'])} quarantined)")
@@ -3710,8 +3718,10 @@ def cmd_promote_report(args):
     out_path = os.path.join(out_dir, f"promotion-{date}.md")
     with open(out_path, "w") as f:
         f.write(text)
-    outcome = notify.send(cfg, f"superlooper promotion evidence — {date}",
-                          "promotion evidence ready — no verdict, your call (Gate 2).")
+    outcome = notify.send(cfg, notify.render(
+        cfg, notify.WAITING, f"promotion evidence — {date}",
+        "promotion evidence ready — no verdict, your call (Gate 2).",
+        caller="cli:promote_report"), home=home)
     print(f"wrote {out_path}\nnotify: {outcome}")
     return 0
 
@@ -5100,6 +5110,20 @@ def _watchdog_resurrect(repo, cfg, home, state_dir, resurrect):
     return r.returncode
 
 
+def _send_watchdog_texts(cfg, home, entries):
+    """Render each watchdog text through the one doorway (issue #493) and send it. The pure core
+    hands over tier/headline/ask/caller as data; an entry the renderer refuses (no closed tier) is
+    printed as refused and never sent unshaped — a notification must not abort the check."""
+    for n in entries:
+        try:
+            text = notify.render(cfg, n.get("tier"), n.get("headline"), ask=n.get("ask"),
+                                 caller=n.get("caller"))
+        except ValueError as e:
+            print(f"notify: refused: {e}")
+            continue
+        print(f"notify: {notify.send(cfg, text, home=home)}")
+
+
 def cmd_watchdog(args):
     import watchdog as watchdog_lib
     cfg = _load_config(args.repo)
@@ -5160,8 +5184,7 @@ def cmd_watchdog(args):
         res = watchdog_lib.evaluate(now, cfg, view, prior)
         for rec in res["journal"]:
             journal.append(home, rec, now)
-        for title, body in res["notify"]:
-            print(f"notify: {notify.send(cfg, title, body)}")
+        _send_watchdog_texts(cfg, home, res["notify"])
 
         final = res["state"]
         resurrect_rc = None
@@ -5179,8 +5202,7 @@ def cmd_watchdog(args):
             done = watchdog_lib.after_resurrect(now, cfg, final, res["resurrect"], resurrect_rc)
             for rec in done["journal"]:
                 journal.append(home, rec, now)
-            for title, body in done["notify"]:
-                print(f"notify: {notify.send(cfg, title, body)}")
+            _send_watchdog_texts(cfg, home, done["notify"])
             final = done["state"]
         # A provably-gone runner past the rolling-hour cap: no resurrect emitted. Read the RAW
         # provably-gone fact from evaluate(), NOT the journal: the escalation record is deduped to
@@ -5192,8 +5214,7 @@ def cmd_watchdog(args):
             done = watchdog_lib.after_launch(now, cfg, final, res["launch"], rc)
             for rec in done["journal"]:
                 journal.append(home, rec, now)
-            for title, body in done["notify"]:
-                print(f"notify: {notify.send(cfg, title, body)}")
+            _send_watchdog_texts(cfg, home, done["notify"])
             final = done["state"]
 
         loopstate.save(state_path, final)

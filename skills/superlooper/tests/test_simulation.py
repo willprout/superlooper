@@ -147,7 +147,9 @@ class Sim:
             # test_actions.py with a PINNED local_hhmm, immune to the wall clock. A night_batching=True
             # test turns the DEFAULT window back on and drives it deterministically by PINNING the
             # runner's local clock (pin_clock) — the #217 seam that ends the wall-clock coupling.
-            "notify": {"cmd": "printf '%s|%s\\n' \"$SL_TITLE\" \"$SL_BODY\" >> "
+            # One RECORD per text, \036-terminated: since the notify doorway (#493) a text's body
+            # is up to two lines (the ask, the issue URL), so a newline no longer separates texts.
+            "notify": {"cmd": "printf '%s|%s\\036\\n' \"$SL_TITLE\" \"$SL_BODY\" >> "
                               + str(self.notify_log),
                        "quiet_hours": ({"start": "21:00", "end": "08:00"}
                                        if night_batching else None)},
@@ -431,9 +433,12 @@ class Sim:
         return st["issues"].get(sid, {})
 
     def notify_lines(self):
+        """One entry per text the loop sent — `title|body` with the body's line breaks read as
+        spaces, so a count is a count of TEXTS however many lines the doorway gave each one."""
         if not self.notify_log.exists():
             return []
-        return [l for l in self.notify_log.read_text().splitlines() if l.strip()]
+        return [" ".join(rec.split("\n")).strip()
+                for rec in self.notify_log.read_text().split("\036\n") if rec.strip()]
 
     def sends(self):
         """Every message the loop actually put in front of a worker.

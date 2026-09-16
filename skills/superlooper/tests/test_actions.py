@@ -1088,6 +1088,83 @@ def test_dead_auth_and_dead_anchor_both_named_sorted():
     assert only(out, "launch") == [] and only(out, "park") == []
 
 
+# =========================== the owner-text doorway (#493) ===========================
+# decide() never composes a text. Every notify act names a TIER from the closed set, a one-clause
+# headline, an optional ask and (when an issue exists) its URL, plus the caller the doorway names in
+# a truncation record. The runner's executor renders it through notify.render — the only composer.
+
+import notify as notify_mod
+
+
+def _notify_acts(out):
+    return only(out, "notify")
+
+
+def test_every_decide_notify_names_a_closed_tier_and_its_caller():
+    cases = [
+        decide(dsk=disk(auth_probe=_auth_dead(), launch_anchor=_anchor_down()),
+               parsed_issues=[parsed(5)]),                                       # ALERT
+        decide(dsk=disk(blocked={"i7": "BOUNCED: gone"},
+                        issues_state={"version": 1, "issues": {"i7": ist("blocked")}})),   # bounce
+        decide(dsk=disk(blocked={"i7": "QUESTION: A or B?"},
+                        issues_state={"version": 1, "issues": {"i7": ist("blocked")}})),   # question
+        decide(dsk=disk(blocked={"i7": "a third question"},
+                        issues_state={"version": 1,
+                                      "issues": {"i7": ist("blocked", questions_asked=2)}})),  # park
+        decide(gh_view=ghv(dev_checks=list(RED))),                               # freeze
+    ]
+    seen = set()
+    for out in cases:
+        acts = _notify_acts(out)
+        assert acts, out
+        for a in acts:
+            assert a["tier"] in notify_mod.TIER_EMOJI
+            assert isinstance(a["headline"], str) and a["headline"].strip()
+            assert a["title"] == a["headline"]          # journal readers (the command-center log)
+            assert a["caller"].startswith("decide:")
+            assert "body" not in a                      # no free body: the ask is the only detail
+            seen.add(a["caller"])
+    assert seen == {"decide:alert", "decide:bounce", "decide:question", "decide:park",
+                    "decide:freeze"}
+
+
+def test_owner_handbacks_wait_on_the_owner_and_point_at_the_issue():
+    for dsk, caller in (
+            (disk(blocked={"i7": "BOUNCED: gone"},
+                  issues_state={"version": 1, "issues": {"i7": ist("blocked")}}), "decide:bounce"),
+            (disk(blocked={"i7": "QUESTION: A or B?"},
+                  issues_state={"version": 1, "issues": {"i7": ist("blocked")}}), "decide:question"),
+            (disk(blocked={"i7": "a third question"},
+                  issues_state={"version": 1, "issues": {"i7": ist("blocked", questions_asked=2)}}),
+             "decide:park")):
+        a = [x for x in _notify_acts(decide(dsk=dsk)) if x["caller"] == caller][0]
+        assert a["tier"] == notify_mod.WAITING
+        assert a["url"] == "https://github.com/o/r/issues/7"
+        assert "i7" in a["headline"]
+
+
+def test_alerts_and_freezes_carry_their_tiers():
+    alert = _notify_acts(decide(dsk=disk(auth_probe=_auth_dead()), parsed_issues=[parsed(5)]))[0]
+    assert alert["tier"] == notify_mod.DOWN and alert["url"] is None
+    freeze = _notify_acts(decide(gh_view=ghv(dev_checks=list(RED))))[0]
+    assert freeze["tier"] == notify_mod.WAITING and freeze["headline"] == "merges frozen"
+
+
+def test_a_multi_reason_alert_renders_as_one_headline_line_not_joined_bodies():
+    out = decide(parsed_issues=[parsed(5)],
+                 dsk=disk(auth_probe=_auth_dead(), launch_anchor=_anchor_down()))
+    act = _notify_acts(out)[0]
+    assert act["headline"] == "ALERT: auth_dead, launch_anchor_down"     # every reason, one clause
+    t = notify_mod.render(cfg(notify={"machine_label": "mini"}), act["tier"], act["headline"],
+                          ask=act["ask"], url=act["url"], caller=act["caller"])
+    assert t.lines[0] == "🔴 r@mini · ALERT: auth_dead, launch_anchor_down"
+    assert len(t.lines) <= notify_mod.TEXT_MAX_LINES
+    assert len(t.text.encode("utf-8")) <= notify_mod.TEXT_MAX_BYTES
+    second_body = actions._alert_message("launch_anchor_down")
+    assert second_body not in t.text                   # never the joined runbooks on the phone
+    assert act["ask"].count("; ") >= 1                 # ...which stay whole in the journaled act
+
+
 # =========================== canary re-arm of the systemic hold (#115) ===========================
 # The 2026-07-13 incident: three launch deliveries failed back-to-back, #24's breaker tripped
 # correctly (one park raced the streak, one alert, launches HELD) — but the hold never released on
@@ -2854,7 +2931,7 @@ def test_merge_refused_to_the_cap_parks_needs_william_with_reason_and_one_notify
     assert len(p) == 1 and p[0]["needs_william"] is True
     assert "2 approving reviews required" in p[0]["memo"]   # the refusal reason is surfaced
     n = only(out, "notify")
-    assert len(n) == 1 and "2 approving reviews required" in n[0]["body"]
+    assert len(n) == 1 and "2 approving reviews required" in n[0]["ask"]
 
 
 def test_corrupt_merge_refusal_counter_fails_closed_to_a_park():
@@ -3104,7 +3181,7 @@ def test_referee_path_gate_parks_needs_william_with_file_memo_and_one_notify():
     assert len(p) == 1 and p[0]["needs_william"] is True
     assert ".superlooper/config.json" in p[0]["memo"]
     notices = only(out, "notify")
-    assert len(notices) == 1 and ".superlooper/config.json" in notices[0]["body"]
+    assert len(notices) == 1 and ".superlooper/config.json" in notices[0]["ask"]
 
 
 def test_declared_referee_area_still_parks_needs_william():
@@ -3132,7 +3209,7 @@ def test_preauthorized_referee_issue_merges_through_decide():
     m = only(out, "merge")
     assert len(m) == 1 and m[0]["num"] == 5
     assert only(out, "park") == []
-    assert not any("needs-owner" in n.get("title", "") for n in only(out, "notify"))
+    assert not any("needs-owner" in n["headline"] for n in only(out, "notify"))
 
 
 def test_preauthorized_merge_act_carries_the_referee_audit_trail():
@@ -5315,7 +5392,7 @@ def test_logged_out_alert_says_what_the_owner_must_actually_do():
     stuck — only closing it worked), so the text must say so."""
     d = disk(issues_state={"version": 1, "issues": {"i5": ist("running", sensed_state="logged_out")}})
     out = decide(dsk=d)
-    body = [a for a in out if a["act"] == "notify"][0]["body"]
+    body = [a for a in out if a["act"] == "notify"][0]["ask"]
     assert "i5" in body and "login" in body.lower()
     assert "session_logged_out:i5" != body            # not just the raw code echoed back
 
@@ -5441,7 +5518,7 @@ def test_the_stuck_dialog_alert_tells_the_owner_where_to_look():
                 sensed_since=NOW - actions.AT_DIALOG_ALERT_SECONDS - 1)
     out = decide(events=[{"type": "frozen", "id": "i5"}],
                  dsk=disk(issues_state={"version": 1, "issues": {"i5": stuck}}))
-    body = [x for x in out if x["act"] == "notify"][0]["body"]
+    body = [x for x in out if x["act"] == "notify"][0]["ask"]
     assert "i5" in body and "session_at_dialog:i5" != body
 
 
@@ -5606,7 +5683,7 @@ AUTH_REMEDY_CASES = [
 def _alert_body(**ist_over):
     d = disk(issues_state={"version": 1, "issues": {"i5": ist("running", **ist_over)}})
     out = decide(dsk=d)
-    return [a for a in out if a["act"] == "notify"][0]["body"]
+    return [a for a in out if a["act"] == "notify"][0]["ask"]
 
 
 def test_each_auth_variant_gets_its_own_remedy_in_the_alert_body():
@@ -5665,7 +5742,7 @@ def test_an_unrecognised_banner_keeps_the_original_reason_and_a_generic_body():
     d = disk(issues_state={"version": 1, "issues": {"i5": ist("running", sensed_state="logged_out")}})
     out = decide(dsk=d)
     assert "session_logged_out:i5" in only(out, "alert")[0]["reasons"]
-    body = [a for a in out if a["act"] == "notify"][0]["body"]
+    body = [a for a in out if a["act"] == "notify"][0]["ask"]
     assert "i5" in body and "login" in body.lower()
 
 

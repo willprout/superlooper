@@ -458,7 +458,36 @@ def _gate_health(records, window_start, ledger, config):
         lines.append("- Nightly: no runs recorded in the last 7 days.")
     lines.append(f"- Quarantine: {q_size} test(s). Accepted known failures: {accepted}.")
     lines.append(_notify_channel(records))     # issue #164: the channel canary rides the health block
+    truncated = _notify_truncations(records, window_start)
+    if truncated:                               # issue #493: silent on a window with none
+        lines.append(truncated)
     return lines
+
+
+def _notify_truncations(records, window_start):
+    """The owner texts the notify doorway cut to fit its cap (issue #493), grouped by the sender that
+    overflowed, most frequent first, naming the worst drop. A verbose sender is a defect whose fix
+    lives in that sender; this line is where it is SEEN — on the phone the text only arrived cut
+    short, and before the doorway it arrived as a 10 kB runbook nobody could read. None when the
+    window holds no truncation (no line: a clean sender is not news)."""
+    counts, worst = {}, 0
+    for r in records:
+        if r.get("act") != "notify_truncated" or not _in_window(r, window_start):
+            continue
+        caller = r.get("caller")
+        caller = caller.strip() if isinstance(caller, str) and caller.strip() else "(unknown)"
+        counts[caller] = counts.get(caller, 0) + 1
+        dropped = r.get("dropped_bytes")
+        if isinstance(dropped, int) and not isinstance(dropped, bool):
+            worst = max(worst, dropped)
+    if not counts:
+        return None
+    by_caller = ", ".join("%s ×%d" % (c, n)
+                          for c, n in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])))
+    worst_s = "; up to %d bytes dropped" % worst if worst else ""
+    return ("- Owner texts cut to fit the phone cap (last 7 days): %d — %s%s. Those senders are too "
+            "verbose for a text; the full wording is in the journal." % (sum(counts.values()),
+                                                                          by_caller, worst_s))
 
 
 def _watchdog(records, window_start):

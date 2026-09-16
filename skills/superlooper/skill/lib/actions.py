@@ -106,6 +106,7 @@ import evidence
 import gate
 import issues as issues_mod
 import labels                 # pure leaf: the label vocabulary, so a filer never spells one itself
+import notify as _notify      # the owner-text tier names only (issue #493); decide never sends
 import queue_lint
 import scheduler
 
@@ -1607,8 +1608,14 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                                  # held out of THIS tick's launch phase, like reapproved_now, so the
                                  # gate re-claims the lane rather than a fresh session rebuilding it
 
-    def notify(title, body):
-        out.append({"act": "notify", "title": title, "body": body})
+    def notify(tier, headline, ask, caller, num=None):
+        # decide() never composes a text (issue #493). It names a TIER from the closed set, a
+        # one-clause headline, the ask (the memo or runbook — the doorway cuts it to fit and journals
+        # the overflow) and the issue it concerns; the runner's executor renders the text through
+        # notify.render, the one doorway. `title` repeats the headline for the journal's existing
+        # readers, which render a notify record by its title; nothing sends it.
+        out.append({"act": "notify", "tier": tier, "headline": headline, "title": headline,
+                    "ask": ask, "url": _config.issue_url(cfg, num), "caller": "decide:" + caller})
 
     def ist_of(iid):
         v = ist_map.get(iid)
@@ -1644,7 +1651,7 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
         # failing GitHub write IS a systemic problem. The notify-once marker is stamped by the
         # executor regardless of whether we paged, so this park never re-pages once day breaks.
         if not notify_quiet:
-            notify(f"superlooper: {iid} {who}", memo)
+            notify(_notify.WAITING, f"{iid} {who}", memo, "park", num=num)
         out.append(act)
 
     def start_ok(p, resume=True):
@@ -2188,7 +2195,10 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
         existing = alert_on_disk.get("reasons") if alert_on_disk else None
         if existing != reasons:
             out.append({"act": "alert", "reasons": reasons})
-            notify("superlooper ALERT", "; ".join(_alert_message(r) for r in reasons))
+            # ONE headline naming every reason; the per-reason runbooks ride as the ask, which the
+            # doorway cuts to the cap (issue #493) — they stay whole in this journaled act.
+            notify(_notify.DOWN, "ALERT: " + ", ".join(reasons),
+                   "; ".join(_alert_message(r) for r in reasons), "alert")
     elif alert_on_disk:
         out.append({"act": "clear_alert"})
 
@@ -2285,9 +2295,9 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
             if not frozen:
                 out.append({"act": "freeze", "reason": f"dev checks red: {name} ({concl})",
                             "fingerprint": fp})
-                notify("superlooper: merges frozen",
+                notify(_notify.WAITING, "merges frozen",
                        f"required check '{name}' is red on {dev_branch}; fix-forward filed, "
-                       "building continues")
+                       "building continues", "freeze")
             # File ONCE per distinct breakage — but only for as long as the issue that filing
             # produced is actually standing (issue #294). A retired fingerprint re-arms, and the
             # executor reconciles against GitHub before creating, so a still-open fix issue is
@@ -2940,7 +2950,8 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                 # the journal, the report); only the 3am page waits. A stuck bounce-label still
                 # escalates via park_label_stuck (a failing GitHub write is systemic and pages).
                 if not notify_quiet:
-                    notify(f"superlooper: {iid} bounced (needs-owner)", blocked_text)
+                    notify(_notify.WAITING, f"{iid} bounced (needs-owner)", blocked_text, "bounce",
+                           num=num)
                 out.append(act)
                 continue
             # A real owner-decision question (#163). The worker has posted a structured question to
@@ -2966,9 +2977,9 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                 # report); only the 3am page waits. Gated on the post-once stamp too, so a re-derived
                 # tick never re-pages.
                 if not ist.get("question_posted") and not notify_quiet:
-                    notify(f"superlooper: {iid} needs an answer",
+                    notify(_notify.WAITING, f"{iid} needs an answer",
                            f"a worker exited on a question and is waiting for {operator}:\n\n"
-                           f"{blocked_text}")
+                           f"{blocked_text}", "question", num=num)
                 out.append({"act": "post_question", "id": iid, "num": num, "question": blocked_text})
             continue
 

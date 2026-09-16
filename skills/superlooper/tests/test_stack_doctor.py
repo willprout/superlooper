@@ -147,7 +147,7 @@ def _healthy_probe():
 
 def _ok_sender(channel="cmd"):
     """A fake notify.send_test that reports a delivered send without touching a subprocess."""
-    def _send(config, title, body):
+    def _send(config, text):
         return notify.SendResult(channel, True, 0, "")
     return _send
 
@@ -439,6 +439,20 @@ def test_notify_check_sends_one_test_message_and_passes_on_delivery(tmp_path, mo
     # it announced the side effect BEFORE sending, naming the channel and the message text
     joined = "\n".join(announced)
     assert "cmd" in joined and "test" in joined.lower()
+    # the announce shows EXACTLY the rendered text that went out (issue #493) — the body line here
+    assert marker.read_text() and marker.read_text() in joined
+
+
+def test_notify_check_sends_a_rendered_test_tier_text(tmp_path, monkeypatch):
+    # issue #493: the doctor's proof send goes through the doorway like every other owner text.
+    monkeypatch.setenv("SL_CMUX", str(tmp_path / "no-cmux"))
+    marker = tmp_path / "delivered.txt"
+    config = {"repo": "willprout/superlooper",
+              "notify": {"imessage_to": None, "machine_label": "mini",
+                         "cmd": f'printf "%s" "$SL_TITLE" > {marker}'}}
+    result = stack_doctor.check_notify(config, announce=lambda *a: None)
+    assert result.ok is True
+    assert marker.read_text() == "🧪 superlooper@mini · " + stack_doctor.NOTIFY_TEST_HEADLINE
 
 
 def test_notify_check_fails_carrying_rc_and_stderr_of_a_failed_send(tmp_path, monkeypatch):
@@ -458,8 +472,8 @@ def test_notify_check_unconfigured_still_fails_without_sending(tmp_path, monkeyp
     monkeypatch.setenv("SL_CMUX", str(tmp_path / "no-cmux"))
     calls = []
 
-    def _recording_sender(config, title, body):
-        calls.append((title, body))
+    def _recording_sender(config, text):
+        calls.append(text)
         return notify.SendResult("cmd", True, 0, "")
 
     announced = []
@@ -560,7 +574,7 @@ def test_check_stack_threads_the_canary_into_the_notify_block(tmp_path, monkeypa
 def test_notify_check_announces_before_it_sends(tmp_path):
     events = []
 
-    def _recording_sender(config, title, body):
+    def _recording_sender(config, text):
         events.append("send")
         return notify.SendResult("cmd", True, 0, "")
 

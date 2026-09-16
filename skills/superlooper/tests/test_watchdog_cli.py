@@ -199,6 +199,25 @@ def test_stale_heartbeat_opens_an_episode_and_journals_notified(tmp_path):
     assert rig.wstate()["episode"]["signals"] == ["heartbeat_stale"]
 
 
+def test_the_watchdogs_texts_are_rendered_through_the_doorway(tmp_path):
+    # issue #493: the CLI dispatch renders every evaluate()/after_* entry via notify.render, so the
+    # text that leaves carries its tier and the `<repo>@<machine>` identity, and nothing else shapes it.
+    rig = _Rig(tmp_path)
+    sent = tmp_path / "sent.txt"
+    cfg_path = rig.repo / ".superlooper" / "config.json"
+    cfg = json.loads(cfg_path.read_text())
+    cfg["notify"] = {"machine_label": "mini",
+                     "cmd": f'printf "%s|%s\\n" "$SL_TITLE" "$SL_BODY" >> {sent}'}
+    cfg_path.write_text(json.dumps(cfg))
+    rig.heartbeat(3600)
+    r = rig.run()
+    assert r.returncode == 0, r.stderr
+    assert "notify: sent via cmd" in r.stdout
+    title, body = sent.read_text().split("|", 1)
+    assert title == "🔴 r@mini · watchdog: heartbeat_stale"
+    assert body.count("\n") <= 2 and len((title + "\n" + body).rstrip("\n").encode()) <= 280
+
+
 def test_grace_elapsed_launches_the_debugger_exactly_once(tmp_path):
     rig = _Rig(tmp_path)
     rig.heartbeat(3600)

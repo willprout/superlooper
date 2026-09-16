@@ -5,8 +5,10 @@
 #
 # Usage: imessage-notify.sh <recipient> <title> [<body>]
 #   <recipient>  a phone number (+1…) or Apple ID email registered with iMessage
-#   <title>      the headline (the report/alert reason)
-#   <body>       optional detail line
+#   <title>      line 1 of the rendered owner text (lib/notify.py's render — the one doorway,
+#                issue #493): `<tier emoji> <repo>@<machine> · <what happened>`
+#   <body>       optional: the envelope's remaining lines (the ask, the URL); render() already
+#                capped the whole text, so this script never splits or trims
 #
 # It calls `osascript` by BARE NAME (so a stub on PATH intercepts it in tests) and drives Messages
 # via AppleScript. A nonzero exit is fine — notify.py turns it into a journaled outcome, never a

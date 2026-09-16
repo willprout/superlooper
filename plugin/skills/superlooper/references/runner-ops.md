@@ -557,6 +557,28 @@ transition to `parked` or `needs-owner`, every freeze, and every ALERT — the s
 long-running work finishing, stalling, or needing input reaches you (spec §2). A send failure is
 journaled, never fatal; notifications are a convenience layer, never a safety layer.
 
+**What a text looks like.** Every text — from the runner, the watchdog, the nightly, the promotion
+report, the morning report and `doctor --stack` — is rendered by one doorway into at most three
+lines: `<tier emoji> <repo>@<machine> · <what happened>`, then what is asked of you (when anything
+is), then the issue or PR URL (only when one exists). A text is capped at three lines and 280 bytes.
+A sender that says more is cut to fit — the ask first, then the headline; the identity and the URL
+never — and the cut is journaled as `notify_truncated`, which the morning report lists under **Gate
+health** by sender: a sender too verbose for a phone, whose full wording is still in the journal.
+
+```
+🟠 superlooper@mini · i412 needs-owner
+retry cap hit (2 relaunches, still no report)
+https://github.com/willprout/superlooper/issues/412
+```
+
+**Tiers and the machine name.** The emoji is the priority, from a closed set: 🔴 the loop is down
+with work to do and cannot fix itself (it needs you); 🟠 a decision or answer is waiting on you while
+the loop keeps running (a park, a bounce, a question, merges frozen, a red nightly, promotion
+evidence); 🟢 recovered; ☀️ the morning report; 🧪 a test send from `doctor --stack`. The machine
+half of `<repo>@<machine>` is the host's short hostname unless you set `notify.machine_label` in
+`.superlooper/config.json` (for example `"mini"` or `"laptop"`), which is how you tell two machines'
+loops apart on a lock screen.
+
 **One-time setup:** the first time it texts you, macOS asks permission to let the terminal control
 Messages — click **Allow** once. **Every launchd-started job** — the nightly, the watchdog, and (in
 the `login-item` home) the runner itself — needs that same permission granted to whatever user
