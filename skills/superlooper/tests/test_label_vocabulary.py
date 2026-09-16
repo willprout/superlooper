@@ -624,7 +624,9 @@ def test_every_gh_helper_that_names_a_label_flag_is_classified():
                # adopt's ledger read (issue #450): `--label limitations-ledger` FILTERS for the one
                # issue that already carries the marker. The APPLY of that marker happens at the
                # `create_issue(labels=[...])` call in the CLI, which the fence resolves there.
-               "marked_issues_health"}
+               "marked_issues_health",
+               # the watchdog's demand read (issue #494): `--label in-progress` FILTERS for the lanes
+               "open_issues_health"}
     tree = _parse((_REPO / _ENGINE / "lib" / "gh.py").read_text(encoding="utf-8"))
     assert tree is not None, "lib/gh.py must parse"
     naming = set()

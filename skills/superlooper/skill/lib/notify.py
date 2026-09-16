@@ -366,6 +366,13 @@ def send(config, text, home=None):
     return ok_msg if r.ok else fail_msg.format(rc=r.rc)
 
 
+def delivered(outcome):
+    """Did a send() outcome reach a channel? True only for a "sent via <channel>" outcome: a refusal,
+    a failed channel and log-only (nothing configured) all left the owner's phone untouched. The page
+    bookkeeping (issue #494) keys on this: a 🟢 follows only a 🔴 that actually went out."""
+    return isinstance(outcome, str) and outcome.startswith("sent via ")
+
+
 def send_test(config, text, home=None):
     """Deliver ONE rendered text through the configured precedence and return the full SendResult
     (channel, ok, rc, stderr) — the stack doctor's hook for PROVING the channel works, and the

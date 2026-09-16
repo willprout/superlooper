@@ -77,10 +77,13 @@ def test_stale_heartbeat_trips_and_notifies_once():
     assert ep["opened_at"] == T0
     assert len(r["notify"]) == 1
     title, body = r["notify"][0]["headline"], r["notify"][0]["ask"]
-    assert "watchdog" in title.lower()
-    assert "30" in body                       # names the grace window
-    assert "full" in body                     # names the authority tier
+    assert "watchdog" in title.lower() and "heartbeat" in body
+    # the debugger-launch countdown is the JOURNAL's (and the morning report's), not the phone's
+    # (issue #494): the record names the grace, the authority and when the launch falls due
     assert _outcomes(r) == ["notified"]
+    rec = r["journal"][0]
+    assert rec["grace_seconds"] == 30 * MIN and rec["authority"] == "full"
+    assert rec["launch_due_at"] == T0 + 30 * MIN and rec["texted"] is True
     assert all(j["act"] == "watchdog" for j in r["journal"])
     assert r["launch"] is None                # never a launch before the grace elapses
 
@@ -94,7 +97,8 @@ def test_present_alert_trips():
     r = _run(T0, _view(alert={"reasons": ["gh_unreachable"], "since": T0 - 300}))
     ep = r["state"]["episode"]
     assert ep is not None and ep["signals"] == ["alert"]
-    assert "gh_unreachable" in r["notify"][0]["ask"]
+    assert "gh_unreachable" in ep["detail"]
+    assert r["notify"] == []                  # the runner owns ALERT texts (issue #494)
 
 
 def test_unreadable_alert_still_counts_as_present():
@@ -334,7 +338,7 @@ def test_grace_elapsed_emits_exactly_one_launch_request():
     assert ep["launched_at"] == now and ep["launch_id"] == "d1"
     assert _outcomes(done) == ["launched"]
     assert done["journal"][0]["id"] == "d1"
-    assert len(done["notify"]) == 1 and "d1" in done["notify"][0]["ask"]
+    assert done["notify"] == []               # a VERIFIED launch is journal + report only (#494)
     # ...and the SAME standing episode never launches again
     later = _run(now + 60 * MIN, _view(now + 60 * MIN, heartbeat=T0 - 21 * MIN), done["state"])
     assert later["launch"] is None
@@ -569,8 +573,13 @@ def test_after_resurrect_success_journals_a_distinct_act_and_texts_loudly():
     assert [j.get("act") for j in done["journal"]] == ["runner_resurrect"]
     assert done["journal"][0]["outcome"] == "resurrected"
     assert done["journal"][0]["id"] == "r1"
-    assert len(done["notify"]) == 1                        # loud, not silent (the DoD)
-    assert "r1" in done["notify"][0]["ask"] or "runner" in done["notify"][0]["ask"].lower()
+    # issue #494: a restart that fixed the runner before any 🔴 went out has nothing to close on the
+    # phone — the journal and the morning report carry it. It is loud only after a delivered 🔴.
+    assert done["notify"] == []
+    down = wd.record_delivered(r["state"], {"tier": "down", "marks": "runner"})
+    loud = wd.after_resurrect(T0, _cfg(), down, r["resurrect"], rc=0)
+    assert len(loud["notify"]) == 1
+    assert "r1" in loud["notify"][0]["ask"] or "runner" in loud["notify"][0]["ask"].lower()
 
 
 def test_dead_runner_with_a_fresh_heartbeat_is_not_resurrected():
@@ -822,7 +831,8 @@ def test_a_stop_that_did_not_take_leaves_a_live_runner_watched():
                        stopped_by_owner=True, runner_live=True))
     assert _outcomes(r) == ["notified"]
     assert r["state"]["episode"]["signals"] == ["alert"]
-    assert len(r["notify"]) == 1
+    # watched, with its debugger countdown running — the TEXT for an alert is the runner's (#494)
+    assert r["journal"][0]["launch_due_at"] == T0 + 30 * MIN and r["notify"] == []
 
 
 def test_a_live_runner_with_a_marker_still_reaches_the_debugger_when_it_wedges():
@@ -992,7 +1002,9 @@ def _entries(*results):
 
 
 def _shape_ok(n):
-    return (set(n) == {"tier", "headline", "ask", "caller"} and n["tier"] in notify_mod.TIER_EMOJI
+    # `marks` (issue #494) rides on a 🔴 only: which record its delivery stamps
+    keys = {"tier", "headline", "ask", "caller"} | ({"marks"} if n.get("tier") == "down" else set())
+    return (set(n) == keys and n["tier"] in notify_mod.TIER_EMOJI
             and isinstance(n["headline"], str) and n["headline"].strip()
             and n["caller"].startswith("watchdog:"))
 
@@ -1007,7 +1019,8 @@ def test_an_opened_episode_texts_down_with_its_signals_as_the_headline():
 
 def test_resurrection_outcomes_carry_recovered_and_down_tiers():
     r = _run(T0, _dead(T0))
-    ok = wd.after_resurrect(T0, _cfg(), r["state"], r["resurrect"], rc=0)["notify"][0]
+    down = wd.record_delivered(r["state"], {"tier": "down", "marks": "runner"})
+    ok = wd.after_resurrect(T0, _cfg(), down, r["resurrect"], rc=0)["notify"][0]
     bad = wd.after_resurrect(T0, _cfg(), r["state"], r["resurrect"], rc=2)["notify"][0]
     assert _shape_ok(ok) and _shape_ok(bad)
     assert ok["tier"] == notify_mod.RECOVERED and ok["caller"] == "watchdog:resurrected"
@@ -1021,10 +1034,9 @@ def test_capped_and_disabled_resurrection_and_debugger_launch_texts_are_down():
     assert _shape_ok(disabled) and disabled["tier"] == notify_mod.DOWN
     assert disabled["caller"] == "watchdog:resurrect_disabled"
     r = _run(T0, _view(heartbeat=T0 - 21 * MIN), cfg=_cfg(grace_minutes=0))
-    launched = wd.after_launch(T0, _cfg(), r["state"], r["launch"], rc=0)["notify"][0]
+    assert wd.after_launch(T0, _cfg(), r["state"], r["launch"], rc=0)["notify"] == []
     failed = wd.after_launch(T0, _cfg(), r["state"], r["launch"], rc=3)["notify"][0]
-    assert _shape_ok(launched) and _shape_ok(failed)
-    assert launched["tier"] == notify_mod.DOWN and launched["caller"] == "watchdog:debugger_launched"
+    assert _shape_ok(failed)
     assert failed["tier"] == notify_mod.DOWN and failed["caller"] == "watchdog:debugger_launch_failed"
 
 
@@ -1035,3 +1047,172 @@ def test_a_capped_crash_loop_escalation_is_down():
     capped = _run(T0 + 6 * MIN, _dead(T0 + 6 * MIN), st, cfg=cfg)["notify"][0]
     assert _shape_ok(capped) and capped["tier"] == notify_mod.DOWN
     assert capped["caller"] == "watchdog:resurrect_capped"
+
+
+# ================== one sender per episode, and only when there is work (issue #494) ==================
+# The runner texts its own ALERT reasons; the watchdog texts only what the runner cannot say about
+# itself — a runner that is dead or wedged, a restart that failed, a debugger that could not launch,
+# the crash-loop cap — and each only while there is work to serve (`view["demand"]`, which the CLI
+# reads through actions.work_demand). Resurrection itself is never gated. A 🟢 goes out only after
+# a 🔴 the CLI recorded as DELIVERED (record_delivered).
+
+def _idle(view):
+    return dict(view, demand=False)
+
+
+def _busy(view):
+    return dict(view, demand=True)
+
+
+def _delivered(result, state=None):
+    st = state if state is not None else result["state"]
+    for n in result["notify"]:
+        st = wd.record_delivered(st, n)
+    return st
+
+
+def test_an_alert_only_episode_opens_journals_its_countdown_and_texts_nothing():
+    r = _run(T0, _busy(_view(alert={"reasons": ["usage_stale"], "since": T0 - 300})))
+    assert r["state"]["episode"]["signals"] == ["alert"]
+    assert r["notify"] == []
+    (rec,) = r["journal"]
+    assert rec["outcome"] == "notified" and rec["texted"] is False
+    assert rec["launch_due_at"] == T0 + 30 * MIN and rec["authority"] == "full"
+    # ...through the grace and the launch: still the runner's episode to text, never the watchdog's
+    now = T0 + 30 * MIN
+    r2 = _run(now, _busy(_view(now, alert={"reasons": ["usage_stale"]})), r["state"])
+    assert r2["notify"] == [] and r2["launch"] is not None
+    assert wd.after_launch(now, _cfg(), r2["state"], r2["launch"], rc=0, demand=True)["notify"] == []
+
+
+def test_a_wedged_runner_with_no_work_opens_silently_and_pages_when_work_appears():
+    wedged = dict(heartbeat=T0 - 21 * MIN)
+    r = _run(T0, _idle(_view(**wedged)))
+    assert r["state"]["episode"]["signals"] == ["heartbeat_stale"] and r["notify"] == []
+    assert r["journal"][0]["texted"] is False
+    r2 = _run(T0 + 5 * MIN, _idle(_view(T0 + 5 * MIN, **wedged)), r["state"])
+    assert r2["notify"] == []
+    r3 = _run(T0 + 10 * MIN, _busy(_view(T0 + 10 * MIN, **wedged)), r2["state"])
+    (n,) = r3["notify"]
+    assert n["tier"] == notify_mod.DOWN and n["marks"] == "episode"
+    assert "heartbeat_stale" in n["headline"]
+    r4 = _run(T0 + 15 * MIN, _busy(_view(T0 + 15 * MIN, **wedged)), r3["state"])
+    assert r4["notify"] == []                                        # paged once per episode
+
+
+def test_a_dead_runner_with_no_work_is_restarted_without_a_text():
+    r = _run(T0, _idle(_dead(T0)))
+    assert r["resurrect"] is not None and r["notify"] == []          # resurrection is never gated
+    ok = wd.after_resurrect(T0, _cfg(), r["state"], r["resurrect"], rc=0, demand=False)
+    assert ok["notify"] == [] and _outcomes(ok) == ["resurrected"]
+    bad = wd.after_resurrect(T0, _cfg(), r["state"], r["resurrect"], rc=2, demand=False)
+    assert bad["notify"] == [] and _outcomes(bad) == ["resurrect_failed"]
+    assert bad["state"]["resurrection"]["failure_notified"] is False  # unsent: a later one may page
+    r2 = _run(T0 + 6 * MIN, _busy(_dead(T0 + 6 * MIN)), bad["state"])
+    bad2 = wd.after_resurrect(T0 + 6 * MIN, _cfg(), r2["state"], r2["resurrect"], rc=2, demand=True)
+    assert [n["tier"] for n in bad2["notify"]] == [notify_mod.DOWN]
+
+
+def test_a_failed_restart_page_that_was_delivered_is_closed_by_the_restart_that_works():
+    r = _run(T0, _busy(_dead(T0)))
+    bad = wd.after_resurrect(T0, _cfg(), r["state"], r["resurrect"], rc=2, demand=True)
+    st = _delivered(bad)
+    assert st["resurrection"]["down_delivered"] is True
+    r2 = _run(T0 + 6 * MIN, _busy(_dead(T0 + 6 * MIN)), st)
+    ok = wd.after_resurrect(T0 + 6 * MIN, _cfg(), r2["state"], r2["resurrect"], rc=0, demand=True)
+    (g,) = ok["notify"]
+    assert g["tier"] == notify_mod.RECOVERED
+    assert ok["state"]["resurrection"]["down_delivered"] is False
+    healthy = _run(T0 + 12 * MIN, _busy(_view(T0 + 12 * MIN)), ok["state"])
+    assert healthy["notify"] == []                                   # one 🟢, not two
+
+
+def test_the_crash_loop_cap_pages_under_demand_once_and_the_runner_coming_back_greens_it():
+    cfg = _cfg(resurrection_max_per_hour=0)
+    idle = _run(T0, _idle(_dead(T0)), cfg=cfg)
+    assert _outcomes(idle) == ["resurrect_capped"] and idle["notify"] == []
+    busy = _run(T0 + 5 * MIN, _busy(_dead(T0 + 5 * MIN)), idle["state"], cfg=cfg)
+    assert busy["journal"] == []                                     # the escalation journaled once
+    (n,) = busy["notify"]
+    assert n["tier"] == notify_mod.DOWN and n["marks"] == "runner"
+    st = _delivered(busy)
+    again = _run(T0 + 10 * MIN, _busy(_dead(T0 + 10 * MIN)), st, cfg=cfg)
+    assert again["notify"] == []
+    back = _run(T0 + 15 * MIN, _busy(_view(T0 + 15 * MIN)), again["state"], cfg=cfg)
+    (g,) = back["notify"]
+    assert g["tier"] == notify_mod.RECOVERED and "runner" in g["headline"]
+    assert _run(T0 + 20 * MIN, _busy(_view(T0 + 20 * MIN)), back["state"], cfg=cfg)["notify"] == []
+
+
+def test_an_undelivered_cap_page_recovers_silently():
+    cfg = _cfg(resurrection_max_per_hour=0)
+    busy = _run(T0, _busy(_dead(T0)), cfg=cfg)
+    assert len(busy["notify"]) == 1                                  # sent, but never delivered
+    back = _run(T0 + 5 * MIN, _busy(_view(T0 + 5 * MIN)), busy["state"], cfg=cfg)
+    assert back["notify"] == []
+
+
+def test_a_delivered_episode_page_gets_one_green_when_the_signal_clears():
+    r = _run(T0, _busy(_view(heartbeat=T0 - 21 * MIN)))
+    st = _delivered(r)
+    assert st["episode"]["down_delivered"] is True
+    cleared = _run(T0 + 10 * MIN, _idle(_view(T0 + 10 * MIN)), st)
+    assert _outcomes(cleared) == ["stand_down"]
+    (g,) = cleared["notify"]                                         # demand is irrelevant to a 🟢
+    assert g["tier"] == notify_mod.RECOVERED and "heartbeat_stale" in g["headline"]
+    # the undelivered twin stands down silently, as before
+    silent = _run(T0 + 10 * MIN, _busy(_view(T0 + 10 * MIN)), r["state"])
+    assert _outcomes(silent) == ["stand_down"] and silent["notify"] == []
+
+
+def test_a_wedged_runner_that_dies_carries_its_page_to_the_restart_not_a_false_green():
+    r = _run(T0, _busy(_view(heartbeat=T0 - 21 * MIN, runner_live=True)))
+    st = _delivered(r)
+    died = _run(T0 + 5 * MIN, _busy(_dead(T0 + 5 * MIN, stale_min=26)), st)
+    assert died["resurrect"] is not None
+    assert died["notify"] == []                                      # NOT "cleared" — it is dead
+    assert died["state"]["resurrection"]["down_delivered"] is True
+    ok = wd.after_resurrect(T0 + 5 * MIN, _cfg(), died["state"], died["resurrect"], rc=0)
+    assert [n["tier"] for n in ok["notify"]] == [notify_mod.RECOVERED]
+
+
+def test_a_failed_debugger_launch_pages_only_under_demand():
+    st = _open_episode(T0)
+    now = T0 + 30 * MIN
+    r = _run(now, _idle(_view(now, heartbeat=T0 - 21 * MIN)), st)
+    quiet = wd.after_launch(now, _cfg(), r["state"], r["launch"], rc=2, demand=False)
+    assert quiet["notify"] == [] and quiet["state"]["episode"]["launch_failure_notified"] is False
+    r2 = _run(now + 5 * MIN, _busy(_view(now + 5 * MIN, heartbeat=T0 - 21 * MIN)), quiet["state"])
+    loud = wd.after_launch(now + 5 * MIN, _cfg(), r2["state"], r2["launch"], rc=2, demand=True)
+    (n,) = loud["notify"]
+    assert n["tier"] == notify_mod.DOWN and n["marks"] == "episode"
+
+
+def test_a_view_without_a_demand_reading_pages_as_before():
+    # The pure core fails toward the page: only an explicit False silences it.
+    for view in (_view(heartbeat=T0 - 21 * MIN), dict(_view(heartbeat=T0 - 21 * MIN), demand=None)):
+        assert len(_run(T0, view)["notify"]) == 1
+
+
+def test_record_delivered_stamps_only_what_a_down_page_names_and_never_raises():
+    st = _run(T0, _busy(_view(heartbeat=T0 - 21 * MIN)))["state"]
+    assert wd.record_delivered(st, {"tier": "recovered"}) == st
+    assert wd.record_delivered(st, {"tier": "down", "marks": "nonsense"}) == st
+    assert wd.record_delivered(dict(st, episode=None), {"tier": "down", "marks": "episode"})["episode"] is None
+    for garbage_state in (None, [], "x"):
+        for entry in (None, [], {"marks": "runner"}):
+            assert isinstance(wd.record_delivered(garbage_state, entry), dict)
+    back = wd.coerce_state(wd.record_delivered(st, {"tier": "down", "marks": "runner"}))
+    assert back["resurrection"]["down_delivered"] is True
+
+
+def test_a_delayed_page_names_only_what_stands_now():
+    # An ALERT holds the episode open; the heartbeat went stale and came back while nothing was
+    # waiting. When work appears the heartbeat is FRESH — the union of the episode's signals still
+    # names heartbeat_stale, but there is nothing about the runner to page.
+    r = _run(T0, _idle(_view(heartbeat=T0 - 21 * MIN, alert={"reasons": ["usage_stale"]},
+                             runner_live=True)))
+    assert r["state"]["episode"]["signals"] == ["alert", "heartbeat_stale"] and r["notify"] == []
+    later = _run(T0 + 10 * MIN, _busy(_view(T0 + 10 * MIN, alert={"reasons": ["usage_stale"]})),
+                 r["state"])
+    assert later["notify"] == []

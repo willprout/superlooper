@@ -221,6 +221,14 @@ def open_issues(label, limit=200):
                        "--json", _ISSUE_FIELDS, "--limit", str(limit)])
 
 
+def open_issues_health(label, limit=200):
+    """open_issues() as a ReadHealth(issues, ok) — the watchdog's demand read (issue #494): whether
+    an `in-progress` lane exists is only a reading when the list actually answered, so a refused read
+    is tellable from "nothing is in progress"."""
+    return _json_list_health(["issue", "list", "--state", "open", "--label", label,
+                              "--json", _ISSUE_FIELDS, "--limit", str(limit)])
+
+
 # The ledger read (issue #450). Its OWN narrow field list, deliberately: `number` and `labels` so
 # limitations.find_ledger can CONFIRM the marker in the payload rather than trust the `--label`
 # flag we asked for, `isPinned` so a re-adopt re-pins an unpinned ledger instead of erroring on an

@@ -750,6 +750,24 @@ def test_watchdog_notify_only_episodes_stay_quiet():
     assert "nothing happened" in out.lower()
 
 
+def test_watchdog_countdowns_reach_the_report_without_breaking_quiet():
+    # issue #494: the debugger-launch countdown left the phone. The episode's opening record carries
+    # it, and the report FILE shows it — a line under Unattended debugger — while an episode that
+    # never launched still leaves the night quiet.
+    j = [_rec(1030, "watchdog", outcome="notified", signals=["alert"], grace_seconds=1800,
+              authority="full", launch_due_at=2830, texted=False),
+         _rec(1040, "watchdog", outcome="stand_down", signals=["alert"])]
+    out = report.morning(j, _view(queue=[], usage=None), ledger={}, config=_cfg())
+    assert "nothing happened" in out.lower()
+    section = out.split("## Unattended debugger", 1)[1].split("\n## ", 1)[0]
+    assert "alert" in section and "30 min" in section and "full" in section
+    assert "not texted" in section
+    # a pre-#494 record (no countdown fields) renders nothing new
+    old = [_rec(1030, "watchdog", outcome="notified", signals=["heartbeat_stale"])]
+    old_out = report.morning(old, _view(queue=[], usage=None), ledger={}, config=_cfg())
+    assert "None — the watchdog launched nothing." in old_out
+
+
 # --------------------------- runner resurrection (issue #208) ---------------------------
 
 def test_runner_resurrection_renders_and_breaks_quiet():
