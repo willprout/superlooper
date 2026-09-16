@@ -889,14 +889,14 @@ def test_demand_falls_back_to_the_published_view_when_github_will_not_answer(tmp
     texts = _texts_to(rig, tmp_path)
     rig.heartbeat(3600)                                   # wedged-looking: a heartbeat_stale episode
     view = rig.home / "state" / "gh_view.json"
-    view.write_text(json.dumps({"issues": {}, "closed_nums": []}))
+    view.write_text(json.dumps({"issues": {}, "closed_nums": [], "polled_at": time.time() - 900}))
     assert rig.run(GH_FAIL="1").returncode == 0
     assert texts() == []                                  # the last known view: nothing waiting
     (rig.home / "state" / "watchdog.json").unlink()
     view.write_text(json.dumps({"issues": {"i9": {"number": 9, "title": "t", "body": "",
                                                   "labels": [{"name": "agent-ready"},
                                                              {"name": "type:build"}]}},
-                                "closed_nums": []}))
+                                "closed_nums": [], "polled_at": time.time() - 900}))
     assert rig.run(GH_FAIL="1").returncode == 0
     assert [t.split("|")[0] for t in texts()] == ["🔴 r@mini · watchdog: heartbeat_stale"]
 
@@ -907,3 +907,21 @@ def test_unknowable_demand_fails_toward_the_page(tmp_path):
     rig.heartbeat(3600)
     assert rig.run(GH_FAIL="1").returncode == 0           # no GitHub, no published view
     assert len(texts()) == 1
+    # ...and a view published by a runner that never saw GitHub answer is no evidence either
+    (rig.home / "state" / "watchdog.json").unlink()
+    (rig.home / "state" / "gh_view.json").write_text(json.dumps(
+        {"issues": {}, "closed_nums": [], "polled_at": None}))
+    assert rig.run(GH_FAIL="1").returncode == 0
+    assert len(texts()) == 2
+
+
+def test_a_wedge_the_runner_already_texted_is_not_texted_again(tmp_path):
+    rig = _Rig(tmp_path)
+    texts = _texts_to(rig, tmp_path)
+    rig.heartbeat(3600)
+    rig.runner_lock(os.getpid(), age=3600)                # alive, up an hour, not ticking: wedged
+    (rig.home / "state" / "runner_paged.json").write_text(json.dumps(
+        {"reasons": ["runner_tick_errors:4"]}))
+    assert rig.run().returncode == 0
+    assert rig.wstate()["episode"]["signals"] == ["heartbeat_stale"]
+    assert texts() == []

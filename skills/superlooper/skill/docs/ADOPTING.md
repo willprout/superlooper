@@ -239,7 +239,7 @@ on dev.)
 | `triage.rubric` | `null` | The **nit rubric** a triage flight closes against (issue #449). `null` means the standing rule's own four lines apply (N1 unreachable input, N2 cosmetic-only, N3 cost exceeds consequence, N4 duplicate hardening) — the default, and the one that cannot drift from the document. To use your own, give a non-empty list of `{"id", "title", "test"}` objects; an override **replaces** the default set rather than adding to it. Every field is quoted verbatim in the close comment and in the limitations-ledger entry, so all three are required. The rule's floor stands whatever your lines say: nothing silent-failure-shaped, nothing touching approvals/merging/publishing, and nothing the owner has personally flagged is ever a nit. |
 | `watchdog.authority` | `"full"` | Standing authority tier for an **unattended** sl-debugger session the watchdog launches (issue #66): `diagnose-only` \| `allowlist` \| `full`. Even `full` excludes the constitution absolutely (never `agent-ready`, never merge/force-push, never frozen issue text, never `.superlooper/**` or `.github/workflows/**`) — enforced by the sl-debugger skill's unattended contract. |
 | `watchdog.allowlist` | `[]` | The exact repair verbs permitted at the `allowlist` tier, as strings, interpreted literally (never expansively). Ignored at the other tiers. |
-| `watchdog.grace_minutes` | `30` | How long after the watchdog texts you it waits before launching the unattended session. If the signal clears meanwhile it stands down silently. `0` launches on the tripping check. |
+| `watchdog.grace_minutes` | `30` | How long after an episode opens the watchdog waits before launching the unattended session. The countdown is journaled and listed in the morning report, not texted. If the signal clears meanwhile it stands down. `0` launches on the tripping check. |
 | `watchdog.heartbeat_stale_minutes` | `20` | How stale `state/runner.heartbeat` must be to count as a wedged/dead loop. Keep it comfortably above the longest legitimate tick (a ship recheck can hold one ~10 min). |
 | `watchdog.no_progress_minutes` | `30` | How long eligible `agent-ready` work may wait with **every lane empty and nothing launching** before that reads as a fault. Designed-safe waits (CI gates, blocked-by holds, parked/needs-owner, a building lane during a freeze, a usage meter that reads exhausted) never start this clock. |
 
@@ -250,8 +250,9 @@ clock.
 `templates/launchd.watchdog.plist` as a user LaunchAgent to run `superlooper watchdog --repo
 <path>` every few minutes (300 s is a good interval). Each firing is a mechanical one-shot — no
 LLM anywhere in it: it reads the health signals (stale heartbeat, present `state/ALERT`, the
-no-progress shape), texts you when one trips, waits `watchdog.grace_minutes`, and if the signal
-still stands launches ONE fresh sl-debugger session through the same interactive launch shim
+no-progress shape), texts you only about what the runner cannot say itself (a wedged or dead
+runner, approved work that never launches) and only while there is work waiting, waits
+`watchdog.grace_minutes`, and if the signal still stands launches ONE fresh sl-debugger session through the same interactive launch shim
 workers use. Every launch is journaled and lands in the morning report. `touch
 <state-home>/state/WATCHDOG_OFF` disables the whole path (it keeps observing and journaling,
 launches nothing); delete the file to re-arm. Operations detail:

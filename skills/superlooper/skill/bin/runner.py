@@ -463,6 +463,9 @@ def _read_json(path):
     return v if isinstance(v, dict) else {}
 
 
+_UNREAD = object()          # a lazily-read value that has not been read yet
+
+
 def _rm(path):
     try:
         os.remove(path)
@@ -831,6 +834,7 @@ class Runner:
         self._tick_alert_notified = False    # the wedge page went out once this episode (#494: only
                                              # while there is work to serve, so it may never)
         self._tick_alert_reasons = None      # the reasons the wedge ALERT on disk names
+        self._prior_view = _UNREAD           # the previous process's gh_view.json (issue #494)
         # DISTINCT issues whose launch failed for a DELIVERY-CHANNEL reason — the anchor, the shim, or
         # the launch machinery, never the issue's own state (issue #24, refined by #153). A per-issue
         # fault (base_missing, worktree_create_failed, ...) NEVER enters this streak: _exec_launch
@@ -1323,8 +1327,7 @@ class Runner:
         reasons = sorted("migration_hold:%s:%s" % (kind or "?", label) for kind, label in failures)
         named = ", ".join(label for _kind, label in failures)
         try:
-            loopstate.save(os.path.join(self.state, "ALERT"),
-                           {"reasons": reasons, "since": now, "paged": [], "delivered": []})
+            loopstate.save(os.path.join(self.state, "ALERT"), self._own_alert(reasons, now))
         except Exception as e:
             self._log(f"migration hold ALERT write failed: {_short_repr(e)}")
         try:
@@ -1346,7 +1349,7 @@ class Runner:
                 "failing write every tick. Check gh auth / re-run `superlooper adopt` "
                 "(idempotent), then restart the runner.", caller="runner:migration_hold"),
                 home=self.home)
-            self._record_page(reasons, delivered=notify.delivered(outcome))
+            self._record_own_page(reasons, delivered=notify.delivered(outcome))
         except Exception:
             pass
         self._log(f"BOOT HELD: migration could not be applied: {named}")
@@ -1423,6 +1426,7 @@ class Runner:
         healthy loop as dead, the 2026-07-07 class). Catches Exception, not just OSError: the
         document is built from live GitHub answers, and a wrong-typed one must not wedge the loop."""
         try:
+            self._prior_published_view()            # capture the previous process's view first (#494)
             if self._published_titles is None:      # seed both carries from disk once, post-restart
                 prior = _read_json(self._view_path()) or {}
                 self._published_titles = prior.get("titles") if isinstance(prior.get("titles"), dict) else {}
@@ -1542,6 +1546,7 @@ class Runner:
                     self._tick_alert_journaled = False
                     self._tick_alert_notified = False
                     self._tick_alert_reasons = None
+                    self._close_own_pages()        # a completed tick closes the runner's own 🔴 (#494)
                 # Honor a Restart request (issue #116) at the SAFE POINT between ticks — a tick has
                 # just fully returned (even a crashing one is caught above), so no executor is
                 # mid-flight and no worker session is touched. _honor_restart re-execs in place and
@@ -1569,8 +1574,7 @@ class Runner:
         reasons = [f"runner_tick_errors:{count}"]
         if not self._tick_alert_on_disk:
             try:
-                loopstate.save(os.path.join(self.state, "ALERT"),
-                               {"reasons": reasons, "since": now, "paged": [], "delivered": []})
+                loopstate.save(os.path.join(self.state, "ALERT"), self._own_alert(reasons, now))
                 self._tick_alert_on_disk = True
                 self._tick_alert_reasons = reasons
             except Exception:
@@ -1582,8 +1586,9 @@ class Runner:
                 pass
             self._tick_alert_journaled = True
         # The PAGE waits for work to serve (issue #494) and is re-asked on every crashing tick, so
-        # work approved while the loop is still wedged pages then. It names the reasons the ALERT on
-        # disk carries, which is what a later clean tick's decide closes with a 🟢.
+        # work approved while the loop is still wedged pages then. Its 🟢 comes from the first tick
+        # that COMPLETES (_close_own_pages) — never from decide, which clears this ALERT on any tick
+        # it runs, including one that crashes right after.
         if not self._tick_alert_notified and self._work_demand():
             paged = self._tick_alert_reasons or reasons
             try:
@@ -1592,7 +1597,7 @@ class Runner:
                     self.config, notify.DOWN, "ALERT: " + paged[0],
                     f"runner tick has failed {count}x in a row — the loop is wedged",
                     caller="runner:tick_errors"), home=self.home)
-                self._record_page(paged, delivered=notify.delivered(outcome))
+                self._record_own_page(paged, delivered=notify.delivered(outcome))
             except Exception:
                 pass
             self._tick_alert_notified = True   # notify.send never raises; dedupe regardless
@@ -2518,6 +2523,10 @@ class Runner:
             # probe — a recovery-only tick must still see the signal. Tri-state; fail-open (only an
             # explicit True holds) lives in decide.
             disk["display_asleep"] = self._display_asleep()
+        # Owner pages wait for work to serve (issue #494). Until this process's first poll lands its
+        # parsed view is empty, so decide gets the demand reading of the view published before it.
+        if not self._last_poll_ok:
+            disk["unpolled_demand"] = self._unpolled_demand()
 
         lane_state = actions.lane_state_from(st)
         acts = actions.decide(now, self.config, self.usage_view(),
@@ -5519,20 +5528,97 @@ class Runner:
         except Exception as e:
             self._log(f"page record skipped: {_short_repr(e)}")
 
+    def _own_alert(self, reasons, now):
+        """state/ALERT for a hold the runner raises ITSELF (the wedged tick, the boot migration hold).
+        Those writes replace the reasons, but the page record of whatever stood before is carried
+        (issue #494): a 🔴 already delivered for a reason decide will raise again must neither be
+        paged twice nor lose its 🟢."""
+        prev = _read_json(os.path.join(self.state, "ALERT"))
+        prev = prev if isinstance(prev, dict) else {}
+
+        def names(key):
+            v = prev.get(key)
+            return sorted({x for x in v if isinstance(x, str)}) if isinstance(v, list) else []
+        return {"reasons": reasons, "since": now, "paged": names("paged"),
+                "delivered": names("delivered")}
+
+    def _own_pages_path(self):
+        return os.path.join(self.state, "runner_paged.json")
+
+    def _record_own_page(self, reasons, delivered):
+        """A 🔴 the runner sent about ITSELF (issue #494): stamped as paged on state/ALERT, and — when
+        it reached the phone — recorded in state/runner_paged.json rather than as `delivered` on the
+        ALERT. decide never raises these reasons, so it would read their absence as recovery on any
+        tick it runs; the record here is closed only by a tick that completes (_close_own_pages), and
+        the watchdog reads it so a wedge the runner has already paged is not paged a second time."""
+        self._record_page(reasons, delivered=False)
+        if not delivered:
+            return
+        try:
+            prev = _read_json(self._own_pages_path())
+            have = prev.get("reasons") if isinstance(prev, dict) else None
+            have = {x for x in have if isinstance(x, str)} if isinstance(have, list) else set()
+            loopstate.save(self._own_pages_path(), {"reasons": sorted(have | set(reasons))})
+        except Exception as e:
+            self._log(f"own page record skipped: {_short_repr(e)}")
+
+    def _close_own_pages(self):
+        """Close the runner's own delivered 🔴s with one 🟢 (issue #494) — called after a tick that
+        COMPLETED, the one proof that the wedge or the boot hold is over. The record is on disk, so a
+        runner restarted mid-wedge still closes the page its predecessor sent. Guarded: a failed 🟢
+        must never raise into the run loop."""
+        path = self._own_pages_path()
+        try:
+            if not os.path.exists(path):
+                return
+            rec = _read_json(path)
+            reasons = rec.get("reasons") if isinstance(rec, dict) else None
+            reasons = [x for x in reasons if isinstance(x, str)] if isinstance(reasons, list) else []
+            _rm(path)
+            if not reasons:
+                return
+            import notify
+            notify.send(self.config, notify.render(
+                self.config, notify.RECOVERED, "cleared: " + ", ".join(reasons),
+                "the runner is completing ticks again — the loop is serving its work",
+                caller="runner:own_page_cleared"), home=self.home)
+        except Exception as e:
+            self._log(f"own page close skipped: {_short_repr(e)}")
+
     def _work_demand(self):
         """actions.work_demand for a page the runner sends ITSELF — outside decide (issue #494): the
-        wedged-tick alert and the boot migration hold. The live poll view when this process has one;
-        before its first poll, the view it last published. A runner that has never published anything
-        has only its disk lanes to go on. A reading that raises fails toward the page."""
+        wedged-tick alert and the boot migration hold. The live poll view once this process has one,
+        else _unpolled_demand. A reading that raises fails toward the page."""
         try:
-            st = self._load_state()
-            if self._last_poll_ok:
-                closed = self.gh_view.get("closed_nums") if isinstance(self.gh_view, dict) else None
-                return actions.work_demand(list(self._parsed_by_id.values()), st, closed)
-            demand = actions.published_work_demand(_read_json(self._view_path()), st)
-            return actions.work_demand([], st, None) if demand is None else demand
+            if not self._last_poll_ok:
+                return self._unpolled_demand()
+            closed = self.gh_view.get("closed_nums") if isinstance(self.gh_view, dict) else None
+            return actions.work_demand(list(self._parsed_by_id.values()), self._load_state(), closed)
         except Exception:
             return True
+
+    def _prior_published_view(self):
+        """The GitHub view the PREVIOUS runner process published, read once and kept (issue #494).
+        This process's first tick republishes state/gh_view.json — with an empty issue map and no
+        `polled_at` when GitHub is not answering — so the earlier document has to be captured before
+        that write: _publish_view calls this first."""
+        if self._prior_view is _UNREAD:
+            try:
+                self._prior_view = _read_json(self._view_path())
+            except Exception:
+                self._prior_view = None
+        return self._prior_view
+
+    def _unpolled_demand(self):
+        """Demand before this process's first poll has landed (issue #494): the previous process's
+        published view against today's disk lanes. A restart into a GitHub outage must still page for
+        the queue it knew about. No usable view (never published, unreadable, or published by a runner
+        that never saw GitHub answer) is unknowable, and an unknowable reading fails toward the page."""
+        try:
+            demand = actions.published_work_demand(self._prior_published_view(), self._load_state())
+        except Exception:
+            demand = None
+        return True if demand is None else demand
 
     def _exec_clear_alert(self, a, now):
         _rm(os.path.join(self.state, "ALERT"))

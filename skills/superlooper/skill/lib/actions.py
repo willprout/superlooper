@@ -1362,8 +1362,10 @@ def work_demand(parsed_issues, issues_state, closed_nums):
         `in-progress` label on an issue the loop has not settled.
 
     NOT demand: a worker stopped on an owner question and a parked / bounced / needs-owner issue —
-    their 🟠 was already sent and the loop does nothing until the owner answers — including while
-    the hand-back's own label move is still retrying; and a stray label on merged work.
+    their 🟠 was already sent and the loop does nothing until the owner answers — including when the
+    view still shows a label the settled hand-back has since removed; and a stray label on merged work.
+    (A hand-back whose label move is still RETRYING has not settled its status yet, so it still reads
+    as the running or approved issue it was — which is what keeps park_label_stuck paging.)
 
     Pure and total: wrong-typed input reads as no demand from that input and never raises."""
     ist_map = _dget(issues_state, "issues", dict)
@@ -1391,12 +1393,14 @@ def work_demand(parsed_issues, issues_state, closed_nums):
 
 def published_work_demand(published_view, issues_state):
     """work_demand read from the runner's last PUBLISHED GitHub view (state/gh_view.json) — for the
-    moments the live view is not in hand: a runner held at boot before its first poll, or the
-    watchdog when GitHub will not answer it. Returns None when the document carries no readable issue
-    map, so each caller decides which way an unknowable reading falls."""
+    moments the live view is not in hand: a runner before its first poll lands (held at boot, or
+    restarted into a GitHub outage), or the watchdog when GitHub will not answer it. Returns None when
+    the document is no evidence — no readable issue map, or no `polled_at`: a runner that never saw
+    GitHub answer publishes an EMPTY map that means "unknown", not "nothing is waiting" — so each
+    caller decides which way an unknowable reading falls."""
     doc = published_view if isinstance(published_view, dict) else {}
     raw = doc.get("issues")
-    if not isinstance(raw, dict):
+    if not isinstance(raw, dict) or not _real(doc.get("polled_at")):
         return None
     parsed = [issues_mod.parse_issue(r) for r in raw.values() if isinstance(r, dict)]
     return work_demand(parsed, issues_state, doc.get("closed_nums"))
@@ -1419,9 +1423,9 @@ def _alert_pages(reasons, alert_on_disk, demand):
         appeared. A reason set that merely shrank pages nothing.
       * `recovered` — the delivered reasons that are gone: exactly the 🟢 to send, sent whatever the
         demand, because it closes a 🔴 already on the phone. A silent episode recovers silently.
-      * a delivered reason that disappears on the SAME tick a new one appears is read as one outage
-        RE-NAMED (a vaguer class replaced by a precise one, a sensed variant changing), not as a
-        recovery: the new reasons inherit the delivered mark, so the 🟢 comes when they clear.
+        A 🟢 names only a reason whose own 🔴 was delivered — no inference that a reason leaving as
+        another arrives is "the same outage renamed": when that is so, the new name's 🔴 and the old
+        name's 🟢 (whose ask names what still stands) say exactly what happened, in that order.
 
     An ALERT with no `paged` record was written by an engine that texted every reason it wrote, so
     its reasons read as already paged (no duplicate 🔴 on the upgrade restart); with no `delivered`
@@ -1432,14 +1436,8 @@ def _alert_pages(reasons, alert_on_disk, demand):
     paged = {r for r in raw_paged if isinstance(r, str)} if isinstance(raw_paged, list) else set()
     was_delivered = {r for r in _dget(prev, "delivered", list) if isinstance(r, str)}
     current = set(reasons)
-    gone = was_delivered - current
-    appeared = current - set(prev_reasons)
+    recovered = sorted(was_delivered - current)
     delivered = was_delivered & current
-    recovered = []
-    if gone and appeared:
-        delivered |= appeared
-    elif gone:
-        recovered = sorted(gone)
     was_paged = sorted(paged)
     paged &= current
     down = bool(demand) and bool(current - paged)
@@ -2314,7 +2312,10 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     # whether or not anyone is waiting: the dashboard, `status` and the morning report read the file,
     # and a held queue still reads as held. Only the TEXT waits for demand — work the loop is trying
     # to do — and a 🟢 goes out only for a 🔴 that reached the phone. See _alert_pages.
-    pages = _alert_pages(reasons, alert_on_disk, work_demand(plist, issues_state, closed_nums))
+    # Until this runner's first poll lands it has no parsed view at all, so the runner reads demand
+    # from the view it published before and hands the answer in (`unpolled_demand`, only then).
+    demand = work_demand(plist, issues_state, closed_nums) or dsk.get("unpolled_demand") is True
+    pages = _alert_pages(reasons, alert_on_disk, demand)
     if reasons:
         existing = alert_on_disk.get("reasons") if alert_on_disk else None
         if existing != reasons or pages["rewrite"]:

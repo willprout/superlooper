@@ -571,9 +571,10 @@ when nothing is waiting — it just doesn't text you about it.
 **One sender for each problem.** The runner texts its own ALERTs. The watchdog texts only what the
 runner can't say about itself: the runner is wedged or dead, a restart failed, restarts hit the
 hourly cap, a debugger session couldn't launch, or approved work has sat unlaunched with every lane
-free. When the watchdog sees an ALERT it doesn't text you again. Its countdown to launching a
-debugger is written to the journal and the morning report, not sent to your phone, and so is a
-debugger launch that worked.
+free. When the watchdog sees an ALERT it doesn't text you again, and when the runner has already
+texted you that its own ticks keep failing, the watchdog doesn't text the same wedge a second time
+as a stale heartbeat. Its countdown to launching a debugger is written to the journal and the
+morning report, not sent to your phone, and so is a debugger launch that worked.
 
 **A 🟢 only follows a 🔴 you got.** When something recovers (the usage meter reads again, auth works
 again, the fence is back up, the runner is back), you get a 🟢 only if the 🔴 for it actually

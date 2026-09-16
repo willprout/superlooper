@@ -6118,9 +6118,10 @@ def test_a_new_reason_joining_a_paged_alert_pages_and_a_shrink_does_not():
     assert g["tier"] == notify_mod.RECOVERED and "gh_unreachable" in g["headline"]
 
 
-def test_a_renamed_reason_inherits_the_open_page_instead_of_greening_it():
-    # One outage re-named mid-episode (a vaguer class replaced by a precise one, a sensed variant
-    # changing) must not read as a recovery on the phone: the delivered mark moves to the new name.
+def test_a_delivered_reason_that_leaves_is_greened_even_when_another_appears():
+    # No rename inference (review P2): a 🟢 names only a reason whose 🔴 reached the phone, so a
+    # reason that clears on the same tick another appears still gets its 🟢, and the new reason is
+    # paged on its own merits.
     d = disk(alert={"reasons": ["session_logged_out:i5:api_key"], "since": NOW - 100,
                     "paged": ["session_logged_out:i5:api_key"],
                     "delivered": ["session_logged_out:i5:api_key"]},
@@ -6128,6 +6129,58 @@ def test_a_renamed_reason_inherits_the_open_page_instead_of_greening_it():
                                         sensed_auth="subscription")))
     out = decide(dsk=d)
     (a,) = only(out, "alert")
-    assert a["reasons"] == ["session_logged_out:i5:subscription"]
-    assert a["delivered"] == ["session_logged_out:i5:subscription"]
-    assert [n["tier"] for n in _texts(out)] == [notify_mod.DOWN]      # the precise name pages
+    assert a["reasons"] == ["session_logged_out:i5:subscription"] and a["delivered"] == []
+    assert [n["tier"] for n in _texts(out)] == [notify_mod.DOWN, notify_mod.RECOVERED]
+    g = _texts(out, notify_mod.RECOVERED)[0]
+    assert "api_key" in g["headline"] and "subscription" in g["ask"]      # "still standing: ..."
+    # ...and on an idle loop the unrelated newcomer is never greened later: it was never delivered
+    corrupt = _state(i7=ist("merged", update_errors="x"))
+    idle = disk(alert={"reasons": ["usage_stale"], "since": NOW - 100, "paged": ["usage_stale"],
+                       "delivered": ["usage_stale"]}, issues_state=corrupt)
+    out2 = decide(usage=usage_ok(), dsk=idle)
+    (a2,) = only(out2, "alert")
+    assert a2["reasons"] == ["update_errors:i7"] and a2["paged"] == [] and a2["delivered"] == []
+    assert [n["tier"] for n in _texts(out2)] == [notify_mod.RECOVERED]   # usage_stale, only
+    healed = decide(usage=usage_ok(), dsk=disk(alert=_carried_alert(a2, NOW), issues_state=_state()))
+    assert only(healed, "clear_alert") and _texts(healed) == []
+
+
+def test_a_flapping_github_costs_one_red_and_one_green_per_outage_never_per_tick():
+    # A delivered gh_unreachable clears on the first good poll: the 🔴 is closed by a 🟢. Across
+    # repeated outages that is one of each per outage — bounded by GH_ALERT_FAILURES, never per tick.
+    d = disk(issues_state=_state(i7=ist("running")))
+    tiers = []
+    for k in range(60):
+        failures = actions.GH_ALERT_FAILURES + 1 if (k // 15) % 2 == 0 else 0
+        out = decide(now=NOW + k * 15, dsk=d, gh_view=ghv(consecutive_failures=failures))
+        tiers += [n["tier"] for n in _texts(out)]
+        a = only(out, "alert")
+        if a:
+            carried = _carried_alert(a[0], NOW + k * 15)
+            for n in _texts(out, notify_mod.DOWN):            # the executor: a delivered send
+                carried["delivered"] = sorted(set(carried["delivered"]) | set(n["pages"]))
+            d = dict(d, alert=carried)
+        elif only(out, "clear_alert"):
+            d = dict(d, alert=None)
+    assert tiers == [notify_mod.DOWN, notify_mod.RECOVERED] * 2
+
+
+def test_before_the_first_poll_lands_the_runner_hands_decide_its_demand_reading():
+    # A runner restarted into a GitHub outage has no parsed view at all; the runner reads demand from
+    # the view it published before the restart and hands decide the answer (review P1).
+    g = ghv(stale=True, consecutive_failures=actions.GH_ALERT_FAILURES)
+    held = decide(gh_view=g, dsk=disk(unpolled_demand=True))
+    assert [n["tier"] for n in _texts(held)] == [notify_mod.DOWN]
+    assert _texts(decide(gh_view=g, dsk=disk(unpolled_demand=False))) == []
+    for garbage in (None, "yes", 1):                   # only an explicit True is a reading of demand
+        assert _texts(decide(gh_view=g, dsk=disk(unpolled_demand=garbage))) == []
+
+
+def test_a_published_view_is_evidence_only_if_its_runner_saw_github_answer():
+    row = {"number": 9, "title": "t", "body": "",
+           "labels": [{"name": "agent-ready"}, {"name": "type:build"}]}
+    assert actions.published_work_demand({"issues": {"i9": row}, "polled_at": NOW}, None) is True
+    assert actions.published_work_demand({"issues": {}, "polled_at": NOW}, None) is False
+    for doc in ({"issues": {"i9": row}, "polled_at": None},        # published before any poll landed
+                {"issues": {"i9": row}}, {"issues": [], "polled_at": NOW}, None, [], "x"):
+        assert actions.published_work_demand(doc, None) is None, doc

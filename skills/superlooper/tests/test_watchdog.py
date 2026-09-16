@@ -1216,3 +1216,25 @@ def test_a_delayed_page_names_only_what_stands_now():
     later = _run(T0 + 10 * MIN, _busy(_view(T0 + 10 * MIN, alert={"reasons": ["usage_stale"]})),
                  r["state"])
     assert later["notify"] == []
+
+
+def test_a_wedge_the_runner_already_paged_is_not_paged_again_by_the_watchdog():
+    # Review P2: a runner whose ticks crash pages runner_tick_errors itself; ~20 min later its
+    # heartbeat reads stale. That is the same outage from a second sender — the watchdog stays quiet
+    # while the runner's delivered wedge page stands (`runner_paged`, state/runner_paged.json).
+    wedged = dict(heartbeat=T0 - 21 * MIN, runner_live=True,
+                  alert={"reasons": ["runner_tick_errors:4"]})
+    quiet = _run(T0, _busy(_view(runner_paged=["runner_tick_errors:4"], **wedged)))
+    assert quiet["state"]["episode"]["signals"] == ["alert", "heartbeat_stale"]
+    assert quiet["notify"] == []
+    # without the runner's page on record, a stale heartbeat is the watchdog's to say
+    assert len(_run(T0, _busy(_view(**wedged)))["notify"]) == 1
+
+
+def test_an_episode_written_by_the_old_engine_is_not_paged_again():
+    # Review P2: the old engine texted every episode at open; an episode it wrote carries no `paged`.
+    legacy = dict(wd.new_state(), episode={"signals": ["heartbeat_stale"], "opened_at": T0 - 5 * MIN,
+                                           "detail": "x", "launched_at": None, "launch_id": None,
+                                           "launch_attempts": 0, "launch_failure_notified": False})
+    r = _run(T0, _busy(_view(heartbeat=T0 - 26 * MIN)), legacy)
+    assert r["notify"] == [] and r["state"]["episode"]["signals"] == ["heartbeat_stale"]

@@ -62,7 +62,9 @@ Who gets texted (issue #494, owner ruling 2026-09-16) — three rules on top of 
                 cannot say about itself: a runner that is wedged (heartbeat_stale) or dead, a
                 restart that failed, the crash-loop cap, a debugger that could not launch — plus
                 no_progress, which a live runner cannot see. An episode on `alert` alone texts
-                nothing, and neither does a verified debugger launch (journal + morning report).
+                nothing, and neither does a verified debugger launch (journal + morning report),
+                nor a stale heartbeat the runner has already paged as its own failing ticks
+                (`view["runner_paged"]`). An episode an older engine opened reads as paged.
   DEMAND        every 🔴 waits for work to serve (`view["demand"]`, read by the CLI through
                 actions.work_demand). An idle loop is silent whatever breaks, and the first check
                 that finds work waiting while the fault still stands sends the page. Resurrection
@@ -402,6 +404,14 @@ def record_delivered(state, entry):
     return st
 
 
+def _runner_paged_wedge(view):
+    """Has the runner itself delivered a page that its ticks are failing (issue #494)? The CLI reads
+    state/runner_paged.json into `view["runner_paged"]`; the record stands until a tick completes."""
+    paged = view.get("runner_paged")
+    return isinstance(paged, list) and any(
+        isinstance(r, str) and r.startswith("runner_tick_errors:") for r in paged)
+
+
 def _green(headline, ask, caller):
     return _text(notify_lib.RECOVERED, headline, ask, caller)
 
@@ -700,8 +710,15 @@ def evaluate(now, config, view, state):
     # heartbeat that went stale and came back while an ALERT held the episode open is not a page.
     # The debugger countdown is the JOURNAL's: it rides the opening record below, where the morning
     # report and the dashboard read it.
+    # An episode written before this rule carries no `paged`: the old engine texted every episode it
+    # opened, so it reads as already paged. A wedge the RUNNER has already paged about itself
+    # (`view["runner_paged"]`, its delivered runner_tick_errors page) is not paged again as a stale
+    # heartbeat — one outage, one sender.
+    pageable = PAGED_SIGNALS & set(sigs)
+    if _runner_paged_wedge(view):
+        pageable -= {HEARTBEAT_STALE}
     texted = False
-    if not ep.get("paged") and demand and PAGED_SIGNALS & set(sigs):
+    if not ep.get("paged", "paged" not in ep) and demand and pageable:
         notify.append(_text(notify_lib.DOWN, "watchdog: " + ", ".join(sigs), "; ".join(details),
                             "episode", marks=MARK_EPISODE))
         ep = dict(ep, paged=True)
