@@ -989,8 +989,9 @@ def repo_state(slug, states, spinning=False, merges_frozen=None, alert=None,
 
     That substitution is the whole of issue #365's board half, and its direction matters: the stop
     condition REPLACES ``runner-down`` rather than sitting beside it, so the grey RUNNER DOWN
-    takeover and the dead-man's-switch push both stand down for a stop the owner asked for — the
-    3am text about an outage they created on purpose. It can only ever fire alongside a positive
+    takeover stands down for a stop the owner asked for — the 3am alarm about an outage they
+    created on purpose. (The dashboard no longer texts about a downed runner at all: issue #496
+    retired that push; runner-down paging is the engine watchdog's.) It can only ever fire alongside a positive
     "no live runner" read (see :func:`stop_state`), so a stop that did NOT take never silences
     anything."""
     conditions = []
