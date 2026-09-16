@@ -449,3 +449,113 @@ def test_a_nameless_repo_still_gets_a_named_row():
     # visible everywhere in boring mode). An unnamed row is an unattributable alarm.
     t = truth.whole_field([{"slug": "acme/titan", "truth": truth.banner(_silent())}])
     assert t["repos"][0]["name"] == "acme/titan"
+
+
+# ============ the texts line: when did a text last reach the phone? (issue #495) ============
+# The daily morning text was the notify channel's only proof, and it now goes out only on news. There
+# is deliberately no heartbeat text in its place (owner ruling 2026-09-16): a dead channel only matters
+# when there is work, and the owner looks at THIS strip when he approves work. So the strip states the
+# age of the last delivered text, calmly, and says plainly when nothing has reached the phone in more
+# than a week. The verdict is lib/texts'; this module only words it.
+
+import texts as texts_mod
+
+
+def _texts(state, age=None, age_text=None, channel="cmd", rc=None, delivered_channel="cmd",
+           untimed=False):
+    return {"state": state, "delivered_age": age, "delivered_age_text": age_text,
+            "delivered_channel": delivered_channel if age is not None else None,
+            "delivered_untimed": untimed, "channel": channel, "rc": rc}
+
+
+def test_a_recent_text_is_stated_calmly():
+    t = truth.banner(_live(), texts=_texts(texts_mod.DELIVERED, 3 * 3600, "3h ago"))
+    assert t["texts"] == {"state": "delivered", "text": "last text delivered 3h ago"}
+    assert t["level"] == truth.LEVEL_OK, "a working channel is not news — the strip stays calm"
+
+
+def test_a_week_without_a_delivered_text_is_said_plainly_on_its_own_line():
+    t = truth.banner(_live(), texts=_texts(texts_mod.STALE, 9 * 86400, "216h ago"))
+    assert t["texts"]["state"] == "stale"
+    assert "last text delivered 216h ago" in t["texts"]["text"]
+    assert "over a week" in t["texts"]["text"]
+    # Said plainly, in its own ink — but it does not turn the whole strip amber. With no heartbeat text,
+    # an idle week is the NORMAL way to get here; a strip amber every quiet week is wallpaper, and it
+    # would hide the next drift or blind-data notice under a colour that already means nothing (fresh
+    # review of #495, and #166's own rule: silence is still allowed where it is honest).
+    assert t["level"] == truth.LEVEL_OK
+
+
+def test_a_week_old_journal_with_no_text_at_all_is_said_plainly():
+    t = truth.banner(_live(), texts=_texts(texts_mod.STALE))
+    assert "no text delivered in over a week" in t["texts"]["text"]
+    assert t["level"] == truth.LEVEL_OK
+
+
+def test_a_channel_nothing_has_proven_yet_is_stated_never_an_all_clear():
+    t = truth.banner(_live(), texts=_texts(texts_mod.UNPROVEN))
+    assert t["texts"]["state"] == "unproven" and "no text delivered yet" in t["texts"]["text"]
+    assert "last text delivered" not in t["texts"]["text"]
+
+
+def test_a_delivery_whose_time_cannot_be_read_says_so():
+    t = truth.banner(_live(), texts=_texts(texts_mod.UNPROVEN, untimed=True))
+    assert t["texts"]["text"] == "last text's time cannot be read"
+
+
+def test_a_failed_text_names_the_channel_and_the_last_delivery():
+    t = truth.banner(_live(), texts=_texts(texts_mod.DEAD, 2 * 86400, "48h ago", rc=2))
+    assert t["texts"]["state"] == "dead"
+    assert "FAILED" in t["texts"]["text"] and "cmd" in t["texts"]["text"]
+    assert "rc=2" in t["texts"]["text"] and "last delivered 48h ago" in t["texts"]["text"]
+    assert t["level"] == truth.LEVEL_NOTICE
+
+
+def test_no_configured_channel_is_named():
+    t = truth.banner(_live(), texts=_texts(texts_mod.UNCONFIGURED, channel="log-only"))
+    assert "no text channel configured" in t["texts"]["text"]
+    assert t["level"] == truth.LEVEL_NOTICE
+
+
+def test_a_dead_loop_outranks_a_broken_channel():
+    t = truth.banner(_silent(), texts=_texts(texts_mod.DEAD, rc=2))
+    assert t["level"] == truth.LEVEL_DOWN
+
+
+def test_only_a_broken_or_missing_channel_raises_the_strip():
+    raised = {state for state in texts_mod.STATES
+              if truth.banner(_live(), texts=_texts(state, 3600, "1h ago"))["level"]
+              == truth.LEVEL_NOTICE}
+    assert raised == {texts_mod.DEAD, texts_mod.UNCONFIGURED}
+
+
+def test_an_embedder_that_wires_no_texts_verdict_gets_no_line_and_no_level_change():
+    t = truth.banner(_live())
+    assert t["texts"] is None and t["level"] == truth.LEVEL_OK
+
+
+def test_a_junk_texts_verdict_is_unproven_never_an_all_clear():
+    for junk in ({}, {"state": "fine"}, {"state": []}, "delivered", 7):
+        t = truth.banner(_live(), texts=junk)
+        assert t["texts"]["state"] == "unproven", junk
+        assert "delivered" not in t["texts"]["text"].replace("no text delivered", ""), junk
+
+
+def test_every_texts_state_words_itself():
+    for state in texts_mod.STATES:
+        line = truth.banner(_live(), texts=_texts(state, 3600, "1h ago"))["texts"]
+        assert line["state"] == state and line["text"]
+
+
+def test_boring_modes_rows_carry_each_repos_own_texts_line():
+    a = truth.banner(_live(), texts=_texts(texts_mod.DELIVERED, 3600, "1h ago"))
+    b = truth.banner(_live(), texts=_texts(texts_mod.DEAD, rc=2))
+    t = truth.whole_field([_repo("titan", a), _repo("acme", b)])
+    assert t["repos"][0]["texts"] is a["texts"], "the row must carry the repo's OWN verdict object"
+    assert t["repos"][1]["texts"] is b["texts"]
+    assert t["level"] == truth.LEVEL_NOTICE
+
+
+def test_a_row_whose_strip_carries_no_texts_line_renders_none():
+    t = truth.whole_field([_repo("titan", truth.banner(_live()))])
+    assert t["repos"][0]["texts"] is None

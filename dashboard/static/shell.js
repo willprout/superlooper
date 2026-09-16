@@ -996,7 +996,7 @@
     // glance summarises), but the WORDS are never aggregated — "loop may be down" with no name on it
     // sends the owner to check the wrong runner and hides that the other repo is fine.
     var rows = repos.map(function (r) {
-      var tick = r.tick || {}, data = r.data || {};
+      var tick = r.tick || {}, data = r.data || {}, tx = r.texts;
       // No per-row level class: the row's state is already carried by its tick/data spans (.r.down,
       // .r.blind, .r.dark), and an emitted-but-unstyled class is a hook that reads as intent it
       // doesn't have (raised in review). The strip's own lvl- class carries the worst-of colour.
@@ -1005,6 +1005,8 @@
         '<span class="r ' + esc(tick.state || "down") + '">' +
           esc(tick.text || "no tick seen — loop may be down") + '</span>' +
         '<span class="r ' + esc(data.state || "blind") + '">' + esc(data.text || "data ?") + '</span>' +
+        // When this repo's loop last got a text to the phone (issue #495) — per repo, like the tick.
+        (tx && tx.text ? '<span class="r texts ' + esc(tx.state || "") + '">' + esc(tx.text) + '</span>' : "") +
       '</span>';
     }).join("");
     // Stated ONCE: there is one installed engine behind every repo. A live engine says nothing (§0.2).

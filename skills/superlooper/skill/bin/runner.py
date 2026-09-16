@@ -5661,8 +5661,10 @@ class Runner:
 
     def _morning_report_hook(self, date, now):
         """Task 11 seam (filled): report.morning() renders reports/morning-<date>.md from the
-        journal + the live view assembled here, then the report's one-line summary is pushed as a
-        MORNING-tier text through the notify doorway (issue #493). A
+        journal + the live view assembled here, then — only when report.morning_news finds news
+        (issue #495) — the report's one-line summary is pushed as a MORNING-tier text through the
+        notify doorway (issue #493). A quiet report is written and stamped like any other; its skipped
+        text is journaled as `morning_push_skipped` with the reason. A
         render/write/notify failure is contained — the action record + the journal it reads are
         already durable, so the report can always be re-rendered by `superlooper morning-report`."""
         import report                                # lazy: keep the agent-agnostic runner light
@@ -5710,26 +5712,27 @@ class Runner:
                 f.write(text)
         except OSError:
             pass
-        # First non-title, non-blank line is the summary tally / "nothing happened" — the push body.
+        # The text goes out only on NEWS (issue #495, owner ruling 2026-09-16): a quiet report is
+        # written and the day stamped, but "Nothing happened overnight" is not worth the phone. There
+        # is deliberately no heartbeat text in its place — the channel's proof is now the AGE of the
+        # last text of any kind, which the notify doorway journals as `notify_canary` on every send
+        # and the report file + dashboard render.
+        if not report.morning_news(records, view, self.config):
+            try:
+                journal.append(self.home, {"act": "morning_push_skipped", "date": date,
+                                           "reason": report.QUIET_SKIP_REASON,
+                                           "caller": "runner:morning_report", "outcome": "ok"}, now)
+            except (OSError, ValueError):
+                pass                            # the report already rendered (contained failure)
+            self._log(f"morning report {date}: written; quiet — no text sent")
+            return
+        # First non-title, non-blank line is the summary tally — the push body.
         summary = next((ln for ln in text.splitlines()
                         if ln.strip() and not ln.startswith("#")), "morning report ready")
-        # The morning push doubles as the notify-channel CANARY (issue #164): send_test sends the
-        # SAME push via the SAME precedence as send(), but returns the full delivery result. Journal
-        # it as `notify_canary` so the NEXT report's "Notify channel" line surfaces a SILENTLY dead
-        # channel (once dead for days, found only by a human reading the journal) on the owner-read
-        # report + dashboard — the one surface a dead channel can't itself reach. This is the morning
-        # heartbeat, at a reasonable hour: it adds NO 3am ping, unlike a synthetic nightly probe.
-        r = notify.send_test(self.config, notify.render(self.config, notify.MORNING, summary,
-                                                        caller="runner:morning_report"),
-                             home=self.home)
-        self._log(f"morning report {date}: notify [{r.channel} ok={r.ok} rc={r.rc}]")
-        try:
-            journal.append(self.home, {"act": "notify_canary", "date": date, "ok": bool(r.ok),
-                                       "channel": r.channel, "rc": r.rc,
-                                       "detail": (r.stderr or "")[:200], "outcome": "ok"}, now)
-        except (OSError, ValueError):
-            pass                                # the report already rendered; a canary write hiccup
-                                                # never breaks the morning report (contained failure)
+        outcome = notify.send(self.config, notify.render(self.config, notify.MORNING, summary,
+                                                         caller="runner:morning_report"),
+                              home=self.home)
+        self._log(f"morning report {date}: notify [{outcome}]")
 
     def _exec_notify(self, a, now):
         """Task 11 seam (filled): notify.send() delivers by the configured precedence

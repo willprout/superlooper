@@ -484,7 +484,7 @@ def _notify_row(canary, out):
         _remedy("superlooper doctor --stack sends a live test message and proves the channel", out)
         return
     if status == "unconfigured":
-        _row("notify", "NO CHANNEL CONFIGURED — pushes go to the journal only", out)
+        _row("notify", "NO CHANNEL CONFIGURED — no push reaches your phone", out)
         _remedy("set notify.imessage_to or notify.cmd in .superlooper/config.json, then "
                 "superlooper doctor --stack", out)
         return

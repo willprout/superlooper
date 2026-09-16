@@ -738,7 +738,7 @@ def check_notify(config, config_error=None, sender=None, announce=None, canary=N
     if sender is SKIP_SEND:
         # A read-only caller (`superlooper upkeep`). The channel is CONFIGURED — that much is
         # proven above — but delivery is not, so this is a WARN carrying the command that does
-        # prove it, never a pass dressed up as one. The notify canary the morning push journals is
+        # prove it, never a pass dressed up as one. The notify canary every real text journals is
         # the evidence a read-only report leans on instead (report.notify_canary).
         return CheckResult(
             "notify channel", True,

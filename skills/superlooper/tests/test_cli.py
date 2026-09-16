@@ -1983,8 +1983,38 @@ def test_morning_report_cli_texts_the_morning_tier_and_journals_the_canary(rig, 
     (title, body), = _texts(sent)
     assert title.startswith("☀️ r@mini · 1 merged")
     assert body == ""
+    # the doorway journals the delivery as the canary (issue #495) — once, not again from the verb
     canary = [x for x in journal.read(str(home)) if x.get("act") == "notify_canary"]
-    assert canary and canary[-1]["ok"] is True and canary[-1]["channel"] == "cmd"
+    assert len(canary) == 1 and canary[0]["ok"] is True and canary[0]["channel"] == "cmd"
+    assert canary[0]["caller"] == "cli:morning_report"
+
+
+def test_a_quiet_hand_run_morning_report_writes_the_file_and_texts_nothing(rig, tmp_path):
+    # issue #495: the hand-run verb follows the same quiet rule as the scheduled report
+    import journal
+    home = rig.tmp / "slhome" / "o__r"
+    sent = tmp_path / "sent.txt"
+    _texting_config(rig, sent)
+    r = cli(rig, "morning-report", "--repo", str(rig.repo))
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert sorted((home / "reports").glob("morning-*.md")), "the file is still written"
+    assert not sent.exists()
+    assert "not sent" in r.stdout and "--always-send" in r.stdout      # says why, and the way past it
+    (skip,) = [x for x in journal.read(str(home)) if x.get("act") == "morning_push_skipped"]
+    assert "quiet" in skip["reason"] and skip["caller"] == "cli:morning_report"
+
+
+def test_always_send_texts_a_quiet_hand_run_report_because_the_operator_asked(rig, tmp_path):
+    import journal
+    home = rig.tmp / "slhome" / "o__r"
+    sent = tmp_path / "sent.txt"
+    _texting_config(rig, sent)
+    r = cli(rig, "morning-report", "--always-send", "--repo", str(rig.repo))
+    assert r.returncode == 0, r.stdout + r.stderr
+    (title, body), = _texts(sent)
+    assert title.startswith("☀️ r@mini · ")
+    assert "notify: sent via cmd" in r.stdout
+    assert not [x for x in journal.read(str(home)) if x.get("act") == "morning_push_skipped"]
 
 
 def test_doctor_stack_sends_a_test_tier_text(rig, tmp_path):

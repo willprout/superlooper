@@ -108,6 +108,15 @@ def _strip(snap):
     return snap["repos"][0]["truth"]
 
 
+def _texted(home, age, ok=True, channel="cmd"):
+    """A text the engine's notify doorway journaled `age` seconds before NOW (issue #495). A healthy
+    loop has one inside the week — with no daily heartbeat text, that IS the channel's proof."""
+    with open(home / "journal.jsonl", "a") as f:
+        f.write(json.dumps({"ts": NOW - age, "act": "notify_canary", "ok": ok, "channel": channel,
+                            "rc": 0 if ok else 2, "detail": "", "tier": "waiting",
+                            "caller": "decide:park", "outcome": "ok"}) + "\n")
+
+
 # =============================== the DoD case ===============================
 
 def test_a_stale_runner_view_shows_the_down_state_not_a_confident_mirror(home):
@@ -298,3 +307,46 @@ def test_the_worst_repo_sets_the_level_and_the_healthy_one_keeps_its_own_words(t
         "the worst repo must not smear its alarm over a healthy one")
     assert rows["bravo"]["level"] == "down"
     assert "loop may be down" in rows["bravo"]["tick"]["text"]
+
+
+# =============================== the texts line (issue #495) ===============================
+# The engine journals every text it attempts; the strip states how long ago one last reached the
+# phone. Wired from the SAME journal read the tower log and the fixer block are glossed from.
+
+def test_the_last_delivered_text_reaches_the_strip_with_its_age(home):
+    _publish(home)
+    _heartbeat(home, 10)
+    _texted(home, 3 * 3600)
+    snap = server.assemble_snapshot(_config(home), now=NOW, gh_mod=_Gh())
+    t = _strip(snap)
+    assert t["texts"] == {"state": "delivered", "text": "last text delivered 3h ago"}
+    assert snap["repos"][0]["texts"]["delivered_age"] == 3 * 3600
+    assert snap["truth"]["repos"][0]["texts"] is t["texts"], "boring mode binds the same verdict"
+
+
+def test_a_week_with_no_delivered_text_is_said_plainly_without_nagging(home):
+    _publish(home)
+    _heartbeat(home, 10)
+    _texted(home, 9 * 86400)
+    t = _strip(server.assemble_snapshot(_config(home), now=NOW, gh_mod=_Gh()))
+    assert t["texts"]["state"] == "stale" and "over a week" in t["texts"]["text"]
+    assert t["level"] == "ok", "an idle week is not an alarm — the line says it; the strip stays calm"
+
+
+def test_a_failed_text_after_a_delivery_reads_as_dead(home):
+    _publish(home)
+    _heartbeat(home, 10)
+    _texted(home, 86400)
+    _texted(home, 60, ok=False)
+    t = _strip(server.assemble_snapshot(_config(home), now=NOW, gh_mod=_Gh()))
+    assert t["texts"]["state"] == "dead" and "last delivered 24h ago" in t["texts"]["text"]
+    assert t["level"] == "notice"
+
+
+def test_a_state_home_with_no_text_on_record_says_so_rather_than_claiming_a_delivery(home):
+    # the fixture journal has no canary: nothing has proven the channel, and silence is not proof
+    _publish(home)
+    _heartbeat(home, 10)
+    t = _strip(server.assemble_snapshot(_config(home), now=NOW, gh_mod=_Gh()))
+    assert t["texts"]["state"] in ("unproven", "stale")
+    assert "last text delivered" not in t["texts"]["text"]
