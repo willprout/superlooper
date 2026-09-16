@@ -16,7 +16,10 @@ Design commitments (all bought in prior runs, all tested):
   * No mutation of any input, no module-level mutable state: same inputs -> same output, twice.
   * NOTIFY IS A STANDING RULE (owner directive), NIGHT-BATCHED (issue #164): every new systemic
     ALERT (runner/auth dead, whole queue stalled) and every freeze emits {"act": "notify"} at any
-    hour — that is the safety layer, never quieted. A routine owner-DECISION hand-back (park /
+    hour — that is the safety layer, never quieted. An ALERT pages only while there is WORK TO
+    SERVE (issue #494, work_demand): an idle loop's ALERT is recorded, not texted, and pages the
+    moment work appears while it still stands; its recovery texts 🟢 only after a DELIVERED 🔴.
+    A routine owner-DECISION hand-back (park /
     bounce / durable question) pages immediately during the DAY, but during quiet hours (config
     `notify.quiet_hours`, default 21:00–08:00) it is BATCHED to the morning report instead: the
     ACTION still fires (state settles, the journal + morning report list it), only the page waits.
@@ -1338,6 +1341,114 @@ def territory_claims_from(issues_state):
     return out
 
 
+# The labels that say an issue has been HANDED BACK — a park, a bounce, a posted question. Their owner
+# text already went out, and the loop does nothing with the issue until the owner answers.
+HANDBACK_LABELS = frozenset({"parked", "needs-owner", "needs-william", "awaiting-answer"})
+
+
+def work_demand(parsed_issues, issues_state, closed_nums):
+    """Is there work the loop is trying to do? THE demand predicate for owner pages (issue #494):
+    every systemic 🔴 — decide's ALERT page, the runner's own wedge and boot-hold pages, and the
+    watchdog's runner-down pages — goes out only while this is True. Owner ruling 2026-09-16: an idle
+    loop is silent whatever breaks; the moment demand appears and the loop still cannot serve it is
+    the page.
+
+    Demand is either of:
+      * an APPROVED issue eligible to launch — `agent-ready` and `issues.eligible` (a valid type, no
+        label conflict, every `blocked-by` closed). The owner answering a question and re-approving a
+        park are both this same verb, so both count;
+      * an IN-PROGRESS lane — an in-flight or finishing status on disk (running / frozen / exited /
+        gating / holding), which holds even when this tick's GitHub view came back empty, or an
+        `in-progress` label on an issue the loop has not settled.
+
+    NOT demand: a worker stopped on an owner question and a parked / bounced / needs-owner issue —
+    their 🟠 was already sent and the loop does nothing until the owner answers — including when the
+    view still shows a label the settled hand-back has since removed; and a stray label on merged work.
+    (A hand-back whose label move is still RETRYING has not settled its status yet, so it still reads
+    as the running or approved issue it was — which is what keeps park_label_stuck paging.)
+
+    Pure and total: wrong-typed input reads as no demand from that input and never raises."""
+    ist_map = _dget(issues_state, "issues", dict)
+    for iid, ist in ist_map.items():
+        if _iid_num(iid) is not None and _status_of(ist) in TERRITORY_CLAIM_STATUSES:
+            return True
+    try:
+        closed = set(closed_nums) if isinstance(closed_nums, (set, frozenset, list, tuple)) else set()
+    except TypeError:                                  # an unhashable member: nothing reads as closed
+        closed = set()
+    for p in parsed_issues if isinstance(parsed_issues, (list, tuple)) else []:
+        num = p.get("num") if isinstance(p, dict) else None
+        if type(num) is not int or num <= 0 or not isinstance(p.get("labels"), (list, tuple)):
+            continue
+        labels = {x for x in p["labels"] if isinstance(x, str)}
+        status = _status_of(ist_map.get(f"i{num}"))
+        if "agent-ready" in labels:
+            if status != "merged" and issues_mod.eligible(p, closed, False):
+                return True
+        elif ("in-progress" in labels and not labels & HANDBACK_LABELS
+              and status not in TERMINAL_STATUSES and status != "awaiting_answer"):
+            return True
+    return False
+
+
+def published_work_demand(published_view, issues_state):
+    """work_demand read from the runner's last PUBLISHED GitHub view (state/gh_view.json) — for the
+    moments the live view is not in hand: a runner before its first poll lands (held at boot, or
+    restarted into a GitHub outage), or the watchdog when GitHub will not answer it. Returns None when
+    the document is no evidence — no readable issue map, or no `polled_at`: a runner that never saw
+    GitHub answer publishes an EMPTY map that means "unknown", not "nothing is waiting" — so each
+    caller decides which way an unknowable reading falls."""
+    doc = published_view if isinstance(published_view, dict) else {}
+    raw = doc.get("issues")
+    if not isinstance(raw, dict) or not _real(doc.get("polled_at")):
+        return None
+    parsed = [issues_mod.parse_issue(r) for r in raw.values() if isinstance(r, dict)]
+    return work_demand(parsed, issues_state, doc.get("closed_nums"))
+
+
+def _alert_pages(reasons, alert_on_disk, demand):
+    """Who hears about this tick's ALERT reasons (issue #494) — the page bookkeeping, kept apart from
+    the reasons themselves, which are raised exactly as before whether or not anyone is texted.
+
+    The durable ALERT carries two records beside its reasons:
+      paged      the reasons a 🔴 has already been SENT for in this episode (the page's dedup);
+      delivered  the reasons whose 🔴 actually reached the phone — written by the notify executor on
+                 a delivered send, never here, because only the send knows.
+
+    Returns {"paged", "delivered", "down", "recovered", "rewrite"}:
+      * `rewrite` — the ALERT's record differs from what is on disk (read with the legacy rule
+        below), so the `alert` act must write it;
+      * `down` — send ONE 🔴 naming every current reason: there is demand and some reason has not
+        been paged yet. That covers a new reason, and a standing one whose demand has only now
+        appeared. A reason set that merely shrank pages nothing.
+      * `recovered` — the delivered reasons that are gone: exactly the 🟢 to send, sent whatever the
+        demand, because it closes a 🔴 already on the phone. A silent episode recovers silently.
+        A 🟢 names only a reason whose own 🔴 was delivered — no inference that a reason leaving as
+        another arrives is "the same outage renamed": when that is so, the new name's 🔴 and the old
+        name's 🟢 (whose ask names what still stands) say exactly what happened, in that order.
+
+    An ALERT with no `paged` record was written by an engine that texted every reason it wrote, so
+    its reasons read as already paged (no duplicate 🔴 on the upgrade restart); with no `delivered`
+    record nothing is known to have arrived, so its recovery sends no 🟢."""
+    prev = alert_on_disk if isinstance(alert_on_disk, dict) else {}
+    prev_reasons = [r for r in _dget(prev, "reasons", list) if isinstance(r, str)]
+    raw_paged = prev.get("paged") if "paged" in prev else prev_reasons
+    paged = {r for r in raw_paged if isinstance(r, str)} if isinstance(raw_paged, list) else set()
+    was_delivered = {r for r in _dget(prev, "delivered", list) if isinstance(r, str)}
+    current = set(reasons)
+    recovered = sorted(was_delivered - current)
+    delivered = was_delivered & current
+    was_paged = sorted(paged)
+    paged &= current
+    down = bool(demand) and bool(current - paged)
+    if down:
+        paged = set(current)
+    return {"paged": sorted(paged), "delivered": sorted(delivered), "down": down,
+            "recovered": recovered,
+            "rewrite": (prev_reasons != sorted(current) or was_paged != sorted(paged)
+                        or sorted(was_delivered) != sorted(delivered))}
+
+
 def _issues_state_corrupt_for_launches(issues_state):
     """True when persisted issue state is structurally unreadable enough that fresh launches must
     stop. Missing state is a cold start and is allowed; present-but-wrong-typed state could hide a
@@ -1608,14 +1719,20 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                                  # held out of THIS tick's launch phase, like reapproved_now, so the
                                  # gate re-claims the lane rather than a fresh session rebuilding it
 
-    def notify(tier, headline, ask, caller, num=None):
+    def notify(tier, headline, ask, caller, num=None, pages=None):
         # decide() never composes a text (issue #493). It names a TIER from the closed set, a
         # one-clause headline, the ask (the memo or runbook — the doorway cuts it to fit and journals
         # the overflow) and the issue it concerns; the runner's executor renders the text through
         # notify.render, the one doorway. `title` repeats the headline for the journal's existing
         # readers, which render a notify record by its title; nothing sends it.
-        out.append({"act": "notify", "tier": tier, "headline": headline, "title": headline,
-                    "ask": ask, "url": _config.issue_url(cfg, num), "caller": "decide:" + caller})
+        # `pages` (issue #494) names the ALERT reasons a systemic 🔴 carries: the executor records
+        # them as DELIVERED on the ALERT only when the send reaches the phone, which is what later
+        # earns their recovery a 🟢.
+        act = {"act": "notify", "tier": tier, "headline": headline, "title": headline,
+               "ask": ask, "url": _config.issue_url(cfg, num), "caller": "decide:" + caller}
+        if pages is not None:
+            act["pages"] = list(pages)
+        out.append(act)
 
     def ist_of(iid):
         v = ist_map.get(iid)
@@ -2191,16 +2308,30 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     # rather than a corner. Duplicates were structurally impossible before that second
     # detector existed, which is why plain sort() was enough until now.
     reasons = sorted(set(reasons))
+    # WHO HEARS ABOUT IT (issue #494). Everything above decides what the ALERT says, and it says it
+    # whether or not anyone is waiting: the dashboard, `status` and the morning report read the file,
+    # and a held queue still reads as held. Only the TEXT waits for demand — work the loop is trying
+    # to do — and a 🟢 goes out only for a 🔴 that reached the phone. See _alert_pages.
+    # Until this runner's first poll lands it has no parsed view at all, so the runner reads demand
+    # from the view it published before and hands the answer in (`unpolled_demand`, only then).
+    demand = work_demand(plist, issues_state, closed_nums) or dsk.get("unpolled_demand") is True
+    pages = _alert_pages(reasons, alert_on_disk, demand)
     if reasons:
         existing = alert_on_disk.get("reasons") if alert_on_disk else None
-        if existing != reasons:
-            out.append({"act": "alert", "reasons": reasons})
+        if existing != reasons or pages["rewrite"]:
+            out.append({"act": "alert", "reasons": reasons, "paged": pages["paged"],
+                        "delivered": pages["delivered"]})
+        if pages["down"]:
             # ONE headline naming every reason; the per-reason runbooks ride as the ask, which the
             # doorway cuts to the cap (issue #493) — they stay whole in this journaled act.
             notify(_notify.DOWN, "ALERT: " + ", ".join(reasons),
-                   "; ".join(_alert_message(r) for r in reasons), "alert")
+                   "; ".join(_alert_message(r) for r in reasons), "alert", pages=reasons)
     elif alert_on_disk:
         out.append({"act": "clear_alert"})
+    if pages["recovered"]:
+        notify(_notify.RECOVERED, "cleared: " + ", ".join(pages["recovered"]),
+               ("still standing: " + ", ".join(reasons)) if reasons else
+               "nothing else is down — the loop is serving its work again", "alert_cleared")
 
     # ---- fail-open episode journaling (issue #46), bounded to ONE record per episode ----
     # The dark-meter episode IS the usage_stale-alert episode, so the ALERT-on-disk's usage_stale

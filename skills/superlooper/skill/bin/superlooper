@@ -4623,7 +4623,8 @@ def cmd_upkeep(args):
 # `superlooper watchdog` is ONE mechanical health check — the unattended-debugger fallback.
 # No LLM call exists anywhere on this path and it makes no repair decisions: it reads the
 # engine's own signals (state/runner.heartbeat, state/ALERT, the no-progress shape), and per
-# lib/watchdog.py's episode rules notifies -> waits the grace -> launches ONE sl-debugger
+# lib/watchdog.py's episode rules journals (and, only for what the runner cannot text itself and
+# only while there is work waiting — issue #494, texts) -> waits the grace -> launches ONE sl-debugger
 # session through the SAME launcher workers use (launch-session.py --cwd,
 # never a headless `claude -p` — owner billing rule). Run it on an interval via
 # templates/launchd.watchdog.plist (it may run under launchd: a check needs no cmux pane;
@@ -4871,19 +4872,60 @@ def _watchdog_gh_view(cfg, st):
     gh_ok is False when the view is UNOBSERVABLE, so the caller FREEZES the clocks instead of
     reading a refusal as 'nothing eligible': the probe is down, OR (the #92 trap) the probe
     SUCCEEDS but a list read is REFUSED — read-health `ok` distinguishes that from a genuine
-    empty answer (the #21/#61 contract). A clean answered-empty read is observable (gh_ok True)."""
+    empty answer (the #21/#61 contract). A clean answered-empty read is observable (gh_ok True).
+    The third value hands the answered reads — (parsed agent-ready issues, closed set), or None when
+    unobservable — to _watchdog_demand (issue #494), so a demand reading never repeats them."""
     import actions
     import watchdog as watchdog_lib
     if not gh.probe():
-        return False, []
+        return False, [], None
     ready = gh.ready_issues_health()
     closed = gh.closed_issue_nums_health()
     if not ready.ok or not closed.ok:
-        return False, []                    # probe ok but a read REFUSED -> unobservable
+        return False, [], None              # probe ok but a read REFUSED -> unobservable
     parsed = [issues_lib.parse_issue(r) for r in ready.value]
     lane_state = actions.lane_state_from(st)
     claims = actions.territory_claims_from(st)
-    return True, watchdog_lib.launchable_nums(parsed, lane_state, cfg, closed.value, claims)
+    return (True, watchdog_lib.launchable_nums(parsed, lane_state, cfg, closed.value, claims),
+            (parsed, closed.value))
+
+
+def _watchdog_demand(cfg, st, state_dir, lanes_busy, eligible, needed, answered=None):
+    """Is there work the loop is trying to do? actions.work_demand, read for the watchdog's owner
+    texts (issue #494) — every runner-down 🔴 waits for it; resurrection never does. Cheapest proof
+    first: a busy lane or launchable work this check already read, then an in-flight lane on disk.
+    Past that, GitHub is asked only when a text could depend on the answer (`needed`) — the approved
+    queue, the in-progress list and the closed set, all three answering (`answered` carries the
+    first and third when this check's eligibility read already made them). When GitHub will not
+    answer, the runner's last published view stands in; when there is no readable view either,
+    demand is unknowable and the reading fails toward the page."""
+    import actions
+    if lanes_busy or eligible or actions.work_demand([], st, None):
+        return True
+    if not needed:
+        return False
+    if answered is not None or gh.probe():
+        if answered is None:
+            ready = gh.ready_issues_health()
+            closed = gh.closed_issue_nums_health()
+            answered = ([issues_lib.parse_issue(r) for r in ready.value], closed.value) \
+                if ready.ok and closed.ok else None
+        flying = gh.open_issues_health("in-progress") if answered is not None else None
+        if answered is not None and flying.ok:
+            parsed = list(answered[0]) + [issues_lib.parse_issue(r) for r in flying.value]
+            return actions.work_demand(parsed, st, answered[1])
+    published = actions.published_work_demand(
+        _read_json_file(os.path.join(state_dir, "gh_view.json"), None), st)
+    return True if published is None else published
+
+
+def _watchdog_runner_paged(state_dir):
+    """The reasons the RUNNER has delivered a 🔴 about itself (state/runner_paged.json, issue #494),
+    or None. It stands until a runner tick completes; the pure core reads it so a wedge the runner has
+    already texted is not texted a second time as a stale heartbeat."""
+    rec = _read_json_file(os.path.join(state_dir, "runner_paged.json"), None)
+    reasons = rec.get("reasons") if isinstance(rec, dict) else None
+    return reasons if isinstance(reasons, list) else None
 
 
 def _watchdog_usage_exhausted():
@@ -5110,10 +5152,13 @@ def _watchdog_resurrect(repo, cfg, home, state_dir, resurrect):
     return r.returncode
 
 
-def _send_watchdog_texts(cfg, home, entries):
+def _send_watchdog_texts(cfg, home, entries, state):
     """Render each watchdog text through the one doorway (issue #493) and send it. The pure core
     hands over tier/headline/ask/caller as data; an entry the renderer refuses (no closed tier) is
-    printed as refused and never sent unshaped — a notification must not abort the check."""
+    printed as refused and never sent unshaped — a notification must not abort the check.
+    Returns `state` with every DELIVERED entry recorded (issue #494, watchdog.record_delivered): a
+    🔴 that reached the phone is what earns its recovery a 🟢, so the record rides the same save."""
+    import watchdog as watchdog_lib
     for n in entries:
         try:
             text = notify.render(cfg, n.get("tier"), n.get("headline"), ask=n.get("ask"),
@@ -5121,7 +5166,11 @@ def _send_watchdog_texts(cfg, home, entries):
         except ValueError as e:
             print(f"notify: refused: {e}")
             continue
-        print(f"notify: {notify.send(cfg, text, home=home)}")
+        outcome = notify.send(cfg, text, home=home)
+        print(f"notify: {outcome}")
+        if notify.delivered(outcome):
+            state = watchdog_lib.record_delivered(state, n)
+    return state
 
 
 def cmd_watchdog(args):
@@ -5153,23 +5202,26 @@ def cmd_watchdog(args):
         hb_fresh = isinstance(heartbeat, int) and now - heartbeat <= stale_secs
         # The gh eligibility read + usage read are spent only when they can matter: a stale
         # heartbeat is already the louder signal, and a busy lane is progress by definition.
-        gh_ok, eligible = (False, [])
+        gh_ok, eligible, answered = (False, [], None)
         if hb_fresh and not lanes_busy:
-            gh_ok, eligible = _watchdog_gh_view(cfg, st)
+            gh_ok, eligible, answered = _watchdog_gh_view(cfg, st)
         usage_exhausted = bool(eligible) and _watchdog_usage_exhausted()
+        state_path = os.path.join(state_dir, watchdog_lib.STATE_FILENAME)
+        prior = watchdog_lib.coerce_state(_read_json_file(state_path, None))
+        kill_switch = os.path.exists(os.path.join(state_dir, watchdog_lib.KILL_SWITCH_FILENAME))
+        stopped_by_owner = _watchdog_stopped(state_dir)
 
         view = {"heartbeat": heartbeat, "alert": alert, "lanes_busy": lanes_busy,
                 "gh_ok": gh_ok, "eligible_nums": eligible,
                 "usage_exhausted": usage_exhausted,
-                "kill_switch": os.path.exists(
-                    os.path.join(state_dir, watchdog_lib.KILL_SWITCH_FILENAME)),
+                "kill_switch": kill_switch,
                 "debugger_live": _watchdog_debugger_live(state_dir),
                 # The owner's own off switch (issue #239). Read HERE, in the view, so there is
                 # exactly ONE place the decision is made — the pure evaluate() — rather than a
                 # second guard down in the executor that could disagree with it. The read sits as
                 # late as the view is built and evaluate() is pure, so the window between "the
                 # marker lands" and "we act" is arithmetic, not I/O.
-                "stopped_by_owner": _watchdog_stopped(state_dir),
+                "stopped_by_owner": stopped_by_owner,
                 # WHEN this runner started, so a heartbeat it inherited from the previous process
                 # is not read as its own silence. Nothing stamps the heartbeat at boot.
                 "runner_started_at": runner_started_at,
@@ -5177,16 +5229,24 @@ def cmd_watchdog(args):
                 # core honours the marker only when this is False, so a runner still up — because
                 # the stop timed out on a long tick, or the bootout failed — is still watched.
                 "runner_live": runner_live,
-                "runner_dead": runner_dead}
-        state_path = os.path.join(state_dir, watchdog_lib.STATE_FILENAME)
-        prior = watchdog_lib.coerce_state(_read_json_file(state_path, None))
+                "runner_dead": runner_dead,
+                # The runner's own delivered pages (issue #494): a wedge it has already texted is
+                # not texted again as a stale heartbeat.
+                "runner_paged": _watchdog_runner_paged(state_dir),
+                # Is there work to serve (issue #494)? Every runner-down 🔴 waits for it. GitHub is
+                # asked only when a text could turn on the answer: never under the kill switch or a
+                # stop that took (both text nothing), and not on a healthy check with no ALERT and no
+                # open episode, which can page only no_progress — whose launchable work IS demand.
+                "demand": _watchdog_demand(
+                    cfg, st, state_dir, lanes_busy, eligible, answered=answered,
+                    needed=not kill_switch and not (stopped_by_owner and not runner_live) and (
+                        (heartbeat is not None and not hb_fresh) or alert is not None
+                        or prior.get("episode") is not None))}
 
         res = watchdog_lib.evaluate(now, cfg, view, prior)
         for rec in res["journal"]:
             journal.append(home, rec, now)
-        _send_watchdog_texts(cfg, home, res["notify"])
-
-        final = res["state"]
+        final = _send_watchdog_texts(cfg, home, res["notify"], res["state"])
         resurrect_rc = None
         # Runner resurrection (issue #208): a provably-gone runner is RESTARTED before any debugger
         # is hired for a wedge — a corpse needs restarting, not diagnosing. The attempt was already
@@ -5199,11 +5259,11 @@ def cmd_watchdog(args):
             # restart that still burned a slot is recoverable, a storm is not.
             loopstate.save(state_path, final)
             resurrect_rc = _watchdog_resurrect(args.repo, cfg, home, state_dir, res["resurrect"])
-            done = watchdog_lib.after_resurrect(now, cfg, final, res["resurrect"], resurrect_rc)
+            done = watchdog_lib.after_resurrect(now, cfg, final, res["resurrect"], resurrect_rc,
+                                                demand=view["demand"])
             for rec in done["journal"]:
                 journal.append(home, rec, now)
-            _send_watchdog_texts(cfg, home, done["notify"])
-            final = done["state"]
+            final = _send_watchdog_texts(cfg, home, done["notify"], done["state"])
         # A provably-gone runner past the rolling-hour cap: no resurrect emitted. Read the RAW
         # provably-gone fact from evaluate(), NOT the journal: the escalation record is deduped to
         # once per capped streak, so every later capped check journals nothing and the summary read
@@ -5211,11 +5271,11 @@ def cmd_watchdog(args):
         capped = bool(res.get("runner_down")) and res.get("resurrect") is None
         if res["launch"] is not None:
             rc = _watchdog_launch(args.repo, cfg, home, state_dir, res["launch"], final)
-            done = watchdog_lib.after_launch(now, cfg, final, res["launch"], rc)
+            done = watchdog_lib.after_launch(now, cfg, final, res["launch"], rc,
+                                             demand=view["demand"])
             for rec in done["journal"]:
                 journal.append(home, rec, now)
-            _send_watchdog_texts(cfg, home, done["notify"])
-            final = done["state"]
+            final = _send_watchdog_texts(cfg, home, done["notify"], done["state"])
 
         loopstate.save(state_path, final)
         ep = final.get("episode")

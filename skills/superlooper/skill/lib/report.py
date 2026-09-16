@@ -511,6 +511,28 @@ def _watchdog(records, window_start):
     return lines
 
 
+def _watchdog_countdowns(records, window_start):
+    """Every watchdog episode OPENING with its debugger-launch countdown (issue #494). The countdown
+    used to ride the owner's text; the runner owns ALERT texts now and a runner-down page waits for
+    work to serve, so the report file is where the countdown is read. Deliberately NOT a quiet-
+    breaker: an episode that stood down launched nothing (see _watchdog). Only records that carry
+    the countdown render — an older record has nothing to say here."""
+    lines = []
+    for r in records:
+        if (r.get("act") != "watchdog" or r.get("outcome") != "notified"
+                or not _in_window(r, window_start) or "launch_due_at" not in r):
+            continue
+        sigs = ", ".join(s for s in (r.get("signals") or []) if isinstance(s, str)) \
+            or "(signal unrecorded)"
+        grace = r.get("grace_seconds")
+        due = (f"{int(grace) // 60} min later" if isinstance(grace, (int, float))
+               and not isinstance(grace, bool) and grace >= 0 else "after its grace")
+        lines.append(f"- Watchdog episode opened on {sigs} — an unattended sl-debugger was due {due} "
+                     f"(authority: {r.get('authority')}) unless the signal cleared; "
+                     + ("texted." if r.get("texted") is True else "not texted."))
+    return lines
+
+
 def _resurrection(records, window_start):
     """Runner resurrection activity (issue #208): every automatic RESTART of a provably-gone runner —
     succeeded, failed, or cap-paused — reaches the owner's morning surface. The runner going down and
@@ -1013,6 +1035,7 @@ def morning(journal_records, gh_view, ledger, config):
     regens = _regenerations(records, week_start)
     wanders = _wanders(records, overnight_start)
     watchdog = _watchdog(records, overnight_start)
+    countdowns = _watchdog_countdowns(records, overnight_start)   # never a quiet-breaker (#494)
     resurrections = _resurrection(records, overnight_start)     # runner auto-restarts (#208)
     questions, q_total = _questions(records, overnight_start)   # owner-question rate (#163)
     triage_lines = _triage(records, repo, overnight_start)      # the triage flight (#449)
@@ -1084,7 +1107,8 @@ def morning(journal_records, gh_view, ledger, config):
         _section("Owner questions", questions, "None — no worker needed an owner decision."),
         _section("Conflict regenerations (last 7 days)", regens),
         _section("Wanders", wanders),
-        _section("Unattended debugger", watchdog, "None — the watchdog launched nothing."),
+        _section("Unattended debugger", countdowns + watchdog,
+                 "None — the watchdog launched nothing."),
         _section("Runner resurrection", resurrections, "None — the runner did not go down."),
         # SILENT on a day with no flight (the list is empty, so no heading at all) — unlike every
         # section above, which renders its own "None." line. A delegation that did not fly is not a

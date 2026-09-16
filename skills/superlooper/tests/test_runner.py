@@ -469,10 +469,170 @@ def test_boot_migration_hold_texts_down_through_the_doorway(rig, tmp_path):
     marker = tmp_path / "held.txt"
     rig.r.config["notify"]["cmd"] = f'printf "%s|%s" {{title}} {{body}} > {marker}'
     rig.r.config["notify"]["machine_label"] = "mini"
+    seed_issue(rig, "i5", status="running")            # work in flight: the hold is worth a page
     rig.r._hold_boot_migration([("create", "awaiting-answer")], NOW)
     title, body = marker.read_text().split("|", 1)
     assert title == "🔴 r@mini · HELD — a repo migration could not be applied"
     assert "awaiting-answer" in body and body.count("\n") <= 1
+    alert = _alert(rig)                                # ...and the page is on the record: paged on
+    assert alert["paged"] == alert["reasons"] and alert["delivered"] == []   # the ALERT, delivered in
+    own = json.loads((rig.home / "state" / "runner_paged.json").read_text())  # the runner's own record
+    assert own["reasons"] == alert["reasons"]
+
+
+# --------------------------- owner pages need work to serve (issue #494) ---------------------------
+
+def _seed_published_view(rig, *issues):
+    """state/gh_view.json as the runner last published it: the raw issue rows of its last poll."""
+    loopstate.save(str(rig.home / "state" / "gh_view.json"),
+                   {"issues": {f"i{i['number']}": i for i in issues}, "closed_nums": [],
+                    "polled_at": NOW - 600})
+
+
+def test_boot_migration_hold_on_an_idle_loop_records_the_alert_and_texts_nothing(rig, tmp_path):
+    marker = tmp_path / "held.txt"
+    rig.r.config["notify"]["cmd"] = f'printf x > {marker}'
+    _seed_published_view(rig)                          # the last poll saw nothing waiting
+    rig.r._hold_boot_migration([("create", "awaiting-answer")], NOW)
+    alert = _alert(rig)
+    assert any("migration_hold" in r for r in alert["reasons"])     # the hold is still RECORDED
+    assert alert["paged"] == [] and alert["delivered"] == []
+    assert not marker.exists()
+
+
+def test_boot_migration_hold_with_no_published_view_fails_toward_the_page(rig, tmp_path):
+    # Nothing to read demand from (a state home whose runner never published a polled view) is
+    # unknowable, and unknowable pages — the same direction the watchdog takes.
+    marker = tmp_path / "held.txt"
+    rig.r.config["notify"]["cmd"] = f'printf x > {marker}'
+    rig.r._hold_boot_migration([("create", "awaiting-answer")], NOW)
+    assert marker.exists()
+
+
+def test_boot_migration_hold_reads_demand_from_the_last_published_view(rig, tmp_path):
+    # At boot the runner has not polled yet, so its demand reading is the view it last published.
+    marker = tmp_path / "held.txt"
+    rig.r.config["notify"]["cmd"] = f'printf x > {marker}'
+    _seed_published_view(rig, {"number": 9, "title": "t", "body": "",
+                          "labels": [{"name": "agent-ready"}, {"name": "type:build"}]})
+    rig.r._hold_boot_migration([("create", "awaiting-answer")], NOW)
+    assert marker.exists()
+
+
+def test_a_runner_restarted_into_a_github_outage_still_pages_for_the_queue_it_published(
+        rig, tmp_path, monkeypatch):
+    # Review P1: until a poll lands the runner has no parsed view, and its first tick REPUBLISHES
+    # gh_view.json with no issues — so demand is read from the view the previous process published,
+    # captured before this one overwrites it. Approved work was waiting; GitHub is down; that pages.
+    marker = tmp_path / "pings.txt"
+    rig.r.config["notify"]["cmd"] = f'printf "%s\\036" {{title}} >> {marker}'
+    _seed_published_view(rig, {"number": 9, "title": "t", "body": "",
+                               "labels": [{"name": "agent-ready"}, {"name": "type:build"}]})
+    monkeypatch.setenv("GH_FAIL", "1")
+    for k in range(runner_mod.actions.GH_ALERT_FAILURES + 2):
+        rig.r.tick(now=NOW + k * (runner_mod.GH_POLL_SECONDS + 1))
+    assert "gh_unreachable" in _alert(rig)["reasons"]
+    reds = [t for t in marker.read_text().split("\036") if t.startswith("🔴")]
+    assert len(reds) == 1 and "gh_unreachable" in reds[0]
+    view = json.loads((rig.home / "state" / "gh_view.json").read_text())
+    assert view["polled_at"] is None                   # the blanked republish is not evidence
+
+
+def test_a_runner_restarted_into_a_github_outage_with_nothing_queued_stays_silent(
+        rig, tmp_path, monkeypatch):
+    marker = tmp_path / "pings.txt"
+    rig.r.config["notify"]["cmd"] = f'printf "%s\\036" {{title}} >> {marker}'
+    _seed_published_view(rig)                          # the last poll saw no work at all
+    monkeypatch.setenv("GH_FAIL", "1")
+    for k in range(runner_mod.actions.GH_ALERT_FAILURES + 2):
+        rig.r.tick(now=NOW + k * (runner_mod.GH_POLL_SECONDS + 1))
+    assert "gh_unreachable" in _alert(rig)["reasons"]
+    texts = marker.read_text().split("\036") if marker.exists() else []
+    assert not [t for t in texts if t.startswith("🔴")]
+
+
+def _texts_in(marker):
+    return [t for t in (marker.read_text() if marker.exists() else "").split("\036")
+            if t and not t.startswith("☀️")]
+
+
+def test_a_wedge_page_is_closed_by_a_clean_tick_never_by_a_decide_that_then_crashes(rig, tmp_path):
+    # Review P1: decide owns no runner_tick_errors reason, so any tick on which decide RUNS clears
+    # the wedge ALERT — including a tick that crashes right after. The 🟢 for the runner's own page
+    # therefore belongs to the one moment that proves recovery: a tick that completes.
+    marker = tmp_path / "pings.txt"
+    rig.r.config["notify"]["cmd"] = f'printf "%s\\036" {{title}} >> {marker}'
+    seed_issue(rig, "i5", status="running")
+    real_tick = rig.r.tick
+    rig.r.tick = _raising_tick(ValueError("boom"))
+    rig.r.run(max_ticks=5, sleep=lambda s: None)
+    assert [t[:1] for t in _texts_in(marker)] == ["🔴"]
+    assert (rig.home / "state" / "runner_paged.json").exists()          # the delivery, on disk
+    real_tick(now=NOW)                    # decide runs and clears the ALERT; the tick "then crashes"
+    assert _alert(rig) is None and [t[:1] for t in _texts_in(marker)] == ["🔴"]
+    rig.r.tick = real_tick
+    rig.r.run(max_ticks=1, sleep=lambda s: None)                          # a tick that completes
+    texts = _texts_in(marker)
+    assert [t[:1] for t in texts] == ["🔴", "🟢"] and "runner_tick_errors" in texts[1]
+    assert not (rig.home / "state" / "runner_paged.json").exists()
+    rig.r.run(max_ticks=1, sleep=lambda s: None)
+    assert len(_texts_in(marker)) == 2                                    # one 🟢, not one per tick
+
+
+def test_the_runners_own_alert_keeps_the_page_record_it_overwrites(rig):
+    # Review P2: the wedge and boot-hold ALERT writes replace the reasons, but a 🔴 already delivered
+    # for a standing reason must not be forgotten — or its 🟢 never comes and it is paged twice.
+    loopstate.save(str(rig.home / "state" / "ALERT"),
+                   {"reasons": ["usage_stale"], "since": NOW, "paged": ["usage_stale"],
+                    "delivered": ["usage_stale"]})
+    _seed_published_view(rig)
+    rig.r._raise_tick_error_alert(4)
+    alert = _alert(rig)
+    assert alert["reasons"] == ["runner_tick_errors:4"]
+    assert alert["paged"] == ["usage_stale"] and alert["delivered"] == ["usage_stale"]
+
+
+def test_exec_alert_writes_the_page_record_and_keeps_the_episode_start(rig):
+    path = rig.home / "state" / "ALERT"
+    rig.r._exec_alert({"act": "alert", "reasons": ["usage_stale"], "paged": [],
+                       "delivered": []}, NOW)
+    assert _alert(rig) == {"reasons": ["usage_stale"], "since": NOW, "paged": [], "delivered": []}
+    # demand appears: the SAME reasons are re-written only to record the page — the hold's start
+    # time (which the morning report and `status` age from) must not move
+    rig.r._exec_alert({"act": "alert", "reasons": ["usage_stale"], "paged": ["usage_stale"],
+                       "delivered": []}, NOW + 500)
+    assert _alert(rig)["since"] == NOW and _alert(rig)["paged"] == ["usage_stale"]
+    rig.r._exec_alert({"act": "alert", "reasons": ["gh_unreachable", "usage_stale"],
+                       "paged": ["gh_unreachable", "usage_stale"], "delivered": []}, NOW + 900)
+    assert _alert(rig)["since"] == NOW + 900                         # a changed set is a new since
+    assert path.exists()
+
+
+def test_exec_notify_records_a_delivered_page_and_not_a_failed_one(rig, tmp_path):
+    loopstate.save(str(rig.home / "state" / "ALERT"),
+                   {"reasons": ["usage_stale"], "since": NOW, "paged": ["usage_stale"],
+                    "delivered": []})
+    act = {"act": "notify", "tier": "down", "headline": "ALERT: usage_stale", "ask": "x",
+           "url": None, "caller": "decide:alert", "pages": ["usage_stale"]}
+    rig.r.config["notify"]["cmd"] = "exit 3"
+    assert rig.r._exec_notify(act, NOW).startswith("cmd notify failed")
+    assert _alert(rig)["delivered"] == []             # never reached the phone: nothing to close later
+    rig.r.config["notify"]["cmd"] = f"printf x > {tmp_path / 'ok.txt'}"
+    assert rig.r._exec_notify(act, NOW).startswith("sent via cmd")
+    assert _alert(rig)["delivered"] == ["usage_stale"]
+    assert _alert(rig)["since"] == NOW
+
+
+def test_a_delivered_page_is_closed_by_one_green_when_the_tick_recovers(rig, tmp_path):
+    marker = tmp_path / "pings.txt"
+    rig.r.config["notify"]["cmd"] = f'printf "%s\\036" {{title}} >> {marker}'
+    loopstate.save(str(rig.home / "state" / "ALERT"),
+                   {"reasons": ["runner_tick_errors:4"], "since": NOW, "paged": ["runner_tick_errors:4"],
+                    "delivered": ["runner_tick_errors:4"]})
+    rig.r.tick(now=NOW + 15)                          # the first clean tick: decide has no reasons
+    assert _alert(rig) is None
+    texts = [t for t in marker.read_text().split("\036") if t and not t.startswith("☀️")]
+    assert len(texts) == 1 and texts[0].startswith("🟢 r@") and "runner_tick_errors:4" in texts[0]
 
 
 # --------------------------- freeze ownership (Codex R2 C2) ---------------------------
@@ -5781,9 +5941,24 @@ def _raising_tick(exc):
     return _tick
 
 
+def test_consecutive_tick_crashes_on_an_idle_loop_record_the_alert_and_text_nothing(rig, tmp_path):
+    # issue #494: nothing queued, nothing running — a wedged runner is the owner's to fix when he
+    # next wants to build, and the ALERT says so on every surface he reads.
+    marker = tmp_path / "pings.txt"
+    rig.r.config["notify"]["cmd"] = f'printf x >> {marker}'
+    _seed_published_view(rig)                          # the last poll saw nothing waiting
+    rig.r.tick = _raising_tick(ValueError("boom"))
+    rig.r.run(max_ticks=6, sleep=lambda s: None)
+    alert = json.loads((rig.home / "state" / "ALERT").read_text())
+    assert any("tick" in r for r in alert["reasons"]) and alert["paged"] == []
+    assert not marker.exists()
+    assert [j for j in _journal(rig) if j.get("act") == "alert"]      # ...still journaled once
+
+
 def test_consecutive_tick_crashes_raise_alert_and_notify_once(rig, tmp_path):
     marker = tmp_path / "pings.txt"
     rig.r.config["notify"]["cmd"] = f'printf "%s\\n" {{title}} >> {marker}'
+    seed_issue(rig, "i5", status="running")            # a lane in flight: demand (issue #494)
     rig.r.tick = _raising_tick(
         UnicodeDecodeError("utf-8", _PNG_BYTES, 0, 1, "invalid start byte"))
     rig.r.run(max_ticks=6, sleep=lambda s: None)      # 6 crashes in a row
@@ -5863,6 +6038,7 @@ def test_read_json_is_none_only_when_the_file_is_absent(rig, tmp_path):
 def test_tick_error_alert_write_retries_until_it_lands(rig, tmp_path, monkeypatch):
     marker = tmp_path / "pings.txt"
     rig.r.config["notify"]["cmd"] = f'printf x >> {marker}'
+    seed_issue(rig, "i5", status="running")            # a lane in flight: demand (issue #494)
     rig.r.tick = _raising_tick(ValueError("boom"))
     real_save, calls = runner_mod.loopstate.save, {"alert": 0}
     def flaky_save(path, data):
@@ -7364,6 +7540,7 @@ def test_boot_migration_that_raises_holds_and_notifies_once_not_a_storm(rig, mon
     # Booting is held, so the loop NEVER ticks (no heartbeat) and the owner is notified exactly
     # ONCE — never the ~15-text storm a failing per-tick write produces.
     _set_repo_labels(rig, ["agent-ready", "in-progress", "parked"])       # needs-owner missing
+    seed_issue(rig, "i5", status="running")        # work in flight, so the hold pages (issue #494)
     def boom(*a, **k):
         raise RuntimeError("gh create_label exploded")
     monkeypatch.setattr(runner_mod.gh, "create_label", boom)

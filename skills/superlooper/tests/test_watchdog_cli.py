@@ -804,3 +804,124 @@ def test_a_runner_that_only_just_booted_is_not_diagnosed_on_the_old_heartbeat(tm
     # And it is not called HEALTHY either: a runner that has not stamped a tick is unproven, not
     # well. The summary a person reads has to be able to tell those apart.
     assert "booting" in r.stdout, r.stdout
+
+
+# ================== owner texts: one sender, only when there is work (issue #494) ==================
+# The CLI reads demand through actions.work_demand — lanes on disk, then GitHub (agent-ready +
+# in-progress + closed), then the runner's last published view when GitHub will not answer — hands
+# it to the pure core, and records each DELIVERED 🔴 in watchdog.json so a recovery can close it.
+
+def _texts_to(rig, tmp_path):
+    """Point notify at a file; return a reader of the texts sent, one entry per text."""
+    sent = tmp_path / "texts.log"
+    cfg_path = rig.repo / ".superlooper" / "config.json"
+    cfg = json.loads(cfg_path.read_text())
+    cfg["notify"] = {"machine_label": "mini",
+                     "cmd": f'printf "%s|%s\\036" "$SL_TITLE" "$SL_BODY" >> {sent}'}
+    cfg_path.write_text(json.dumps(cfg))
+    return lambda: [t for t in (sent.read_text() if sent.exists() else "").split("\036") if t]
+
+
+def _idle_github(rig):
+    """A GitHub with nothing approved and nothing in progress."""
+    (rig.fixdir / "issue_list.json").write_text("[]")
+
+
+def test_an_alert_only_check_opens_the_episode_and_texts_nothing(tmp_path):
+    rig = _Rig(tmp_path)
+    texts = _texts_to(rig, tmp_path)
+    rig.heartbeat(10)
+    (rig.home / "state" / "ALERT").write_text(json.dumps({"reasons": ["usage_stale"], "since": 1}))
+    r = rig.run()
+    assert r.returncode == 0, r.stderr
+    (rec,) = rig.wjournal()
+    assert rec["outcome"] == "notified" and rec["signals"] == ["alert"] and rec["texted"] is False
+    assert rec["launch_due_at"] > time.time()             # the countdown lives on the record
+    assert texts() == []                                  # the runner owns ALERT texts
+
+
+def test_a_dead_runner_on_an_idle_loop_is_restarted_and_nothing_is_texted(tmp_path):
+    rig = _Rig(tmp_path)
+    texts = _texts_to(rig, tmp_path)
+    _idle_github(rig)
+    rig.heartbeat(3600)
+    rig.runner_lock(999999)
+    rig.anchor()
+    failed = rig.run(STUB_RESURRECT_RC=2)
+    assert failed.returncode == 0, failed.stderr
+    assert len(rig.resurrect_calls()) == 1                # resurrection is never gated
+    ok = rig.run()
+    assert ok.returncode == 0, ok.stderr
+    assert [x["outcome"] for x in rig.rjournal()] == ["resurrect_failed", "resurrected"]
+    assert texts() == []
+
+
+def test_a_delivered_failed_restart_page_is_closed_by_the_restart_that_works(tmp_path):
+    rig = _Rig(tmp_path)                                  # the fixtures hold approved work
+    texts = _texts_to(rig, tmp_path)
+    rig.heartbeat(3600)
+    rig.runner_lock(999999)
+    rig.anchor()
+    assert rig.run(STUB_RESURRECT_RC=2).returncode == 0
+    assert [t.split("|")[0] for t in texts()] == ["🔴 r@mini · could NOT restart the runner"]
+    assert rig.wstate()["resurrection"]["down_delivered"] is True
+    assert rig.run().returncode == 0
+    assert [t.split("|")[0] for t in texts()][1:] == ["🟢 r@mini · runner was down — restarted it"]
+    assert rig.wstate()["resurrection"]["down_delivered"] is False
+
+
+def test_an_undelivered_page_is_not_recorded(tmp_path):
+    rig = _Rig(tmp_path)
+    cfg_path = rig.repo / ".superlooper" / "config.json"
+    cfg = json.loads(cfg_path.read_text())
+    cfg["notify"] = {"cmd": "exit 7"}                     # the channel refuses every send
+    cfg_path.write_text(json.dumps(cfg))
+    rig.heartbeat(3600)
+    rig.runner_lock(999999)
+    rig.anchor()
+    r = rig.run(STUB_RESURRECT_RC=2)
+    assert "notify: cmd notify failed" in r.stdout
+    assert rig.wstate()["resurrection"]["down_delivered"] is False
+
+
+def test_demand_falls_back_to_the_published_view_when_github_will_not_answer(tmp_path):
+    rig = _Rig(tmp_path)
+    texts = _texts_to(rig, tmp_path)
+    rig.heartbeat(3600)                                   # wedged-looking: a heartbeat_stale episode
+    view = rig.home / "state" / "gh_view.json"
+    view.write_text(json.dumps({"issues": {}, "closed_nums": [], "polled_at": time.time() - 900}))
+    assert rig.run(GH_FAIL="1").returncode == 0
+    assert texts() == []                                  # the last known view: nothing waiting
+    (rig.home / "state" / "watchdog.json").unlink()
+    view.write_text(json.dumps({"issues": {"i9": {"number": 9, "title": "t", "body": "",
+                                                  "labels": [{"name": "agent-ready"},
+                                                             {"name": "type:build"}]}},
+                                "closed_nums": [], "polled_at": time.time() - 900}))
+    assert rig.run(GH_FAIL="1").returncode == 0
+    assert [t.split("|")[0] for t in texts()] == ["🔴 r@mini · watchdog: heartbeat_stale"]
+
+
+def test_unknowable_demand_fails_toward_the_page(tmp_path):
+    rig = _Rig(tmp_path)
+    texts = _texts_to(rig, tmp_path)
+    rig.heartbeat(3600)
+    assert rig.run(GH_FAIL="1").returncode == 0           # no GitHub, no published view
+    assert len(texts()) == 1
+    # ...and a view published by a runner that never saw GitHub answer is no evidence either
+    (rig.home / "state" / "watchdog.json").unlink()
+    (rig.home / "state" / "gh_view.json").write_text(json.dumps(
+        {"issues": {}, "closed_nums": [], "polled_at": None}))
+    assert rig.run(GH_FAIL="1").returncode == 0
+    assert len(texts()) == 2
+
+
+def test_a_wedge_the_runner_already_texted_is_not_texted_again(tmp_path):
+    rig = _Rig(tmp_path)
+    texts = _texts_to(rig, tmp_path)
+    rig.heartbeat(3600)
+    rig.runner_lock(os.getpid(), age=3600)                # alive, up an hour, not ticking: wedged
+    (rig.home / "state" / "runner_paged.json").write_text(json.dumps(
+        {"reasons": ["runner_tick_errors:4"]}))
+    assert rig.run().returncode == 0
+    assert rig.wstate()["episode"]["signals"] == ["heartbeat_stale"]
+    assert texts() == []

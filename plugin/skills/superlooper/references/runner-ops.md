@@ -372,7 +372,8 @@ Sections:
 - **Conflict regenerations this week** — the tuning metric: if this climbs, tighten `affinity` or
   reduce `lanes`; if it's always zero, you can loosen. This is how you turn the parallelism dial.
 - **Wanders** — PRs whose actual diff touched areas the issue didn't declare in `touches:`.
-- **Unattended debugger** — every watchdog-launched sl-debugger session, verified or failed.
+- **Unattended debugger** — every watchdog-launched sl-debugger session, verified or failed, and
+  every watchdog episode's debugger countdown (which no longer goes to your phone).
   **Owner-tapped sessions are deliberately absent from this section** — see `superlooper debug`.
 - **Runner resurrection** — every automatic restart of a provably-gone runner.
 - **Gate health** — nightly pass rate, flake count, quarantine size.
@@ -553,9 +554,33 @@ until the browser suite exists — it's built with you first; the config just po
 
 The runner texts you via your Mac's own Messages app (config `notify.imessage_to`), falling back to
 `notify.cmd`, then the session host's own notify channel, then log-only. It fires on every
-transition to `parked` or `needs-owner`, every freeze, and every ALERT — the standing rule that
-long-running work finishing, stalling, or needing input reaches you (spec §2). A send failure is
-journaled, never fatal; notifications are a convenience layer, never a safety layer.
+transition to `parked` or `needs-owner`, every freeze, and every ALERT the loop can do something
+about — the standing rule that long-running work finishing, stalling, or needing input reaches you
+(spec §2). A send failure is journaled, never fatal; notifications are a convenience layer, never a
+safety layer.
+
+**A 🔴 means there is work waiting.** A "down" text goes out only while the loop has work it is
+trying to do: an approved (`agent-ready`) issue that is ready to launch, or an issue in progress. A
+worker stopped on your question and a parked issue don't count — you already got the 🟠 for those,
+and the loop does nothing with them until you answer. So an idle loop stays silent whatever breaks.
+The problem is still written down: `state/ALERT`, `superlooper status` and the dashboard show it,
+and a held queue still reads as held in the morning report. If work shows up later while the
+problem is still there, that is when the text goes out. The watchdog still restarts a dead runner
+when nothing is waiting — it just doesn't text you about it.
+
+**One sender for each problem.** The runner texts its own ALERTs. The watchdog texts only what the
+runner can't say about itself: the runner is wedged or dead, a restart failed, restarts hit the
+hourly cap, a debugger session couldn't launch, or approved work has sat unlaunched with every lane
+free. When the watchdog sees an ALERT it doesn't text you again, and when the runner has already
+texted you that its own ticks keep failing, the watchdog doesn't text the same wedge a second time
+as a stale heartbeat. Its countdown to launching a debugger is written to the journal and the
+morning report, not sent to your phone, and so is a debugger launch that worked.
+
+**A 🟢 only follows a 🔴 you got.** When something recovers (the usage meter reads again, auth works
+again, the fence is back up, the runner is back), you get a 🟢 only if the 🔴 for it actually
+reached you. If no 🔴 was sent, or the send failed, the recovery stays quiet too. Which 🔴s were
+delivered is saved to disk (`state/ALERT` for the runner, `state/watchdog.json` for the watchdog),
+so a restart doesn't forget.
 
 **What a text looks like.** Every text — from the runner, the watchdog, the nightly, the promotion
 report, the morning report and `doctor --stack` — is rendered by one doorway into at most three
@@ -702,15 +727,18 @@ a probe blip OR a refused list read), the clocks FREEZE and an open no_progress 
 not stood down: a gh blip cannot drop the episode and re-trip it (a duplicate text + a restarted
 grace) on recovery.
 
-**The flow.** First trip → one text (naming the signal, the grace, the authority tier) → the
-grace window (`watchdog.grace_minutes`, default 30) → if the signal still stands, ONE fresh
-sl-debugger session launches through the same interactive launch stack workers use (never a
-headless `claude -p`), its brief carrying the tripped signal and the standing `watchdog.authority`
-tier; the session follows the sl-debugger skill's `references/unattended-contract.md`. If the
-signal cleared meanwhile, it stands down SILENTLY (journal only). There is **no pane gate on this
-launch any more**: the session host's server creates the session's workspace, so there is no anchor
-to find and nothing to place — under a `login-item` runner none would resolve at all, and the old
-gate would have made every unattended repair fail at exactly the moment repair is needed.
+**The flow.** First trip → the episode opens, and its journal record carries the countdown (the
+grace, when the launch falls due, the authority tier), which the morning report lists → a 🔴 only
+for `heartbeat_stale` or `no_progress` and only while there is work waiting (see Notifications
+above; an `alert`-only episode is the runner's to text) → the grace window
+(`watchdog.grace_minutes`, default 30) → if the signal still stands, ONE fresh sl-debugger session
+launches through the same interactive launch stack workers use (never a headless `claude -p`), its
+brief carrying the tripped signal and the standing `watchdog.authority` tier; the session follows
+the sl-debugger skill's `references/unattended-contract.md`. If the signal cleared meanwhile, it
+stands down (journal), with a 🟢 only if the episode's 🔴 reached you. There is **no pane gate on
+this launch any more**: the session host's server creates the session's workspace, so there is no
+anchor to find and nothing to place — under a `login-item` runner none would resolve at all, and
+the old gate would have made every unattended repair fail at exactly the moment repair is needed.
 
 **Resurrection (issue #208).** A runner that is **provably gone** — heartbeat stale AND its
 recorded pid dead — is a corpse to restart, not a patient to diagnose, so the watchdog restarts it
@@ -726,9 +754,9 @@ morning report's "Runner resurrection" section.
 
 **Rails.** Singleton (a live `worker.d*.lock` blocks a second session, and concurrent checks
 yield on `state/watchdog.lock`); once-per-incident (a continuing episode never relaunches — a
-genuinely new episode after recovery may); failed launches retry at most 3× with ONE failure
-text; every transition is journaled (`act: "watchdog"`) and every launch — verified or failed —
-appears in the morning report's "Unattended debugger" section. **Kill-switch:**
+genuinely new episode after recovery may); failed launches retry at most 3× with at most ONE
+failure text; every transition is journaled (`act: "watchdog"`) and every launch — verified or
+failed — appears in the morning report's "Unattended debugger" section. **Kill-switch:**
 `touch <state-home>/state/WATCHDOG_OFF` — the check keeps observing and journaling but notifies and
 launches nothing; delete it to re-arm. Episode state lives in `state/watchdog.json`; deleting it
 resets the clocks (safe — the bounds simply restart).

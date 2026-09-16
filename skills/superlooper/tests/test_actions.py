@@ -6,7 +6,8 @@ Contract highlights under test:
   * decide is PURE and STATE-driven: same inputs -> same ordered action list; a cold restart
     (empty loopstate) reconstructs every in-flight decision from GitHub + disk alone.
   * Notify is a standing rule, asserted per scenario: EVERY transition to parked/needs-william,
-    EVERY freeze, EVERY alert must carry an {"act": "notify"} in the same tick's actions. A
+    EVERY freeze, EVERY alert must carry an {"act": "notify"} in the same tick's actions — an alert
+    only while there is work to serve (issue #494: an idle loop's alert is recorded, not texted). A
     scenario where one of these occurs without a notify FAILS.
   * The two proven defect classes are named and defended: shared mutable defaults (decide must
     never mutate its inputs or share state across calls) and fail-OPEN on wrong-TYPED input
@@ -4193,6 +4194,13 @@ def test_a_stale_view_still_escalates_rather_than_suppressing_on_an_unproven_clo
     assert len(a) == 1 and "park_label_stuck:i7" in a[0]["reasons"]
 
 
+def _carried_alert(act, since):
+    """state/ALERT as the runner's `alert` executor writes it: the reasons AND the page record
+    (issue #494) the act carries, so a flap test sees exactly what the next tick would read."""
+    return {"reasons": act["reasons"], "since": since, "paged": act.get("paged", []),
+            "delivered": act.get("delivered", [])}
+
+
 def _ticks(d, views, n=60, issues=lambda k: [parsed(5)]):
     """Run n consecutive ticks, carrying the durable ALERT forward exactly as the runner does (it
     writes state/ALERT on `alert` and removes it on `clear_alert`). `views` picks the gh_view per
@@ -4205,7 +4213,7 @@ def _ticks(d, views, n=60, issues=lambda k: [parsed(5)]):
         alerts += len(a)
         texts += len(only(out, "notify"))
         if a:
-            d = dict(d, alert={"reasons": a[0]["reasons"], "since": NOW + k * 15})
+            d = dict(d, alert=_carried_alert(a[0], NOW + k * 15))
         elif only(out, "clear_alert"):
             clears += 1
             d = dict(d, alert=None)
@@ -4241,7 +4249,7 @@ def test_the_non_terminal_population_is_flap_proof_too():
         alerts += len(a)
         texts += len(only(out, "notify"))
         if a:
-            d = dict(d, alert={"reasons": a[0]["reasons"], "since": NOW + k * 15})
+            d = dict(d, alert=_carried_alert(a[0], NOW + k * 15))
         elif only(out, "clear_alert"):
             clears += 1
             d = dict(d, alert=None)
@@ -5047,12 +5055,13 @@ def test_check_runs_only_view_missing_the_required_status_stays_pending():
 
 def test_persistent_gh_failure_alerts_once_with_notify():
     g = ghv(stale=True, consecutive_failures=10)
-    out = decide(gh_view=g)
+    # with approved work waiting (issue #494: an idle loop's alert is recorded, never texted)
+    out = decide(gh_view=g, parsed_issues=[parsed(5)])
     a = only(out, "alert")
     assert len(a) == 1 and any("gh" in r for r in a[0]["reasons"]) and has_notify(out)
     # same alert already on disk -> no repeat, no re-notify
-    d = disk(alert={"reasons": a[0]["reasons"]})
-    out = decide(dsk=d, gh_view=g)
+    d = disk(alert={"reasons": a[0]["reasons"], "paged": a[0]["paged"]})
+    out = decide(dsk=d, gh_view=g, parsed_issues=[parsed(5)])
     assert only(out, "alert") == [] and not has_notify(out)
 
 
@@ -5940,3 +5949,238 @@ def test_every_gh_alert_reason_carries_a_real_body():
         assert msg != reason and len(msg) > 80, (reason, msg)
     # ...and the transient one must NOT send the owner to re-authenticate something that works.
     assert "gh auth login" not in actions._alert_message("gh_unreachable")
+
+
+# ================= owner texts page only when there is work to serve (issue #494) =================
+# Owner ruling 2026-09-16: a page exists only when there is work the loop is trying to do. Demand is
+# an approved issue eligible to launch, or an in-progress lane; a worker stopped on an owner question
+# and a parked issue are NOT demand (their 🟠 was already sent). The ALERT still RECORDS every reason
+# regardless — only the text waits for demand — and a 🟢 goes out only when its 🔴 was delivered.
+
+import notify as notify_mod
+
+
+def _texts(out, tier=None):
+    return [a for a in only(out, "notify") if tier is None or a.get("tier") == tier]
+
+
+def _state(**issues):
+    return {"version": 1, "issues": dict(issues)}
+
+
+def test_work_demand_is_an_eligible_approval_or_an_in_progress_lane():
+    wd = actions.work_demand
+    assert wd([], _state(), set()) is False                                    # an idle loop
+    assert wd([parsed(5)], _state(), set()) is True                            # approved + eligible
+    assert wd([parsed(5, labels=("in-progress", "type:build"))], _state(), set()) is True
+    # an in-flight lane on DISK is demand even when this tick's GitHub view came back empty
+    for status in ("running", "frozen", "exited", "gating", "holding"):
+        assert wd([], _state(i5=ist(status)), set()) is True, status
+
+
+def test_work_demand_excludes_questions_parks_and_what_cannot_launch():
+    wd = actions.work_demand
+    # an approved issue blocked by an OPEN issue is not eligible to launch — not demand
+    assert wd([parsed(5, blocked_by=[4])], _state(), set()) is False
+    assert wd([parsed(5, blocked_by=[4])], _state(), {4}) is True
+    assert wd([parsed(5, labels=("agent-ready", "type:nonsense"))], _state(), set()) is False
+    # a posted question: the lane was released to awaiting-answer
+    assert wd([parsed(5, labels=("awaiting-answer", "type:build"))],
+              _state(i5=ist("awaiting_answer")), set()) is False
+    # ...even while its in-progress -> awaiting-answer label move is still retrying
+    assert wd([parsed(5, labels=("in-progress", "type:build"))],
+              _state(i5=ist("awaiting_answer")), set()) is False
+    # a park / needs-owner hand-back, settled or with its label move lagging
+    for labels in (("parked", "type:build"), ("needs-owner", "type:build"),
+                   ("in-progress", "needs-owner", "type:build")):
+        assert wd([parsed(5, labels=labels)], _state(i5=ist("parked")), set()) is False, labels
+    for status in ("parked", "needs_william", "bounced", "merged"):
+        assert wd([parsed(5, labels=("in-progress", "type:build"))],
+                  _state(i5=ist(status)), set()) is False, status
+    # a stray approval on merged work launches nothing
+    assert wd([parsed(5)], _state(i5=ist("merged")), set()) is False
+    # a parked/settled status occupies no lane on disk
+    assert wd([], _state(i5=ist("parked"), i6=ist("awaiting_answer"), i7=ist("ready")), set()) is False
+
+
+def test_work_demand_counts_the_owners_answer_and_re_approval():
+    wd = actions.work_demand
+    # the owner answering a question IS the approval verb: agent-ready on an awaiting_answer issue
+    assert wd([parsed(5)], _state(i5=ist("awaiting_answer")), set()) is True
+    # re-approving a parked issue
+    assert wd([parsed(5)], _state(i5=ist("parked", park_notify_cause="cap")), set()) is True
+
+
+def test_work_demand_never_raises_on_garbage():
+    for pi in (None, "x", [None, 3, "i5", {"num": "5"}, {"num": 5, "labels": "agent-ready"}]):
+        for st in (None, [], {"issues": []}, {"issues": {"i5": "running", "x": {}}}):
+            for closed in (None, 3, "x", [[]]):
+                assert actions.work_demand(pi, st, closed) in (True, False)
+    assert actions.work_demand([], {"issues": {"i5": {"status": []}}}, set()) is False
+
+
+def test_a_dark_meter_on_an_idle_loop_records_the_alert_and_texts_nothing():
+    # The 24-episodes-in-six-weeks case: the meter is dark, nothing is queued, nothing is running.
+    out = decide(usage=dark_usage())
+    (a,) = only(out, "alert")
+    assert a["reasons"] == ["usage_stale"]            # the reason is RECORDED (dashboard, report)
+    assert a["paged"] == [] and a["delivered"] == []
+    assert _texts(out) == []                          # ...but nobody is texted
+    # the next tick of the same idle episode: still silent, nothing rewritten
+    d = disk(alert={"reasons": ["usage_stale"], "since": NOW - 100, "paged": [], "delivered": []})
+    out2 = decide(usage=dark_usage(), dsk=d)
+    assert only(out2, "alert") == [] and _texts(out2) == []
+    # ...and its recovery is silent too: no 🔴 was delivered, so there is nothing to close
+    out3 = decide(usage=usage_ok(), dsk=d)
+    assert only(out3, "clear_alert") == [{"act": "clear_alert"}]
+    assert len(only(out3, "usage_recovered")) == 1
+    assert _texts(out3) == []
+
+
+def test_a_dark_meter_with_work_waiting_pages_once_and_records_the_page():
+    out = decide(usage=dark_usage(), parsed_issues=[parsed(5)])
+    (a,) = only(out, "alert")
+    assert a["reasons"] == ["usage_stale"] and a["paged"] == ["usage_stale"]
+    assert a["delivered"] == []                       # delivery is the EXECUTOR's to record
+    (n,) = _texts(out)
+    assert n["tier"] == notify_mod.DOWN and n["pages"] == ["usage_stale"]
+    assert out.index(a) < out.index(n)                # the ALERT lands before the page goes out
+    d = disk(alert={"reasons": ["usage_stale"], "since": NOW - 100,
+                    "paged": ["usage_stale"], "delivered": ["usage_stale"]})
+    out2 = decide(usage=dark_usage(), parsed_issues=[parsed(5)], dsk=d)
+    assert only(out2, "alert") == [] and _texts(out2) == []
+
+
+def test_the_page_fires_when_demand_appears_while_the_fault_still_stands():
+    d = disk(alert={"reasons": ["usage_stale"], "since": NOW - 5000, "paged": [], "delivered": []})
+    out = decide(usage=dark_usage(), parsed_issues=[parsed(5)], dsk=d)
+    (a,) = only(out, "alert")
+    assert a["reasons"] == ["usage_stale"] and a["paged"] == ["usage_stale"]
+    (n,) = _texts(out, notify_mod.DOWN)
+    assert "usage_stale" in n["headline"] and n["pages"] == ["usage_stale"]
+
+
+def test_a_delivered_page_gets_one_green_on_recovery_and_an_undelivered_one_gets_none():
+    delivered = disk(alert={"reasons": ["usage_stale"], "since": NOW - 100,
+                            "paged": ["usage_stale"], "delivered": ["usage_stale"]})
+    out = decide(usage=usage_ok(), dsk=delivered)            # recovery with the queue now empty
+    assert only(out, "clear_alert") == [{"act": "clear_alert"}]
+    (g,) = _texts(out)
+    assert g["tier"] == notify_mod.RECOVERED and "usage_stale" in g["headline"]
+    assert "pages" not in g
+    # paged but the send FAILED: no 🔴 reached the phone, so no 🟢 follows it
+    failed = disk(alert={"reasons": ["usage_stale"], "since": NOW - 100,
+                         "paged": ["usage_stale"], "delivered": []})
+    out2 = decide(usage=usage_ok(), parsed_issues=[parsed(5)], dsk=failed)
+    assert only(out2, "clear_alert") == [{"act": "clear_alert"}] and _texts(out2) == []
+
+
+def test_every_systemic_reason_is_demand_gated_not_only_the_meter():
+    # gh_unreachable used to page on the episode alone, like usage_stale
+    idle = decide(gh_view=ghv(consecutive_failures=actions.GH_ALERT_FAILURES))
+    assert only(idle, "alert")[0]["reasons"] == ["gh_unreachable"] and _texts(idle) == []
+    busy = decide(gh_view=ghv(consecutive_failures=actions.GH_ALERT_FAILURES),
+                  dsk=disk(issues_state=_state(i7=ist("running"))))
+    assert [n["tier"] for n in _texts(busy)] == [notify_mod.DOWN]
+    # a corrupt counter on a finished lane: recorded, but an idle loop hears nothing
+    idle2 = decide(dsk=disk(issues_state=_state(i7=ist("merged", update_errors="x"))))
+    assert only(idle2, "alert")[0]["reasons"] == ["update_errors:i7"] and _texts(idle2) == []
+
+
+def test_a_legacy_alert_file_is_neither_re_paged_nor_greened():
+    # An ALERT written before this change carries no paged/delivered record. The old engine texted
+    # every reason it wrote, so a standing one is not paged AGAIN on the upgrade restart — and with
+    # no record of delivery, its recovery sends no 🟢.
+    legacy = disk(alert={"reasons": ["usage_stale"], "since": NOW - 100})
+    assert _texts(decide(usage=dark_usage(), parsed_issues=[parsed(5)], dsk=legacy)) == []
+    assert _texts(decide(usage=usage_ok(), parsed_issues=[parsed(5)], dsk=legacy)) == []
+
+
+def test_a_new_reason_joining_a_paged_alert_pages_and_a_shrink_does_not():
+    d = disk(alert={"reasons": ["usage_stale"], "since": NOW - 100,
+                    "paged": ["usage_stale"], "delivered": ["usage_stale"]},
+             issues_state=_state(i7=ist("running")))
+    grown = decide(usage=dark_usage(), gh_view=ghv(consecutive_failures=actions.GH_ALERT_FAILURES),
+                   dsk=d)
+    (a,) = only(grown, "alert")
+    assert a["reasons"] == ["gh_unreachable", "usage_stale"]
+    assert a["paged"] == ["gh_unreachable", "usage_stale"] and a["delivered"] == ["usage_stale"]
+    assert [n["tier"] for n in _texts(grown)] == [notify_mod.DOWN]
+    # GitHub answers again while the meter stays dark: that reason's 🔴 was delivered -> one 🟢
+    both = disk(alert={"reasons": ["gh_unreachable", "usage_stale"], "since": NOW - 100,
+                       "paged": ["gh_unreachable", "usage_stale"],
+                       "delivered": ["gh_unreachable", "usage_stale"]},
+                issues_state=_state(i7=ist("running")))
+    shrunk = decide(usage=dark_usage(), dsk=both)
+    (a2,) = only(shrunk, "alert")
+    assert a2["reasons"] == ["usage_stale"] and a2["delivered"] == ["usage_stale"]
+    (g,) = _texts(shrunk)                           # no second 🔴 for the smaller set
+    assert g["tier"] == notify_mod.RECOVERED and "gh_unreachable" in g["headline"]
+
+
+def test_a_delivered_reason_that_leaves_is_greened_even_when_another_appears():
+    # No rename inference (review P2): a 🟢 names only a reason whose 🔴 reached the phone, so a
+    # reason that clears on the same tick another appears still gets its 🟢, and the new reason is
+    # paged on its own merits.
+    d = disk(alert={"reasons": ["session_logged_out:i5:api_key"], "since": NOW - 100,
+                    "paged": ["session_logged_out:i5:api_key"],
+                    "delivered": ["session_logged_out:i5:api_key"]},
+             issues_state=_state(i5=ist("running", sensed_state="logged_out",
+                                        sensed_auth="subscription")))
+    out = decide(dsk=d)
+    (a,) = only(out, "alert")
+    assert a["reasons"] == ["session_logged_out:i5:subscription"] and a["delivered"] == []
+    assert [n["tier"] for n in _texts(out)] == [notify_mod.DOWN, notify_mod.RECOVERED]
+    g = _texts(out, notify_mod.RECOVERED)[0]
+    assert "api_key" in g["headline"] and "subscription" in g["ask"]      # "still standing: ..."
+    # ...and on an idle loop the unrelated newcomer is never greened later: it was never delivered
+    corrupt = _state(i7=ist("merged", update_errors="x"))
+    idle = disk(alert={"reasons": ["usage_stale"], "since": NOW - 100, "paged": ["usage_stale"],
+                       "delivered": ["usage_stale"]}, issues_state=corrupt)
+    out2 = decide(usage=usage_ok(), dsk=idle)
+    (a2,) = only(out2, "alert")
+    assert a2["reasons"] == ["update_errors:i7"] and a2["paged"] == [] and a2["delivered"] == []
+    assert [n["tier"] for n in _texts(out2)] == [notify_mod.RECOVERED]   # usage_stale, only
+    healed = decide(usage=usage_ok(), dsk=disk(alert=_carried_alert(a2, NOW), issues_state=_state()))
+    assert only(healed, "clear_alert") and _texts(healed) == []
+
+
+def test_a_flapping_github_costs_one_red_and_one_green_per_outage_never_per_tick():
+    # A delivered gh_unreachable clears on the first good poll: the 🔴 is closed by a 🟢. Across
+    # repeated outages that is one of each per outage — bounded by GH_ALERT_FAILURES, never per tick.
+    d = disk(issues_state=_state(i7=ist("running")))
+    tiers = []
+    for k in range(60):
+        failures = actions.GH_ALERT_FAILURES + 1 if (k // 15) % 2 == 0 else 0
+        out = decide(now=NOW + k * 15, dsk=d, gh_view=ghv(consecutive_failures=failures))
+        tiers += [n["tier"] for n in _texts(out)]
+        a = only(out, "alert")
+        if a:
+            carried = _carried_alert(a[0], NOW + k * 15)
+            for n in _texts(out, notify_mod.DOWN):            # the executor: a delivered send
+                carried["delivered"] = sorted(set(carried["delivered"]) | set(n["pages"]))
+            d = dict(d, alert=carried)
+        elif only(out, "clear_alert"):
+            d = dict(d, alert=None)
+    assert tiers == [notify_mod.DOWN, notify_mod.RECOVERED] * 2
+
+
+def test_before_the_first_poll_lands_the_runner_hands_decide_its_demand_reading():
+    # A runner restarted into a GitHub outage has no parsed view at all; the runner reads demand from
+    # the view it published before the restart and hands decide the answer (review P1).
+    g = ghv(stale=True, consecutive_failures=actions.GH_ALERT_FAILURES)
+    held = decide(gh_view=g, dsk=disk(unpolled_demand=True))
+    assert [n["tier"] for n in _texts(held)] == [notify_mod.DOWN]
+    assert _texts(decide(gh_view=g, dsk=disk(unpolled_demand=False))) == []
+    for garbage in (None, "yes", 1):                   # only an explicit True is a reading of demand
+        assert _texts(decide(gh_view=g, dsk=disk(unpolled_demand=garbage))) == []
+
+
+def test_a_published_view_is_evidence_only_if_its_runner_saw_github_answer():
+    row = {"number": 9, "title": "t", "body": "",
+           "labels": [{"name": "agent-ready"}, {"name": "type:build"}]}
+    assert actions.published_work_demand({"issues": {"i9": row}, "polled_at": NOW}, None) is True
+    assert actions.published_work_demand({"issues": {}, "polled_at": NOW}, None) is False
+    for doc in ({"issues": {"i9": row}, "polled_at": None},        # published before any poll landed
+                {"issues": {"i9": row}}, {"issues": [], "polled_at": NOW}, None, [], "x"):
+        assert actions.published_work_demand(doc, None) is None, doc

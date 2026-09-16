@@ -2624,3 +2624,47 @@ def test_a_night_batching_sim_that_forgets_to_pin_the_clock_fails_loudly(sim_fac
     sim = sim_factory(night_batching=True)        # ... but no pin_clock()
     with pytest.raises(AssertionError, match="pin_clock"):
         sim.runner.disk_view(sim.now)
+
+
+# =====================================================================================
+# owner texts page only when there is work to serve (issue #494): a dark usage meter on an
+# idle loop — 24 episodes in six weeks on the owner's own machine, each a text — is recorded
+# and never texted; with work waiting it pages once, and its recovery closes that page once.
+# =====================================================================================
+
+_DARK = {"auth_status": "api_error"}
+_READABLE = {"auth_status": "ok", "five_hour_pct": 5, "seven_day_pct": 5}
+
+
+def _dark_meter_episode(sim):
+    """Drive a full dark-meter episode through real ticks: dark from the first read, past the
+    30-min fail-open grace (each tick well under the wake-gap bound), then readable again."""
+    sim.pin_clock("2026-07-02", "12:00")              # a daytime clock, no morning report due
+    sim.set_last_morning_report("2026-07-02")
+    alert = os.path.join(sim.home, "state", "ALERT")
+    sim.runner._fetch_usage = lambda: dict(_DARK)
+    for _ in range(5):                                 # 0, 600 ... 2400s dark: past the 1800s grace
+        sim.tick(advance=600)
+    assert json.load(open(alert))["reasons"] == ["usage_stale"], sim.journal()
+    assert len(sim.journal("fail_open")) == 1
+    sim.runner._fetch_usage = lambda: dict(_READABLE)
+    sim.tick(advance=90)
+    assert not os.path.exists(alert)
+    assert len(sim.journal("usage_recovered")) == 1
+
+
+def test_a_dark_meter_on_an_idle_loop_texts_nothing_across_its_episode_and_recovery(sim_factory):
+    sim = sim_factory()
+    _dark_meter_episode(sim)
+    assert [r["reasons"] for r in sim.journal("alert")] == [["usage_stale"]]   # recorded, once
+    assert sim.notify_lines() == []
+
+
+def test_a_dark_meter_with_work_waiting_pages_once_and_greens_once(sim_factory):
+    sim = sim_factory()
+    sim.add_issue(title="Waiting on the meter", scenario={"scenario": "happy"})
+    _dark_meter_episode(sim)
+    down = [t for t in sim.notify_lines() if t.startswith("🔴")]
+    up = [t for t in sim.notify_lines() if t.startswith("🟢")]
+    assert len(down) == 1 and "ALERT: usage_stale" in down[0], sim.notify_lines()
+    assert len(up) == 1 and "cleared: usage_stale" in up[0], sim.notify_lines()

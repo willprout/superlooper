@@ -51,11 +51,26 @@ and an open no_progress episode is HELD, never stood down on the blip: a gh outa
 episode and re-trip it (a duplicate owner text + a restarted grace) on recovery. A genuinely
 OBSERVED clear (gh up and reporting nothing launchable, or a lane gone busy) still stands down.
 
-Episode discipline (the anti-storm rails): one notify when the episode opens; a clear during
-the grace stands down SILENTLY (journal only); at most one VERIFIED launch per episode, a
-failed launch retries up to LAUNCH_ATTEMPT_CAP with ONE failure text; a live debugger
-session (any worker.d*.lock with a live pid) blocks a new launch — never two. A kill-switch
-file (state/WATCHDOG_OFF) makes every check observe + journal and change nothing.
+Episode discipline (the anti-storm rails): the episode's opening is journaled with its
+debugger-launch countdown; a clear during the grace stands down (journal); at most one VERIFIED
+launch per episode, a failed launch retries up to LAUNCH_ATTEMPT_CAP with at most ONE failure
+text; a live debugger session (any worker.d*.lock with a live pid) blocks a new launch — never
+two. A kill-switch file (state/WATCHDOG_OFF) makes every check observe + journal and change nothing.
+
+Who gets texted (issue #494, owner ruling 2026-09-16) — three rules on top of those rails:
+  ONE SENDER    the runner texts its own ALERT reasons, so the watchdog texts only what the runner
+                cannot say about itself: a runner that is wedged (heartbeat_stale) or dead, a
+                restart that failed, the crash-loop cap, a debugger that could not launch — plus
+                no_progress, which a live runner cannot see. An episode on `alert` alone texts
+                nothing, and neither does a verified debugger launch (journal + morning report),
+                nor a stale heartbeat the runner has already paged as its own failing ticks
+                (`view["runner_paged"]`). An episode an older engine opened reads as paged.
+  DEMAND        every 🔴 waits for work to serve (`view["demand"]`, read by the CLI through
+                actions.work_demand). An idle loop is silent whatever breaks, and the first check
+                that finds work waiting while the fault still stands sends the page. Resurrection
+                itself is never gated — a dead runner with nothing to do is still restarted.
+  🟢 AFTER 🔴   a recovery texts only when its 🔴 was DELIVERED — recorded on disk by the CLI
+                (record_delivered) — and clears that record; a silent episode recovers silently.
 
 TWO off switches reach this module, and they are deliberately not the same one (issue #239):
   WATCHDOG_OFF     the WATCHDOG is off. Every check observes and changes nothing, whatever the
@@ -118,12 +133,15 @@ _SEVEN_DAY_CEILING = 96
 
 def _new_resurrection():
     # issue #208: `attempts` are the restart timestamps in the rolling window (the crash-loop cap
-    # counts these); `capped_notified` / `failure_notified` dedup the escalation and failed-restart
-    # texts for one down-streak (cleared when the runner is observed healthy again).
+    # counts these); `capped_notified` dedups the cap's journal record and `failure_notified` the
+    # failed-restart text for one down-streak (cleared when the runner is observed healthy again).
     # `booting_since` (issue #239) is the runner START TIME already excused as "still booting" —
     # the memory that keeps that excuse from renewing itself forever (see _resurrection).
+    # issue #494: `capped_paged` dedups the cap's TEXT apart from its journal record, because the
+    # text waits for demand and the record does not; `down_delivered` is a runner-down 🔴 that
+    # reached the phone this down-streak — the one thing that earns the runner coming back a 🟢.
     return {"attempts": [], "capped_notified": False, "failure_notified": False,
-            "booting_since": None}
+            "booting_since": None, "capped_paged": False, "down_delivered": False}
 
 
 def new_state():
@@ -173,6 +191,8 @@ def coerce_state(raw):
                              if isinstance(t, (int, float)) and not isinstance(t, bool)]
         r["capped_notified"] = res.get("capped_notified") is True
         r["failure_notified"] = res.get("failure_notified") is True
+        r["capped_paged"] = res.get("capped_paged") is True
+        r["down_delivered"] = res.get("down_delivered") is True
         bs = res.get("booting_since")
         if isinstance(bs, (int, float)) and not isinstance(bs, bool):
             r["booting_since"] = bs
@@ -347,11 +367,53 @@ def _rec(outcome, signals, **extra):
     return {"act": "watchdog", "outcome": outcome, "signals": list(signals), **extra}
 
 
-def _text(tier, headline, ask, caller):
+# The episode signals the watchdog pages on (issue #494): what the runner cannot say about itself.
+# `alert` is the runner's own finding, and the runner already texted it (under the same demand rule).
+PAGED_SIGNALS = frozenset({HEARTBEAT_STALE, NO_PROGRESS})
+
+# Where a delivered 🔴 is recorded (record_delivered): the debugger episode, or the runner's
+# down-streak.
+MARK_EPISODE = "episode"
+MARK_RUNNER = "runner"
+
+
+def _text(tier, headline, ask, caller, marks=None):
     """One owner text, as DATA (issue #493): a tier from the closed set, a one-clause headline, the
     sentence as the ask, and the caller the doorway names if it has to cut the text to fit. The pure
-    core never composes or sends; `superlooper watchdog` renders each through notify.render."""
-    return {"tier": tier, "headline": headline, "ask": ask, "caller": "watchdog:" + caller}
+    core never composes or sends; `superlooper watchdog` renders each through notify.render.
+    `marks` (issue #494) rides on a 🔴: which record the CLI stamps when the send is delivered."""
+    text = {"tier": tier, "headline": headline, "ask": ask, "caller": "watchdog:" + caller}
+    if marks is not None:
+        text["marks"] = marks
+    return text
+
+
+def record_delivered(state, entry):
+    """The state after a text was DELIVERED (issue #494). The CLI calls this for each entry whose
+    send reached the phone; a 🔴 stamps the record its `marks` names — the open episode, or the
+    runner's down-streak — and that stamp is what later earns the matching recovery a 🟢. Anything
+    else (a 🟢, an unknown mark, no episode to stamp) returns the state unchanged. Pure and total."""
+    st = state if isinstance(state, dict) else new_state()
+    marks = entry.get("marks") if isinstance(entry, dict) else None
+    if marks == MARK_EPISODE and isinstance(st.get("episode"), dict):
+        return dict(st, episode=dict(st["episode"], down_delivered=True))
+    if marks == MARK_RUNNER:
+        res = st.get("resurrection") if isinstance(st.get("resurrection"), dict) \
+            else _new_resurrection()
+        return dict(st, resurrection=dict(res, down_delivered=True))
+    return st
+
+
+def _runner_paged_wedge(view):
+    """Has the runner itself delivered a page that its ticks are failing (issue #494)? The CLI reads
+    state/runner_paged.json into `view["runner_paged"]`; the record stands until a tick completes."""
+    paged = view.get("runner_paged")
+    return isinstance(paged, list) and any(
+        isinstance(r, str) and r.startswith("runner_tick_errors:") for r in paged)
+
+
+def _green(headline, ask, caller):
+    return _text(notify_lib.RECOVERED, headline, ask, caller)
 
 
 def _rrec(outcome, signals, **extra):
@@ -368,8 +430,11 @@ def _without(sigs, details, drop):
     return [s for s, _ in kept], [d for _, d in kept]
 
 
-def _resurrection(now, view, w, sigs, details, new_state):
+def _resurrection(now, view, w, sigs, details, new_state, demand=True):
     """The provably-gone-runner restart decision (issue #208), folded into the mechanical check.
+    `demand` (issue #494) gates only the cap's TEXT; the restart, the cap and its journal record are
+    decided exactly as before. A runner observed healthy again after a DELIVERED runner-down 🔴 gets
+    its 🟢 here.
 
     Returns (sigs, details, resurrect, journal, notify, new_state, runner_down). `runner_down` is
     the RAW fact — provably gone THIS check — reported on every check regardless of the cap or the
@@ -394,6 +459,8 @@ def _resurrection(now, view, w, sigs, details, new_state):
     r.setdefault("attempts", [])
     r.setdefault("capped_notified", False)
     r.setdefault("failure_notified", False)
+    r.setdefault("capped_paged", False)
+    r.setdefault("down_delivered", False)
     resurrect, journal, notify = None, [], []
     runner_dead = bool(view.get("runner_dead"))
     hb_stale = HEARTBEAT_STALE in sigs
@@ -404,7 +471,13 @@ def _resurrection(now, view, w, sigs, details, new_state):
     if not hb_stale and not runner_dead:
         r["capped_notified"] = False
         r["failure_notified"] = False
+        r["capped_paged"] = False
         r["booting_since"] = None            # it ticked: whatever it was booting from is finished
+        if r["down_delivered"]:              # issue #494: close the 🔴 that reached the phone
+            r["down_delivered"] = False
+            notify.append(_green("runner is back",
+                                 "the runner is completing ticks again — the loop is serving its "
+                                 "work.", "runner_back"))
 
     attempts = [t for t in r["attempts"]
                 if isinstance(t, (int, float)) and not isinstance(t, bool)]
@@ -423,12 +496,17 @@ def _resurrection(now, view, w, sigs, details, new_state):
                 r["capped_notified"] = True
                 journal.append(_rrec("resurrect_capped", present,
                                      attempts=len(recent), max_per_hour=cap))
+            # The TEXT is deduped on its own flag (issue #494): it waits for work to serve, so on an
+            # idle loop the escalation is journaled now and paged by the first check that finds work.
+            if demand and not r["capped_paged"]:
+                r["capped_paged"] = True
                 if cap == 0:                               # auto-restart disabled by config
                     notify.append(_text(
                         notify_lib.DOWN, "runner is DOWN — auto-restart is DISABLED",
                         "the runner is provably gone (heartbeat stale, pid dead) but automatic "
                         "restart is disabled (watchdog.resurrection_max_per_hour = 0). The loop is "
-                        "down and will stay down until you restart it.", "resurrect_disabled"))
+                        "down and will stay down until you restart it.", "resurrect_disabled",
+                        marks=MARK_RUNNER))
                 else:                                      # genuine crash-loop cap hit
                     # ATTEMPTED, never "was restarted": an attempt is recorded before delivery, so an
                     # undeliverable one (no_pane — no tab made, nothing launched) burns a slot too.
@@ -438,13 +516,15 @@ def _resurrection(now, view, w, sigs, details, new_state):
                         notify_lib.DOWN, "runner keeps dying — auto-restart PAUSED",
                         f"automatic restart has been attempted {len(recent)} time(s) in the last "
                         "hour and the runner is still down. That is a real incident, not a flap, so "
-                        "automatic resurrection is paused — the loop needs you.", "resurrect_capped"))
+                        "automatic resurrection is paused — the loop needs you.", "resurrect_capped",
+                        marks=MARK_RUNNER))
         else:
             n = new_state.get("next_resurrection", 1)
             resurrect = {"id": f"r{n}", "signals": present}
             new_state["next_resurrection"] = n + 1
             r["attempts"] = recent + [now]
             r["capped_notified"] = False
+            r["capped_paged"] = False
     elif hb_stale and not runner_dead:
         last = max(attempts, default=None)
         started = view.get("runner_started_at")
@@ -488,8 +568,9 @@ def evaluate(now, config, view, state):
       state    the new state to persist (episode + no-progress clocks + id counter);
       journal  act:"watchdog" records for TRANSITIONS only (open/stand-down/launch outcomes
                live in after_launch; quiet waiting checks journal nothing);
-      notify   [{tier, headline, ask, caller}] — at most one entry (the episode-opening text),
-               rendered + sent by the CLI through notify.render (issue #493);
+      notify   [{tier, headline, ask, caller, marks?}] — rendered + sent by the CLI through
+               notify.render (issue #493); the CLI feeds each DELIVERED entry to record_delivered
+               (issue #494);
       launch   None, or the launch request {"id","signals","authority","allowlist"} the
                caller executes through the launch shim, then feeds to after_launch.
       resurrect  None, or the restart request {"id","signals"} the caller executes through
@@ -499,8 +580,11 @@ def evaluate(now, config, view, state):
                once per capped streak — so a caller can stay honest ("the runner is DOWN") on
                checks that deliberately say nothing. False under the kill switch (path suppressed).
     The caller supplies `view` (every I/O fact, already read) so this stays a pure function.
+    `view["demand"]` (issue #494) is the actions.work_demand reading: only an explicit False holds a
+    🔴 back, so a view that could not say fails toward the page.
     """
     w = _wcfg(config)
+    demand = view.get("demand") is not False
     state = coerce_state(state)
     sigs, details, since = _signals(now, view, state, w)
 
@@ -574,7 +658,7 @@ def evaluate(now, config, view, state):
     # provably-gone runner's heartbeat_stale away from the episode (a corpse needs restarting, not
     # diagnosing) and emit a resurrect request or a loud escalation.
     sigs, details, resurrect, res_journal, res_notify, new_state, runner_down = _resurrection(
-        now, view, w, sigs, details, new_state)
+        now, view, w, sigs, details, new_state, demand)
     journal.extend(res_journal)
     notify.extend(res_notify)
     ep = state.get("episode")
@@ -593,29 +677,56 @@ def evaluate(now, config, view, state):
                 new_state["episode"] = ep
                 return {"state": new_state, "journal": journal, "notify": notify,
                         "launch": None, "resurrect": resurrect, "runner_down": runner_down}
-            # Self-recovery or owner intervention during (or after) the grace: stand down
-            # SILENTLY — the journal keeps the record, the phone stays quiet.
+            # Self-recovery or owner intervention during (or after) the grace: stand down — the
+            # journal keeps the record. The phone hears about it only to close a 🔴 it was actually
+            # sent (issue #494)...
             journal.append(_rec("stand_down", ep_signals))
+            if ep.get("down_delivered"):
+                if runner_down:
+                    # ...and NOT when the signal left because the runner DIED: heartbeat_stale was
+                    # rerouted to resurrection, so nothing recovered. The open 🔴 now concerns the
+                    # dead runner, whose restart (or return) closes it.
+                    new_state["resurrection"] = dict(new_state["resurrection"],
+                                                     down_delivered=True)
+                else:
+                    notify.append(_green("watchdog: " + ", ".join(ep_signals) + " cleared",
+                                         "the signal that tripped it is gone.", "episode_cleared"))
         new_state["episode"] = None
         return {"state": new_state, "journal": journal, "notify": notify, "launch": launch,
                 "resurrect": resurrect, "runner_down": runner_down}
 
-    if ep is None:
+    opened = ep is None
+    if opened:
         ep = {"signals": sigs, "opened_at": now, "detail": "; ".join(details),
               "launched_at": None, "launch_id": None, "launch_attempts": 0,
-              "launch_failure_notified": False}
-        notify.append(_text(
-            notify_lib.DOWN, "watchdog: " + ", ".join(sigs),
-            "; ".join(details) + f". If this still stands in {int(w['grace_minutes'])} min, "
-            f"an unattended sl-debugger session launches (authority: {w['authority']}). It "
-            "stands down automatically if the signal clears; touch state/"
-            f"{KILL_SWITCH_FILENAME} to disable.", "episode"))
-        journal.append(_rec("notified", sigs, grace_seconds=w["grace_seconds"],
-                            authority=w["authority"]))
+              "launch_failure_notified": False, "paged": False, "down_delivered": False}
     else:
         merged = sorted(set(ep.get("signals") or []) | set(sigs))
         if merged != ep.get("signals"):
             ep = dict(ep, signals=merged, detail="; ".join(details))
+    # The episode's 🔴 (issue #494): only for a signal the runner cannot text itself, only while
+    # there is work to serve, once per episode — on the first check that has both, which may be
+    # long after the episode opened. It reads THIS check's signals, not the episode's union: a
+    # heartbeat that went stale and came back while an ALERT held the episode open is not a page.
+    # The debugger countdown is the JOURNAL's: it rides the opening record below, where the morning
+    # report and the dashboard read it.
+    # An episode written before this rule carries no `paged`: the old engine texted every episode it
+    # opened, so it reads as already paged. A wedge the RUNNER has already paged about itself
+    # (`view["runner_paged"]`, its delivered runner_tick_errors page) is not paged again as a stale
+    # heartbeat — one outage, one sender.
+    pageable = PAGED_SIGNALS & set(sigs)
+    if _runner_paged_wedge(view):
+        pageable -= {HEARTBEAT_STALE}
+    texted = False
+    if not ep.get("paged", "paged" not in ep) and demand and pageable:
+        notify.append(_text(notify_lib.DOWN, "watchdog: " + ", ".join(sigs), "; ".join(details),
+                            "episode", marks=MARK_EPISODE))
+        ep = dict(ep, paged=True)
+        texted = True
+    if opened:
+        journal.append(_rec("notified", sigs, grace_seconds=w["grace_seconds"],
+                            authority=w["authority"], launch_due_at=now + w["grace_seconds"],
+                            texted=texted))
     new_state["episode"] = ep
 
     grace_elapsed = now - ep["opened_at"] >= w["grace_seconds"]
@@ -634,14 +745,16 @@ def evaluate(now, config, view, state):
             "resurrect": resurrect, "runner_down": runner_down}
 
 
-def after_launch(now, config, state, launch, rc):
+def after_launch(now, config, state, launch, rc, demand=True):
     """Record the outcome of an executed launch request. rc==0 (delivery VERIFIED by the
     launch shim) marks the episode launched — once per incident, no relaunch on the same
-    episode. A nonzero rc counts an attempt (retried by later checks up to LAUNCH_ATTEMPT_CAP)
-    and texts the owner ONCE per episode about the failure — the loop still needs attention
-    and now the fallback could not start either. `config` is accepted for call-site symmetry with
-    evaluate(); after_launch reads no config knob (authority/allowlist already rode into the launch
-    request), so it deliberately does NOT resolve _wcfg(config)."""
+    episode — and is journal-only: the morning report and the dashboard carry it (issue #494). A
+    nonzero rc counts an attempt (retried by later checks up to LAUNCH_ATTEMPT_CAP) and texts the
+    owner ONCE per episode about the failure — the loop still needs attention and now the fallback
+    could not start either — while there is work to serve (`demand`, the CLI's work_demand reading;
+    an unsent failure leaves the text armed for a later failed attempt). `config` is accepted for
+    call-site symmetry with evaluate(); after_launch reads no config knob (authority/allowlist
+    already rode into the launch request), so it deliberately does NOT resolve _wcfg(config)."""
     state = coerce_state(state)
     ep = state.get("episode")
     if ep is None:                       # stand-down raced the launch; keep the honest record
@@ -654,30 +767,29 @@ def after_launch(now, config, state, launch, rc):
         ep = dict(ep, launched_at=now, launch_id=launch.get("id"))
         journal.append(_rec("launched", sigs, id=launch.get("id"),
                             authority=launch.get("authority")))
-        notify.append(_text(notify_lib.DOWN, "watchdog launched sl-debugger",
-                            f"unattended session {launch.get('id')} launched — signals: "
-                            + ", ".join(sigs) + f" (authority: {launch.get('authority')}). Its "
-                            "memo will land in the state home's reports/.", "debugger_launched"))
     else:
         ep = dict(ep, launch_attempts=(ep.get("launch_attempts") or 0) + 1)
         journal.append(_rec("launch_failed", sigs, id=launch.get("id"), rc=rc))
-        if not ep.get("launch_failure_notified"):
+        if demand and not ep.get("launch_failure_notified"):
             ep["launch_failure_notified"] = True
             notify.append(_text(notify_lib.DOWN, "watchdog could NOT launch sl-debugger",
                                 f"launch of session {launch.get('id')} failed (rc={rc}) — most "
                                 "likely no resolvable cmux pane (loop stopped and its tab gone?). "
                                 "The tripped signal still stands: " + ", ".join(sigs)
-                                + ". The loop needs you.", "debugger_launch_failed"))
+                                + ". The loop needs you.", "debugger_launch_failed",
+                                marks=MARK_EPISODE))
     return {"state": dict(state, episode=ep), "journal": journal, "notify": notify}
 
 
-def after_resurrect(now, config, state, resurrect, rc):
+def after_resurrect(now, config, state, resurrect, rc, demand=True):
     """Record the outcome of an executed resurrect request (issue #208). rc==0 (the runner came up —
-    the launcher VERIFIED a live pidfile) TEXTS THE OWNER: a dead runner restarting itself is a loud
-    event, not a silent one (the DoD). A nonzero rc journals the failure and texts ONCE per down-
-    streak (the reborn tab could not be placed — its pane is gone, or the shim did not run), then
-    later checks retry up to the rolling-hour cap. `config` is accepted for call-site symmetry with
-    after_launch; this reads no config knob (the cap already gated the request in evaluate).
+    the launcher VERIFIED a live pidfile) is journaled for the morning report, and TEXTS a 🟢 only
+    when a runner-down 🔴 reached the phone this down-streak (issue #494, owner ruling 2026-09-16:
+    a 🟢 closes a 🔴, it never arrives out of nowhere). A nonzero rc journals the failure and texts
+    ONCE per down-streak while there is work to serve (the reborn tab could not be placed — its pane
+    is gone, or the shim did not run), then later checks retry up to the rolling-hour cap. `config`
+    is accepted for call-site symmetry with after_launch; this reads no config knob (the cap already
+    gated the request in evaluate).
 
     The attempt itself was recorded in evaluate (so a launch that fails to VERIFY still counts toward
     the cap — a runner whose tab is gone must not retry forever); after_resurrect only journals the
@@ -690,20 +802,23 @@ def after_resurrect(now, config, state, resurrect, rc):
     if rc == 0:
         r["failure_notified"] = False
         journal.append(_rrec("resurrected", sigs, id=rid))
-        notify.append(_text(
-            notify_lib.RECOVERED, "runner was down — restarted it",
-            f"the runner was provably gone (signals: {', '.join(sigs) or 'heartbeat_stale'}) and "
-            f"has been automatically restarted ({rid}) in its cmux tab. It reconciles from GitHub + "
-            "disk exactly like a manual restart — no work lost, no counters reset.", "resurrected"))
+        if r.get("down_delivered"):
+            r["down_delivered"] = False
+            notify.append(_text(
+                notify_lib.RECOVERED, "runner was down — restarted it",
+                f"the runner was provably gone (signals: {', '.join(sigs) or 'heartbeat_stale'}) and "
+                f"has been automatically restarted ({rid}) in its cmux tab. It reconciles from GitHub "
+                "+ disk exactly like a manual restart — no work lost, no counters reset.",
+                "resurrected"))
     else:
         journal.append(_rrec("resurrect_failed", sigs, id=rid, rc=rc))
-        if not r.get("failure_notified"):
+        if demand and not r.get("failure_notified"):
             r["failure_notified"] = True
             notify.append(_text(
                 notify_lib.DOWN, "could NOT restart the runner",
                 f"the runner is down and the automatic restart ({rid}) failed (rc={rc}) — most "
                 "likely its cmux tab/pane is gone, so a new one cannot be placed without you. The "
-                "loop is not running.", "resurrect_failed"))
+                "loop is not running.", "resurrect_failed", marks=MARK_RUNNER))
     return {"state": dict(state, resurrection=r), "journal": journal, "notify": notify}
 
 
