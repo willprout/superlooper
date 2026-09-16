@@ -72,9 +72,8 @@ def _read_stop_marker(path):
     to the same ``None``, which is right for ALERT and merges_frozen (absent and unreadable both mean
     "not frozen") and exactly wrong here. For this file the two are opposite answers, and the wrong
     one is the dangerous one: every reader of the marker treats absent as permission to restart the
-    loop, so an unreadable marker read as absent puts the board back to RUNNER DOWN and fires the
-    push over a stop the owner deliberately made — this issue's own defect, arriving through a
-    permission bit. The engine's ``runner.read_stop_marker`` draws the line with the same
+    loop, so an unreadable marker read as absent puts the board back to RUNNER DOWN over a stop the
+    owner deliberately made — this issue's own defect, arriving through a permission bit. The engine's ``runner.read_stop_marker`` draws the line with the same
     ``os.path.exists`` check, and this mirrors it. (Found by a fresh reviewer.)
     """
     txt = _read(path)

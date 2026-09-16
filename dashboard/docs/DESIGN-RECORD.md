@@ -67,7 +67,7 @@ they cannot drift). Plus **boring mode** (§4) as the vet's full escape hatch.
 
 | Tier | Contents | Behavior |
 |---|---|---|
-| **Push** (interrupts) | Factory-stopped: runner down (dead-man's switch, §6), ALERT, freeze that is aging past threshold or whose auto-fix itself failed/stalled, usage cap. Decisions blocking work: `needs-william`, bounces. **Machine-gave-up parks as a threshold digest** ("4 parked, oldest 26h — tap to triage"), event-driven so the no-ritual rule holds. | Reaches William wherever he is (iMessage today). Rare by design. |
+| **Push** (interrupts) | Factory-stopped: runner down (dead-man's switch, §6 — paged by the engine watchdog since #496, not the dashboard), ALERT, freeze that is aging past threshold or whose auto-fix itself failed/stalled, usage cap. Decisions blocking work: `needs-william`, bounces. **Machine-gave-up parks as a threshold digest** ("4 parked, oldest 26h — tap to triage"), event-driven so the no-ritual rule holds. | Reaches William wherever he is (iMessage today). Rare by design. |
 | **Inbox** ("Needs You") | Every decision waiting on him, each card: plain-language headline + gloss, memo, and buttons. | Sits until he comes; badge-counted; never re-pings. |
 | **Ambient** | The airfield, the boards, tower log, health strip, per-repo shipped-delta, "since you last looked" markers. | There when he looks. Raw depths (journal, cmux tabs, GitHub) exist underneath; he should never *need* them. |
 
@@ -203,8 +203,12 @@ Four-panel layout:
   separate from the runner — watches `state/runner.heartbeat`; past threshold the entire
   surface grays with "RUNNER DOWN — last heartbeat Xm ago" (a state stale data cannot fake)
   and fires a push. Nobody-watches-the-watcher, closed. No runner changes needed.
+  *Amended 2026-09-16 (owner ruling, issue #496): the push half is retired. The engine watchdog
+  (`superlooper watchdog`) now owns runner-down detection and paging, so the dashboard's own text
+  was a second, noisier sender for the same fact. The grey RUNNER DOWN surface stays; the
+  dashboard texts no one.*
 - **Push taxonomy is the safety net; glanceability is never load-bearing for an absent
-  owner.** Final push list: runner down · ALERT · freeze aging past threshold or auto-fix
+  owner.** Final push list: runner down (the engine watchdog's, per the amendment above) · ALERT · freeze aging past threshold or auto-fix
   itself failed/stalled · usage cap · needs-william/bounce · parks via threshold digest.
 - The center **adds no machinery to the runner** in V1. It is a read-only poller (journal,
   state dir, `gh`, read-only `git diff --stat` against existing worktrees) plus label/comment

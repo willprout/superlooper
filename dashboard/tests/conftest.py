@@ -10,17 +10,19 @@ pytest is invoked from.
 Fail-closed external-binary neutralization (ported from superlooper's 2026-07-03 toast-spam
 ratchet, then hardened): **no test may reach a real ``gh``, ``cmux``, ``osascript``, or the
 ``superlooper`` CLI — nor the network behind them.** The dashboard's egress to the outside world
-is the ``gh`` CLI (all GitHub reads and label/comment/issue writes), the notifier (``cmux notify``
-/ an ``osascript`` iMessage one-liner), and — from issue #41 — the local ``superlooper`` CLI the
-Tidy button drives (which CLOSES session windows, so a stray real invocation in a test would touch
-William's live cmux). Each MUST resolve through an env-var override:
+is the ``gh`` CLI (all GitHub reads and label/comment/issue writes) and — from issue #41 — the
+local ``superlooper`` CLI the Tidy button drives (which CLOSES session windows, so a stray real
+invocation in a test would touch William's live cmux). Each MUST resolve through an env-var
+override:
 
     SL_GH          the gh binary          (lib/gh.py)
-    SL_CMUX        the cmux binary         (lib/notify.py)
-    SL_OSASCRIPT   the osascript binary    (lib/notify.py — the iMessage one-liner; forward
-                   contract for Task 10: notify code MUST resolve osascript via THIS var so this
-                   fixture can neutralize it globally, never a per-test PATH stub — that opt-in
-                   stubbing is exactly the pattern the ratchet outlawed)
+    SL_CMUX        the cmux binary
+    SL_OSASCRIPT   the osascript binary. Nothing in the dashboard resolves either any more: they
+                   were the notifier's (``lib/notify.py`` — the ``cmux notify`` toast and the
+                   iMessage one-liner), which issue #496 removed with the RUNNER DOWN push. Kept
+                   neutralized anyway: both reach William's live machine, and code that ever shells
+                   them again MUST resolve through THESE vars so this fixture covers it globally,
+                   never a per-test PATH stub — the pattern the ratchet outlawed.
     SL_SECURITY    the macOS `security` binary (lib/pollers.py — the usage reader's Keychain read).
                    Neutralizing it fail-closes the usage path's Keychain access AND, transitively,
                    its network call (no token ⇒ no request to api.anthropic.com), so the whole usage

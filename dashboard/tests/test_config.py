@@ -1,7 +1,7 @@
 """The dashboard config contract (Task 1 / decisions B.4, B.7).
 
 `config.load(path)` reads the dashboard's own ``config.json`` (which repos to watch, ports and
-poll cadences, notify settings, the fun-toggle map), fills defaults, and — loud and specific,
+poll cadences, the fun-toggle map), fills defaults, and — loud and specific,
 mirroring the skill's ``lib/config.py`` — rejects any unknown key or wrong-typed value by NAME.
 For each configured repo it reads that repo's OWN ``.superlooper/config.json`` for its slug and
 idle/freeze thresholds (defaulting 480/2700 when absent). No William-specific paths anywhere
@@ -73,7 +73,6 @@ def test_minimal_config_fills_all_defaults(one_repo):
     # How long the runner may go quiet before the dashboard stops calling its view live truth.
     # Well under heartbeat_down_seconds: stop trusting a stale view long before declaring it dead.
     assert cfg["runner_silent_seconds"] == 90
-    assert cfg["notify"] == {"imessage_to": None, "cmd": None}
 
 
 def test_default_fun_map_is_master_plus_every_mvp_mechanic_all_on(one_repo):
@@ -327,37 +326,33 @@ def test_two_repos_each_get_their_own_facts(tmp_path):
     assert repos[1]["idle_seconds"] == 480
 
 
-# --- notify block ---------------------------------------------------------------------------
+# --- the retired notify block (issue #496) --------------------------------------------------
+# `notify` configured the dashboard's one push, RUNNER DOWN. That push is retired — the engine
+# watchdog owns runner-down paging — so the block configures nothing and must not load silently: a
+# channel someone filled in would otherwise look live and never fire. The refusal names what died
+# and what to do, because a bare "unknown key" on a block the old README told you to write reads as
+# a typo (the engine's `_RETIRED_KEYS` precedent, #194).
 
-def test_notify_values_are_honored(tmp_path):
+@pytest.mark.parametrize("notify", [
+    {"imessage_to": None, "cmd": None},                                 # the old example's block
+    {"imessage_to": "+15550001111", "cmd": "notify.sh {title} {body}"},  # a configured channel
+    {},
+])
+def test_the_retired_notify_block_is_refused_with_the_reason_and_the_fix(tmp_path, notify):
     repo = _write_repo(tmp_path, "co", "acme/widget")
-    cfg_path = _write_config(tmp_path, {
-        "repos": [{"path": str(repo)}],
-        "notify": {"imessage_to": "+15550001111", "cmd": "notify.sh {title} {body}"},
-    })
-    cfg = config.load(cfg_path)
-    assert cfg["notify"]["imessage_to"] == "+15550001111"
-    assert cfg["notify"]["cmd"] == "notify.sh {title} {body}"
-
-
-def test_unknown_notify_key_is_rejected(tmp_path):
-    repo = _write_repo(tmp_path, "co", "acme/widget")
-    cfg_path = _write_config(tmp_path, {
-        "repos": [{"path": str(repo)}], "notify": {"sms_to": "x"},
-    })
+    cfg_path = _write_config(tmp_path, {"repos": [{"path": str(repo)}], "notify": notify})
     with pytest.raises(ValueError) as e:
         config.load(cfg_path)
-    assert "sms_to" in str(e.value)
+    msg = str(e.value)
+    assert "'notify'" in msg
+    assert "#496" in msg
+    assert "watchdog" in msg, "name where runner-down paging lives now"
+    assert "delete" in msg.lower(), "and the one-line fix"
 
 
-def test_notify_wrong_typed_value_is_rejected(tmp_path):
-    repo = _write_repo(tmp_path, "co", "acme/widget")
-    cfg_path = _write_config(tmp_path, {
-        "repos": [{"path": str(repo)}], "notify": {"cmd": 123},
-    })
-    with pytest.raises(ValueError) as e:
-        config.load(cfg_path)
-    assert "cmd" in str(e.value)
+def test_a_config_without_notify_carries_no_notify_block(one_repo):
+    _, _, cfg_path = one_repo
+    assert "notify" not in config.load(cfg_path)
 
 
 # --- fun toggle map -------------------------------------------------------------------------
@@ -484,7 +479,7 @@ def test_config_example_exists_and_is_the_readme_pointer():
 def test_config_example_loads_through_the_real_validator(tmp_path):
     # The example's repo paths are placeholders (a user edits them), so swap in one real fixture
     # repo and run the ACTUAL loader — proving every OTHER field in the committed example (keys,
-    # types, port, cadences, notify, fun map) passes validation. A typo in the example fails here.
+    # types, port, cadences, fun map) passes validation. A typo in the example fails here.
     example = json.loads(_EXAMPLE.read_text())
     repo = _write_repo(tmp_path, "co", "acme/widget")
     example["repos"] = [{"path": str(repo)}]
@@ -493,7 +488,9 @@ def test_config_example_loads_through_the_real_validator(tmp_path):
     # And the example shows the documented defaults, so it round-trips to them.
     assert cfg["port"] == 8611
     assert cfg["fun"]["master"] is True
-    assert cfg["notify"] == {"imessage_to": None, "cmd": None}
+    # The retired push's notify block (issue #496) is gone from the example: a stranger copying it
+    # must not be handed a key the loader refuses.
+    assert "notify" not in example
 
 
 # --- airline identity (Task 7 / design record §7: auto-generated default, renameable) --------

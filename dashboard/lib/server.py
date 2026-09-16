@@ -23,7 +23,6 @@ import math
 import os
 import posixpath
 import sys
-import threading
 import time
 import urllib.parse
 from collections import namedtuple
@@ -38,7 +37,6 @@ import engine as engine_mod
 import fixer as fixer_mod
 import flights
 import launch_rules
-import notify as notify_mod
 import pollers
 import readers
 import review_marker
@@ -1954,60 +1952,6 @@ def _runner_message(runner_repos):
     return "no runner heartbeat found — the dashboard watches the runner, not the other way around"
 
 
-# =============================== the dead-man's switch push (design record §6) ===============================
-# The ONE push the dashboard owns: the runner cannot announce its own death, so the backend that
-# watches its heartbeat does. Every OTHER push stays the runner's (issue #10 boundary). The edge
-# detection — fire once per down episode, re-arm on recovery — lives in the pure lib.watchdog.
-# Watchdog; here we only turn a newly-down repo into a message and hand the (bounded, never-raising)
-# notify.send off the poll thread so a slow notifier can never stall the 2-second snapshot.
-
-def runner_down_push(repo):
-    """``(title, body)`` for one repo's RUNNER DOWN push. The title names the offender; the body
-    reuses the on-screen sub-line (``_runner_message``) so the phone push and the grey banner say
-    the same thing."""
-    slug = repo.get("slug") or "the runner"
-    return "RUNNER DOWN — %s" % slug, _runner_message([repo])
-
-
-def runner_down_pushes(snap, watchdog):
-    """The ``(title, body)`` pairs to send THIS poll: the watchdog's newly-down repos turned into
-    messages. Empty when nothing newly went down (still-down repos already pushed; healthy ones
-    never did). Reads the snapshot's ``runner.repos`` — the single source of down-truth the grey
-    surface renders from — so surface and push can never disagree."""
-    repos = (snap.get("runner") or {}).get("repos", []) if isinstance(snap, dict) else []
-    return [(runner_down_push(r), r) for r in watchdog.newly_down(repos)]
-
-
-def _daemon_spawn(fn):
-    """Run ``fn`` on a fire-and-forget daemon thread — the send is bounded and never raises, so a
-    hung notifier can't outlive the process or block the request thread that triggered it."""
-    threading.Thread(target=fn, daemon=True).start()
-
-
-def _stderr_log(slug, title, outcome):
-    """Default push-outcome sink: one stderr line so a misconfigured channel (or a plain log-only
-    fallback) is visible in the server's own output rather than silently swallowed."""
-    sys.stderr.write("command-center: RUNNER DOWN push [%s] — %s\n" % (slug, outcome))
-
-
-def dispatch_runner_pushes(snap, watchdog, config, *, send=None, spawn=None, log=None):
-    """Fire exactly one RUNNER DOWN push per down episode and return the slugs pushed this call.
-    ``send`` is ``notify.send`` (injectable); ``spawn(fn)`` runs it off the poll thread (a daemon
-    thread by default); ``log(slug, title, outcome)`` records the send's outcome string so a
-    misconfigured iMessage/cmd — or a bare ``log-only`` — is never silent (the notifier contract is
-    that the caller journals the result). Tests pass a synchronous ``spawn`` + recording ``send``/
-    ``log`` to observe the once-per-episode contract end-to-end."""
-    send = notify_mod.send if send is None else send
-    spawn = _daemon_spawn if spawn is None else spawn
-    log = _stderr_log if log is None else log
-    pushed = []
-    for (title, body), repo in runner_down_pushes(snap, watchdog):
-        slug = repo.get("slug")
-        spawn(lambda t=title, b=body, s=slug: log(s, t, send(config, t, b)))
-        pushed.append(slug)
-    return pushed
-
-
 def _sum_shipped(repo_snaps):
     keys = ("landings_total", "landings_window", "go_arounds", "parks")
     total = {k: 0 for k in keys}
@@ -2075,9 +2019,9 @@ def assemble_snapshot(config, *, now=None, gh_mod=None, usage=None, diff_reader=
         repo_states.append(state)
         runner_repos.append({"slug": repo["slug"], "down": rs["runner_down"],
                              "heartbeat_age": rs["heartbeat_age"],
-                             # The off switch rides beside `down` (issue #365) so the dead-man's
-                             # switch reads ONE list and can never push about a stop the owner
-                             # asked for — `down` is already False for a deliberate stop.
+                             # The off switch rides beside `down` (issue #365) so the RUNNER DOWN
+                             # surface reads ONE list and can never grey the board over a stop the
+                             # owner asked for — `down` is already False for a deliberate stop.
                              "stopped": rs["stopped"]})
         for rec in journal:
             all_journal.append({"repo": repo.get("name") or repo["slug"], "ts": rec.get("ts"),

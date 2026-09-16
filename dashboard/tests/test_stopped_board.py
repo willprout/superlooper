@@ -3,15 +3,16 @@
 Half of this issue is the button; this is the other half, and it is the half the owner lives with.
 `superlooper stop` (issue #239) leaves a marker at ``state/runner.stopped`` precisely because a
 deliberate stop is otherwise *the exact shape of a crash* — a stale heartbeat and no live runner —
-and the engine's guardians are built to fix that shape at 3am. The dashboard is a third guardian:
-it greys the whole surface RUNNER DOWN and fires the dead-man's-switch push. Reading the marker is
-what stops it from texting the owner about an outage they created on purpose.
+and the engine's guardians are built to fix that shape at 3am. The dashboard greys the whole
+surface RUNNER DOWN for that shape. Reading the marker is what stops it from calling an outage the
+owner created on purpose a crash. (It used to text about it too; issue #496 retired that push —
+runner-down paging is the engine watchdog's.)
 
 Three states, and the distinctions are the whole point:
 
 * **off** — the marker is down and there is a positive "no live runner" read (the heartbeat is
   stale past the down threshold). The loop is off because the owner said so. Shown as its own
-  state, never RUNNER DOWN, and it does NOT fire the push.
+  state, never RUNNER DOWN.
 * **stopping** — the marker is down and the runner is still inside its tick. Transient and
   truthful: it is on its way out, and calling it a crash would be wrong in the other direction.
 * **not taken** — the marker is down and the runner has completed a tick SINCE it landed. That is
@@ -36,7 +37,6 @@ import pytest
 import flights
 import readers
 import server
-import watchdog as watchdog_mod
 
 
 def _home(tmp_path, *, stopped=None, heartbeat=None, lock=None, now=1_000_000):
@@ -263,9 +263,8 @@ def test_stopping_shows_immediately_rather_than_waiting_out_the_down_threshold()
 
 # =============================== the assembled snapshot ===============================
 # The pure functions above are the decisions; these pin that the snapshot actually CARRIES them —
-# and, most of all, that the dashboard's own guardian stands down. The dead-man's-switch push is
-# the dashboard's one outbound message: firing RUNNER DOWN at an owner who just tapped Stop is
-# precisely the 3am text issue #239 exists to retire, arriving from the other side of the machine.
+# and, most of all, that the board stands down: greying RUNNER DOWN at an owner who just tapped Stop
+# is precisely the 3am alarm issue #239 exists to retire, arriving from the other side of the machine.
 
 FIXTURE = os.path.join(os.path.dirname(__file__), "fixtures", "statehome")
 SLUG = "will-titan/superlooper-sandbox"
@@ -303,12 +302,12 @@ def _live(home, alive):
     (home / "state" / "runner.lock").write_text(str(os.getpid() if alive else 999_999))
 
 
-def test_a_crashed_runner_with_no_marker_is_still_runner_down_and_still_pushes(home):
+def test_a_crashed_runner_with_no_marker_is_still_runner_down(home):
     _beat(home, SNAP_NOW - 900)
     snap = server.assemble_snapshot(_config(home), now=SNAP_NOW)
     assert snap["runner"]["down"] is True
     assert snap["pill"]["message"] == "RUNNER DOWN"
-    assert [r["slug"] for r in watchdog_mod.Watchdog().newly_down(snap["runner"]["repos"])] == [SLUG]
+    assert [r["slug"] for r in snap["runner"]["repos"] if r["down"]] == [SLUG]
 
 
 def test_a_stopped_runner_is_shown_as_stopped_and_never_as_down(home):
@@ -320,14 +319,6 @@ def test_a_stopped_runner_is_shown_as_stopped_and_never_as_down(home):
     assert repo["state"]["state"] == flights.STOPPED
     assert repo["runner_down"] is False, "a deliberate stop is not an outage"
     assert snap["runner"]["down"] is False and snap["runner"]["repos"][0]["down"] is False
-
-
-def test_the_dead_mans_switch_does_not_text_the_owner_about_their_own_off_switch(home):
-    _mark(home, stopped_at=SNAP_NOW - 900)
-    _beat(home, SNAP_NOW - 900)
-    _live(home, False)
-    snap = server.assemble_snapshot(_config(home), now=SNAP_NOW)
-    assert watchdog_mod.Watchdog().newly_down(snap["runner"]["repos"]) == []
 
 
 def test_the_snapshot_carries_who_stopped_it_when_and_the_way_back(home):

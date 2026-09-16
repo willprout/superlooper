@@ -1,7 +1,7 @@
 """The dashboard's config contract (Task 1 / decisions B.4, B.7).
 
 The command center is shareable from day one (decision A.3): every per-user fact — which repos to
-watch, ports, poll cadences, notify settings, the fun-toggle map — enters through THIS file's
+watch, ports, poll cadences, the fun-toggle map — enters through THIS file's
 ``config.json``, never a hardcoded William-specific path. So the loader has one job beyond reading
 JSON: fail LOUD and SPECIFIC. An unknown key, a wrong type, or an out-of-range port names the
 offender, so a typo is a clear startup error rather than a dashboard that quietly watches the
@@ -46,10 +46,6 @@ _TOP_DEFAULTS = {
 # `_assemble_repo` a bare dict, and a magic number inline is what this issue forbids).
 RUNNER_SILENT_SECONDS = _TOP_DEFAULTS["runner_silent_seconds"]
 
-# The notify block mirrors the skill's shape (decision B.4): imessage_to → cmd → log precedence,
-# resolved by Task 10. Both null by default (a fresh shareable install nags no one).
-_NOTIFY_DEFAULTS = {"imessage_to": None, "cmd": None}
-
 # The fun-toggle map: one master switch (design record §7) plus a per-mechanic key for every
 # fun mechanic that ships with the MVP (§7 "Ship with the MVP" + the Solari clack, B.10). All
 # default ON — joy is a first-class, terminal requirement (design record §0.1), so the honest
@@ -74,7 +70,18 @@ _REPO_THRESHOLD_DEFAULTS = {"idle_seconds": 480, "freeze_seconds": 2700}
 # absolute path (a relative override stays relative, resolved against cwd like gh's bare ``gh``).
 _DEFAULT_SUPERLOOPER_CLI = "~/.claude/skills/superlooper/bin/superlooper"
 
-_ALLOWED_TOP = set(_TOP_DEFAULTS) | {"repos", "notify", "fun", "superlooper_cli", "operator"}
+_ALLOWED_TOP = set(_TOP_DEFAULTS) | {"repos", "fun", "superlooper_cli", "operator"}
+
+# Keys this dashboard used to accept and no longer does — the engine config's `_RETIRED_KEYS`
+# pattern (#194). A retired key must never load silently: a notify channel someone filled in would
+# look live and never fire. But a bare "unknown key" on a block the old README told you to write
+# reads as a typo, so each entry adds, at the point of the error, what died and what to do.
+_RETIRED_KEYS = {
+    "notify": "the dashboard's RUNNER DOWN push is retired (#496): runner-down paging is the engine "
+              "watchdog's (`superlooper watchdog` — see runner-ops.md), so this block configures "
+              "nothing. Delete the \"notify\" block from config.json; the board still shows "
+              "RUNNER DOWN.",
+}
 _ALLOWED_REPO_ENTRY = {"path", "airline"}
 
 # Every fun mechanic except the master switch — the snapshot resolves each against master so the
@@ -118,7 +125,9 @@ def _validate_and_fill(raw):
     # a misspelled key (`reops`) names the actual offender rather than reporting `repos` missing.
     for k in raw:
         if k not in _ALLOWED_TOP:
-            _err(f"unknown key {k!r} (allowed: {', '.join(sorted(_ALLOWED_TOP))})")
+            hint = _RETIRED_KEYS.get(k)
+            _err(f"unknown key {k!r} (allowed: {', '.join(sorted(_ALLOWED_TOP))})"
+                 + (f" — {hint}" if hint else ""))
 
     # repos — required, non-empty (no sensible default; an empty watch-list is a misconfiguration).
     if "repos" not in raw:
@@ -148,8 +157,6 @@ def _validate_and_fill(raw):
         _err(f"'superlooper_cli' must be a non-empty string path, got {raw_cli!r}")
     out["superlooper_cli"] = os.path.expanduser(raw_cli.strip())
 
-    out["notify"] = _fill_and_check_map("notify", raw.get("notify", {}), _NOTIFY_DEFAULTS,
-                                        _check_str_or_null)
     out["fun"] = _fill_and_check_map("fun", raw.get("fun", {}), _FUN_DEFAULTS, _check_bool)
     out["repos"] = _load_repos(raw["repos"])
 
@@ -182,11 +189,6 @@ def _fill_and_check_map(field, given, defaults, check_value):
     for k, v in merged.items():
         check_value(field, k, v)
     return merged
-
-
-def _check_str_or_null(field, key, v):
-    if v is not None and (not isinstance(v, str) or not v.strip()):
-        _err(f"'{field}.{key}' must be null or a non-empty string, got {v!r}")
 
 
 def _check_bool(field, key, v):
