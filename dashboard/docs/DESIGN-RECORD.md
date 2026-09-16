@@ -203,6 +203,10 @@ Four-panel layout:
   separate from the runner — watches `state/runner.heartbeat`; past threshold the entire
   surface grays with "RUNNER DOWN — last heartbeat Xm ago" (a state stale data cannot fake)
   and fires a push. Nobody-watches-the-watcher, closed. No runner changes needed.
+  *Amended 2026-09-16 (owner ruling, issue #496): the push half is retired. The engine watchdog
+  (`superlooper watchdog`) now owns runner-down detection and paging, so the dashboard's own text
+  was a second, noisier sender for the same fact. The grey RUNNER DOWN surface stays; the
+  dashboard texts no one.*
 - **Push taxonomy is the safety net; glanceability is never load-bearing for an absent
   owner.** Final push list: runner down · ALERT · freeze aging past threshold or auto-fix
   itself failed/stalled · usage cap · needs-william/bounce · parks via threshold digest.

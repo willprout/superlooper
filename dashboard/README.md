@@ -59,7 +59,6 @@ Open `config.json` and set the one thing that's actually yours — **`repos`**:
   "gh_poll_seconds": 30,
   "heartbeat_down_seconds": 300,
   "superlooper_cli": "~/.claude/skills/superlooper/bin/superlooper",
-  "notify": { "imessage_to": null, "cmd": null },
   "fun": {
     "master": true,
     "solari": true,
@@ -85,7 +84,8 @@ Field by field:
   journal/state (default `2s` — the field feels live).
 - **`gh_poll_seconds`** — the slower clock for `gh` calls, which are rate-limited (default `30s`).
 - **`heartbeat_down_seconds`** — how stale the loop runner's heartbeat may get before the
-  dashboard lights **RUNNER DOWN** (default `300s`).
+  dashboard lights **RUNNER DOWN** (default `300s`). The dashboard *shows* a downed runner; it
+  never texts you about one — see [Who texts you when the runner goes down](#who-texts-you-when-the-runner-goes-down).
 - **`superlooper_cli`** — the path to your installed `superlooper` CLI, which the **Tidy** button
   runs locally to close the terminal windows of finished sessions (default
   `~/.claude/skills/superlooper/bin/superlooper`, `~` expanded). Change it only if your skill lives
@@ -96,9 +96,6 @@ Field by field:
   lane has no window (its session ended, or Tidy closed it) the button says so in the engine's own
   words rather than pretending it worked. It needs an installed engine new enough to carry
   `superlooper focus-session`; an older one is named plainly on the first tap.
-- **`notify`** — where the dashboard's one push (RUNNER DOWN) goes. `imessage_to` is a phone
-  number/handle to text; `cmd` is a shell command to run instead. Both `null` by default — a
-  fresh install nags no one.
 - **`fun`** — the joy toggles. `master` gates them all; each mechanic (the Solari board and its
   clack, airline liveries, the living clock, the corner counter, the incident sign) has its own
   switch. **All on by default** — the animated airfield is the point. Dial one back only if you
@@ -107,6 +104,22 @@ Field by field:
 Every field except `repos` has a sensible default, so the smallest valid `config.json` is just
 your repo list. If you mistype a key or type, the dashboard refuses to start and names the exact
 offender — a typo is a clear error, never a dashboard quietly watching the wrong thing.
+
+#### Who texts you when the runner goes down
+
+Not the dashboard. Runner-down paging belongs to the engine's watchdog (`superlooper watchdog`):
+it notices a stale runner heartbeat, restarts a runner that is provably gone, and sends the texts
+around both through the engine's own `notify` settings in each repo's `.superlooper/config.json`.
+How to install it, what trips it, and what it sends are in the runner-ops reference,
+[`plugin/skills/superlooper/references/runner-ops.md`](../plugin/skills/superlooper/references/runner-ops.md)
+▸ *The unattended-debugger watchdog*.
+
+The dashboard used to send its own RUNNER DOWN text as well. That was a second sender for the same
+fact: earlier than the watchdog, with no quiet hours, and sent again every time the dashboard
+restarted while a runner was still down. Issue #496 retired it. The board still greys RUNNER DOWN
+at `heartbeat_down_seconds`; it just no longer texts anyone. The `notify` block that configured that
+text went with it. If your `config.json` still has one, the dashboard (and `bin/liftoff`, which
+reads the same file) refuses to start and says why. Delete the block and start again.
 
 ### 3 · Run
 

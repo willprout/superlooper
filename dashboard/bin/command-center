@@ -46,7 +46,6 @@ import session_window as session_window_mod  # noqa: E402
 import stopswitch as stopswitch_mod  # noqa: E402
 import tidy as tidy_mod       # noqa: E402
 import version as version_mod  # noqa: E402
-import watchdog as watchdog_mod  # noqa: E402
 
 
 def _config_path(argv):
@@ -72,11 +71,11 @@ def _bind_error_line(port, err):
             'then start again.\n' % (port, reason, port))
 
 
-def build_provider(cfg, dashboard_desk, monitor, version=None, engine=None):
+def build_provider(cfg, dashboard_desk, version=None, engine=None):
     """Wire the snapshot provider: fresh local state every call, GitHub + usage on the slow clock,
-    the dashboard's own desk supplying the since-you-last-looked watermark (Task 9), and the
-    dead-man's switch (Task 10) — every poll re-evaluates the runner heartbeat and ``monitor`` (a
-    lib.watchdog.Watchdog) fires exactly one RUNNER DOWN push per down episode, off the poll thread.
+    and the dashboard's own desk supplying the since-you-last-looked watermark (Task 9). Every poll
+    re-reads the runner heartbeat, so a stale one greys the board RUNNER DOWN — shown, never texted:
+    runner-down paging is the engine watchdog's (issue #496 retired the dashboard's own push).
     ``version`` (a lib.version.Version, stamped once at boot) rides along so every poll re-checks
     whether this process's code still matches disk (issue #136). ``engine`` (a lib.engine.EngineDrift)
     does the same for the INSTALLED engine the runner actually executes (issue #166) — a merged
@@ -96,14 +95,10 @@ def build_provider(cfg, dashboard_desk, monitor, version=None, engine=None):
     concluded = server.ConcludedFlights()
 
     def provider():
-        snap = server.assemble_snapshot(cfg, now=time.time(), gh_mod=cached_gh,
+        return server.assemble_snapshot(cfg, now=time.time(), gh_mod=cached_gh,
                                         usage=usage_cache.get(), diff_reader=pollers.diff_stat,
                                         desk=dashboard_desk, concluded=concluded, version=version,
                                         engine=engine)
-        # The one push the dashboard owns (§6): the runner can't announce its own death. Bounded and
-        # never-raising, dispatched on a daemon thread so a slow notifier never stalls the snapshot.
-        server.dispatch_runner_pushes(snap, monitor, cfg)
-        return snap
 
     return provider
 
@@ -143,10 +138,6 @@ def main(argv):
     # The dashboard's OWN tiny state (the since-you-last-looked watermark, Task 9) — under $SL_HOME,
     # beside the loop state homes it reads, never inside them.
     dashboard_desk = desk_mod.Desk(desk_mod.default_path())
-    # The dead-man's switch's memory (Task 10): one Watchdog for the process life, so a runner that
-    # stays down costs one push, not one per 2s poll. In-memory → a restart re-arms (fails toward
-    # notifying, never toward a silent missed alert).
-    monitor = watchdog_mod.Watchdog()
     # This process's code identity, stamped ONCE, right here at boot (issue #136) — before a single
     # request is served, so it is unambiguously the code this process loaded rather than whatever the
     # checkout drifts to later. That is the whole trick: static assets are re-read from disk on every
@@ -162,7 +153,7 @@ def main(argv):
     engine_drift = engine_mod.EngineDrift(
         engine_mod.source_repo([r["path"] for r in cfg["repos"]]),
         engine_mod.install_dir(cfg["superlooper_cli"]))
-    provider = build_provider(cfg, dashboard_desk, monitor, code_version, engine_drift)
+    provider = build_provider(cfg, dashboard_desk, code_version, engine_drift)
     # The verbs (Task 6) — the only GitHub writes in the product. They take the RAW gh adapter, never
     # the slow read-cache (a label change must land now, not on the next 30s tick — CachedGh caches
     # only reads). The allow-list is exactly the configured slugs, so a tap can only ever steer a repo
