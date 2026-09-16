@@ -101,9 +101,16 @@ def test_a_delivery_stamped_far_in_the_future_is_unproven_not_fresh():
 
 def test_a_desktop_toast_is_not_a_text_that_reached_the_phone():
     # cmux is the doorway's local fallback when no owner channel is configured (doctor --stack refuses
-    # it as a channel): its delivery must never read as "last text delivered"
-    v = texts.last_text([_canary(NOW - HOUR, channel="cmux")], NOW)
-    assert v["delivered_age"] is None and v["state"] != texts.DELIVERED
+    # it as a channel): its delivery must never read as "last text delivered" — it proves no channel
+    v = texts.last_text([_canary(NOW - 3 * DAY), _canary(NOW - HOUR, channel="cmux")], NOW)
+    assert v["state"] == texts.UNCONFIGURED and v["delivered_age"] == 3 * DAY
+
+
+def test_only_an_owner_channel_counts_as_a_delivery():
+    for channel, counts in (("imessage", True), ("cmd", True), ("cmux", False), ("log-only", False),
+                            ("pager-of-the-future", False)):
+        v = texts.last_text([_canary(NOW - 60, channel=channel)], NOW)
+        assert (v["delivered_age"] is not None) is counts, channel
 
 
 def test_two_attempts_stamped_the_same_instant_read_the_later_journal_line():

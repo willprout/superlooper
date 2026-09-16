@@ -215,7 +215,7 @@ def _texts_line(verdict):
             " (rc=%d)" % rc if isinstance(rc, int) and not isinstance(rc, bool) else "",
             " · last delivered %s" % age if age else "")
     elif state == texts_mod.UNCONFIGURED:
-        text = "no text channel configured — texts go to the journal only"
+        text = "no text channel configured — texts reach no phone"
     elif v.get("delivered_untimed") is True:
         state = texts_mod.UNPROVEN          # a delivery exists; a clock jump took its age
         text = "last text's time cannot be read"

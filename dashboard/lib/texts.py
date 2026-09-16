@@ -22,7 +22,8 @@ channel. It is mirrored rather than imported: the dashboard never imports the en
   * ``unproven``     — no delivery on record, and the journal is too young to say "a week"; also a
                        delivery whose time cannot be trusted (stamped far in the future by a clock jump)
   * ``dead``         — the latest attempt failed
-  * ``unconfigured`` — the latest attempt was log-only: no channel is configured at all
+  * ``unconfigured`` — the latest attempt reached no owner channel: log-only, or a send that
+                       "worked" on a channel that puts nothing on a phone
 
 **Fail closed.** A record that cannot be read proves nothing: ``ok`` must be exactly ``True``, the ts
 must be a finite number, and the channel a real one. Junk degrades toward ``unproven``, never toward
@@ -48,10 +49,11 @@ STATES = (DELIVERED, STALE, UNPROVEN, DEAD, UNCONFIGURED)
 
 CANARY_ACT = "notify_canary"
 _LOG_ONLY = "log-only"
-# "Channels" on which no text reached the owner's phone: no channel configured, a refusal that never got
-# to one, and the engine's local desktop-toast fallback (which its own stack doctor refuses as a channel).
-# Mirrors the engine's report._NOT_A_DELIVERY.
-_NOT_A_DELIVERY = frozenset({_LOG_ONLY, "refused", "cmux"})
+# The channels that put a text on the owner's phone — an ALLOWLIST, mirroring the engine's
+# report._PHONE_CHANNELS. Every other channel the engine can journal reaches no phone: log-only (none
+# configured) and the engine's local desktop-toast fallback, which its own stack doctor refuses as a
+# channel. An allowlist also means a channel the engine grows later proves nothing until it is known to.
+_PHONE_CHANNELS = frozenset({"imessage", "cmd"})
 
 
 def _finite(v):
@@ -98,8 +100,7 @@ def last_text(journal, now, fmt=None):
         if latest is None or (timed and (latest_ts is None or ts >= latest_ts)):
             latest, latest_ts = rec, (ts if timed else latest_ts)
         channel = _channel(rec)
-        if (timed and rec.get("ok") is True and channel is not None
-                and channel not in _NOT_A_DELIVERY
+        if (timed and rec.get("ok") is True and channel in _PHONE_CHANNELS
                 and (delivered_ts is None or ts >= delivered_ts)):
             delivered_ts, delivered_channel = ts, channel
 
@@ -115,8 +116,11 @@ def last_text(journal, now, fmt=None):
            "delivered_channel": delivered_channel if age is not None else None,
            "delivered_untimed": delivered_ts is not None and age is None}
 
-    if isinstance(latest, dict) and _channel(latest) == _LOG_ONLY:
-        out["state"] = UNCONFIGURED
+    latest_channel = _channel(latest) if isinstance(latest, dict) else None
+    if latest_channel == _LOG_ONLY or (latest_channel is not None
+                                       and latest_channel not in _PHONE_CHANNELS
+                                       and latest.get("ok") is True):
+        out["state"] = UNCONFIGURED      # no owner channel: log-only, or a send that reached no phone
     elif isinstance(latest, dict) and latest.get("ok") is not True:
         out["state"] = DEAD
     elif age is not None:

@@ -359,11 +359,12 @@ CHANNEL_STALE_SECONDS = WEEK_SECONDS
 # jump. A stamp further ahead than this IS one, and proves no age at all.
 CLOCK_SKEW_SECONDS = 3600
 
-# A canary on one of these "channels" put no text on the owner's phone: log-only is no channel
-# configured, a refusal never reached a channel at all, and cmux is the local desktop toast the doorway
-# falls back to when no owner channel is set — which `doctor --stack` refuses as a channel for exactly
-# that reason (nobody is at the machine at 03:00).
-_NOT_A_DELIVERY = frozenset({"log-only", "refused", "cmux"})
+# The channels that put a text on the owner's phone — an ALLOWLIST, so a channel the doorway grows
+# later proves nothing until it is known to. Everything else the doorway can answer reaches no phone:
+# log-only is no channel configured, and cmux is the local desktop toast it falls back to when no owner
+# channel is set — which `doctor --stack` refuses as a channel for exactly that reason (nobody is at
+# the machine at 03:00). The dashboard's lib/texts mirrors this set.
+_PHONE_CHANNELS = frozenset({"imessage", "cmd"})
 
 
 def _last_delivered(canaries):
@@ -373,8 +374,7 @@ def _last_delivered(canaries):
     best = (None, None)
     for r in canaries:
         ts, channel = _since(_ts(r)), r.get("channel")
-        if (ts is None or r.get("ok") is not True or not isinstance(channel, str) or not channel
-                or channel in _NOT_A_DELIVERY):
+        if ts is None or r.get("ok") is not True or channel not in _PHONE_CHANNELS:
             continue
         if best[0] is None or ts >= best[0]:
             best = (ts, channel)
@@ -429,7 +429,10 @@ def notify_canary(records, now=None, max_age_seconds=None):
     rc = rc if isinstance(rc, int) and not isinstance(rc, bool) else None
     detail = latest.get("detail")
     detail = detail.strip() if isinstance(detail, str) and detail.strip() else ""
-    if channel == "log-only":
+    # No owner channel: log-only, or a send that "worked" on a channel that reaches no phone (the
+    # desktop-toast fallback). A FAILED send on any channel still reads as dead, below.
+    if channel == "log-only" or (channel != "?" and channel not in _PHONE_CHANNELS
+                                 and latest.get("ok") is True):
         return {"status": "unconfigured", "channel": channel, "rc": rc, "detail": detail, **last}
     if latest.get("ok") is True:               # `is True`: a truthy string must never read as green
         # Age-out a stale delivery for a windowed (weekly) reader. A missing/corrupt ts fails
@@ -469,8 +472,9 @@ def _notify_channel(records, now):
     last = (f"last text delivered {age} ago (via {v['last_delivered_channel']})" if age is not None
             else None)
     if v["status"] == "unconfigured":
-        return ("- Notify channel: **no channel configured** — pushes go to the journal only; set "
-                "`notify.imessage_to` or `notify.cmd` so alerts can reach your phone.")
+        return ("- Notify channel: **no channel configured** — no push reaches your phone (they go "
+                "to the journal, at most a desktop toast); set `notify.imessage_to` or `notify.cmd` "
+                "so alerts can reach your phone.")
     if v["status"] == "dead":
         # the last attempt did NOT deliver. Say so loudly, naming the channel + reason: this line is
         # the whole point — the owner reads it here even when the channel can't reach them.
@@ -1214,13 +1218,6 @@ def morning(journal_records, gh_view, ledger, config):
                f"{len(merged)} merged · {len(parked)} parked/needs-owner · "
                f"{len(bounces)} bounce(s) · {len(regens)} regen(s) · "
                f"{q_total} question(s) · queue: {len(queue)}.")
-    others = [(len(wanders), "wander(s)"), (len(watchdog), "unattended debugger launch(es)"),
-              (len(resurrections), "runner restart(s)")]
-    if any(n for n, _ in others):
-        # News the tally above does not count (#495). The summary line IS the text body, and the text
-        # now goes out only on news — so a night whose only news is a runner restart must not reach
-        # the phone reading "0 merged · 0 parked … queue: 0.", a text saying nothing happened.
-        summary += " Also: %s." % " · ".join("%d %s" % (n, what) for n, what in others if n)
     if triage_lines:
         # The summary line IS the push body, and it is the ONE place an autonomous delegation could
         # become invisible: a night on which a flight closed three issues would otherwise reach the
@@ -1240,6 +1237,16 @@ def morning(journal_records, gh_view, ledger, config):
         # that only happen to be equal today, and a single hardcoded number would become a lie the
         # day they diverge. The alert lines below each state their own age.
         summary += f" **{len(hold_alerts)} standing hold/freeze past its age threshold — see below.**"
+    others = [(len(wanders), "wander(s)"), (len(watchdog), "unattended-debugger event(s)"),
+              (len(resurrections), "runner-resurrection event(s)")]
+    if any(n for n, _ in others):
+        # News the tally above does not count (#495). The summary line IS the text body, and the text
+        # now goes out only on news — so a night whose only news is a runner resurrection must not
+        # reach the phone reading "0 merged · 0 parked … queue: 0.", a text saying nothing happened.
+        # "event", not "restart": a failed or capped attempt is news too, and the file says which.
+        # LAST, because the notify doorway cuts an over-cap text from its end — the bold alert
+        # clauses above must survive a cut before this does.
+        summary += " Also: %s." % " · ".join("%d %s" % (n, what) for n, what in others if n)
 
     parts = [
         f"# superlooper morning report — {date}\n",

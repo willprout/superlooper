@@ -1277,10 +1277,11 @@ def test_an_integer_timestamp_too_large_for_a_float_never_takes_the_report_down(
 
 @pytest.mark.parametrize("act,rec,words", [
     ("wander", dict(act="hold", id="i12", num=12, wander=True, outcome="ok"), "1 wander(s)"),
-    ("debugger", dict(act="watchdog", outcome="launched", id="d1", signals=["alert"],
-                      authority="full"), "1 unattended debugger launch(es)"),
-    ("resurrection", dict(act="runner_resurrect", outcome="resurrected", id="r1",
-                          signals=["heartbeat_stale"]), "1 runner restart(s)"),
+    # a FAILED launch is news too, so the clause names the event, never a success it cannot claim
+    ("debugger", dict(act="watchdog", outcome="launch_failed", id="d1", signals=["alert"], rc=1),
+     "1 unattended-debugger event(s)"),
+    ("resurrection", dict(act="runner_resurrect", outcome="resurrect_capped", max_per_hour=0,
+                          signals=["heartbeat_stale"]), "1 runner-resurrection event(s)"),
 ])
 def test_news_the_tally_does_not_count_is_still_named_in_the_text(act, rec, words):
     # The summary line IS the text body. A night whose only news is a runner restart used to text
@@ -1295,14 +1296,39 @@ def test_news_the_tally_does_not_count_is_still_named_in_the_text(act, rec, word
 
 def test_a_desktop_toast_is_not_a_text_that_reached_the_phone():
     # cmux is the local fallback when no owner channel is configured; doctor --stack already refuses
-    # it as a channel. Its delivery must not read as "last text delivered".
+    # it as a channel. Its delivery must not read as "last text delivered" — the channel it proves is
+    # no channel, so it reads exactly as log-only does.
     now = 1_000_000
-    j = [_canary(now - 3600, channel="cmux")]
-    assert report.notify_canary(j)["last_delivered_at"] is None
-    assert "last text delivered" not in _channel_line(j, now)
+    j = [_canary(now - 3 * DAY, channel="cmd"), _canary(now - 3600, channel="cmux")]
+    v = report.notify_canary(j)
+    assert (v["last_delivered_at"], v["status"]) == (now - 3 * DAY, "unconfigured")
+    line = _channel_line(j, now)
+    assert "no channel configured" in line.lower()
+
+
+def test_only_an_owner_channel_counts_as_a_delivery():
+    # an allowlist, not a denylist: a channel the doorway grows tomorrow proves nothing until it is
+    # known to reach the owner's phone
+    now = 1_000_000
+    for channel, counts in (("imessage", True), ("cmd", True), ("cmux", False), ("log-only", False),
+                            ("pager-of-the-future", False)):
+        v = report.notify_canary([_canary(now - 60, channel=channel)])
+        assert (v["last_delivered_at"] is not None) is counts, channel
 
 
 def test_two_canaries_stamped_the_same_instant_read_the_later_journal_line():
     # the dashboard reads the later line on a tie; the report must agree with it
     j = [_canary(1000), _canary(1000, ok=False, rc=2, detail="x")]
     assert report.notify_canary(j)["status"] == "dead"
+
+
+def test_the_untallied_news_clause_rides_after_the_alert_clauses():
+    # the notify doorway cuts an over-cap text from its END: the bold alert clauses must come first
+    now = _NEWS_NOW
+    j = [_LAST_REPORT, _rec(_OVERNIGHT, "runner_resurrect", outcome="resurrected", id="r1",
+                            signals=["heartbeat_stale"])]
+    view = _view(now=now, queue=[], usage=None,
+                 queue_hold={"reasons": ["auth_dead"], "since": now - 600})
+    out = report.morning(j, view, ledger={}, config=_cfg())
+    summary = next(ln for ln in out.splitlines() if ln.strip() and not ln.startswith("#"))
+    assert summary.index("THE LAUNCH QUEUE IS HELD") < summary.index("Also:")
