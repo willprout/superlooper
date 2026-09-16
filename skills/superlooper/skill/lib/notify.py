@@ -12,10 +12,19 @@ the priority), a one-clause headline, an optional ask line and an optional URL, 
 
 `repo` is the name half of the configured owner/name; `machine` is `notify.machine_label`, else the
 host's short hostname. The cap (TEXT_MAX_LINES, TEXT_MAX_BYTES) is enforced HERE: an overflowing
-input is cut to fit — the ask first, then the headline; the identity and the URL are never cut — and
-send()/send_test() journal the overflow as its own `notify_truncated` act, so a verbose caller
-surfaces in the morning report's gate health instead of reaching the phone unseen. send() and
-send_test() deliver only a Text the renderer produced; a raw string (the old free title) is refused.
+input is cut to fit — the ask first, then the headline; the identity and the URL survive unless the
+identity alone leaves no room for them — and send()/send_test() journal the overflow as its own
+`notify_truncated` act, so a verbose caller surfaces in the morning report's gate health instead of
+reaching the phone unseen. send() and send_test() deliver only a Text the renderer produced; a raw
+string (the old free title) is refused.
+
+THE PUBLISH SEAM. A runner started on the engine before this doorway keeps its old modules in memory
+but imports this one lazily, at its first send after the publish — and calls it with the old
+(config, title, body) shape. Refusing that call would silence a live runner's every text until
+someone restarts it, so exactly that three-positional shape is RENDERED (a tier inferred from the old
+title, caller `legacy:pre-493-engine`) rather than refused. It is still capped, still journaled when
+cut, and the engine's own senders can never use it (tests/test_notify.py scans for any call that
+passes more than (config, text[, home=])).
 
 DELIVERY, by a fixed precedence (line 1 of the envelope rides as the title, the rest as the body):
 
@@ -101,7 +110,8 @@ class Text(namedtuple("Text", ["tier", "lines", "caller", "full_bytes", "dropped
       lines:         the envelope, 1..TEXT_MAX_LINES single lines, within TEXT_MAX_BYTES together
       caller:        who asked for it ("decide:park", "cli:nightly", ...) — named in the truncation act
       full_bytes:    the size the envelope WOULD have had uncut
-      dropped_bytes: how much the cap removed (0 when the input fit)"""
+      dropped_bytes: how many bytes shorter the delivered text is than the uncut one (0 when the
+                     input fit; net of the "…" the cut adds)"""
     __slots__ = ()
 
     @property
@@ -121,8 +131,12 @@ def _notify_block(config):
 def _one_line(v):
     """Any input as ONE line: every run of whitespace — newlines included — becomes a single space.
     Collapsing is not truncation (nothing is lost); it is what keeps a multi-paragraph memo from
-    breaking the three-line envelope."""
-    return " ".join(str(v).split()) if v is not None else ""
+    breaking the three-line envelope. A character UTF-8 cannot carry (a lone surrogate decoded out of
+    a JSON escape in a memo) becomes "?", so measuring and delivering the text can never raise."""
+    if v is None:
+        return ""
+    s = str(v).encode("utf-8", "replace").decode("utf-8")
+    return " ".join(s.split())
 
 
 def _nbytes(s):
@@ -167,7 +181,7 @@ def _repo_name(config):
 def _fit(prefix, head, ask, url):
     """The envelope's lines within the cap. The order things give way is the design: the ask line is
     cut first (it is the part that grows into a runbook), then the headline; the identity prefix and
-    the URL are never cut (a cut URL is useless). Only an identity + URL that alone overflow — an
+    the URL are never cut (a cut URL is useless). Only an identity + URL that alone leave no room — an
     absurd label or repo — lose the URL, and past that line 1 is hard-cut, so the cap always holds."""
     def lines(h, a, u):
         return [prefix + h] + ([a] if a else []) + ([u] if u else [])
@@ -333,12 +347,48 @@ def _deliver(config, text):
     return SendResult("log-only", True, 0, "")
 
 
-def send(config, text, home=None):
+_LEGACY_CALLER = "legacy:pre-493-engine"
+
+
+def _legacy_text(config, title, body):
+    """Render the PRE-#493 call shape send(config, title, body) — made only by a runner still running
+    the engine that predates this doorway (see THE PUBLISH SEAM above). The tier is inferred from the
+    old engine's fixed title words, failing toward the owner: its morning push is MORNING, its
+    `superlooper: <id> ...` hand-backs and freeze notice are WAITING, and everything else (ALERT, the
+    boot HELD) is DOWN. Returns None when even that cannot render."""
+    title = _one_line(title)
+    if title.startswith("superlooper morning report"):
+        tier = MORNING
+    elif title.startswith("superlooper: "):
+        tier = WAITING
+    else:
+        tier = DOWN
+    try:
+        return render(config, tier, title, ask=body, caller=_LEGACY_CALLER)
+    except ValueError:
+        return None
+
+
+def _accepted(config, text, legacy):
+    """The Text send()/send_test() may deliver, or None to refuse: a rendered Text as-is; the exact
+    pre-#493 three-positional shape rendered through _legacy_text; anything else refused."""
+    if not legacy:
+        return text if _rendered(text) else None
+    if len(legacy) == 1 and not isinstance(text, Text):
+        t = _legacy_text(config, text, legacy[0])
+        return t if _rendered(t) else None
+    return None
+
+
+def send(config, text, *legacy, home=None):
     """Deliver one rendered owner text by the configured precedence; return a short outcome string
     the caller journals. Never raises. `text` must come from render() — anything else (a raw title
-    string, a tampered copy past the cap) is REFUSED, never delivered. A truncated text journals its
-    `notify_truncated` act into `home` (default: the configured state home) before it goes out."""
-    if not _rendered(text):
+    string, a tampered copy past the cap) is REFUSED, never delivered; the one exception is the
+    pre-#493 (config, title, body) shape, rendered by _legacy_text (THE PUBLISH SEAM). A truncated
+    text journals its `notify_truncated` act into `home` (default: the configured state home) before
+    it goes out."""
+    text = _accepted(config, text, legacy)
+    if text is None:
         return _REFUSED
     _journal_truncation(config, text, home)
     r = _deliver(config, text)
@@ -348,14 +398,15 @@ def send(config, text, home=None):
     return ok_msg if r.ok else fail_msg.format(rc=r.rc)
 
 
-def send_test(config, text, home=None):
+def send_test(config, text, *legacy, home=None):
     """Deliver ONE rendered text through the configured precedence and return the full SendResult
     (channel, ok, rc, stderr) — the stack doctor's hook for PROVING the channel works, and the
     morning report's canary. Same precedence, same refusal, same truncation journal, same never-raise
     guarantee as send(); the only difference is the caller gets rc + stderr instead of a flattened
     string, so a failed send can be reported with its actual reason. A real message really goes out:
     callers announce the side effect first."""
-    if not _rendered(text):
+    text = _accepted(config, text, legacy)
+    if text is None:
         return SendResult("refused", False, 2, _REFUSED)
     _journal_truncation(config, text, home)
     return _deliver(config, text)

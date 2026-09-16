@@ -478,3 +478,61 @@ def test_the_doctor_sender_seam_is_handed_a_rendered_text():
                               sender=_sender, announce=lambda *a: None)
     assert len(got) == 1 and isinstance(got[0], notify.Text) and got[0].tier == notify.TEST
     assert got[0].lines[0].startswith("🧪 superlooper@mini · ")
+
+
+# --- the publish seam (fresh review P1) ---------------------------------------------------------
+# A runner started on the pre-#493 engine keeps its old modules in memory but imports notify LAZILY,
+# at its first send after the gated publish — and calls send(config, title, body). Refusing that
+# shape would silence every text of a live runner until someone restarted it. Exactly that
+# three-positional shape is rendered (tier inferred from the old fixed title words) and capped.
+
+@pytest.mark.parametrize("title,emoji", [
+    ("superlooper: i7 parked", "🟠"),
+    ("superlooper: i7 needs an answer", "🟠"),
+    ("superlooper: merges frozen", "🟠"),
+    ("superlooper morning report — 2026-09-17", "☀️"),
+    ("superlooper ALERT", "🔴"),
+    ("superlooper HELD — a repo migration could not be applied", "🔴"),
+])
+def test_a_pre_doorway_runner_still_reaches_the_phone_through_the_renderer(tmp_path, monkeypatch,
+                                                                           title, emoji):
+    monkeypatch.setenv("SL_CMUX", str(tmp_path / "no-cmux"))
+    cfg, out = _cmd_cfg(tmp_path)
+    assert notify.send(cfg, title, "the old body") == "sent via cmd"
+    assert out.read_text() == f"{emoji} superlooper@mini · {title}\nthe old body"
+    out.unlink()
+    r = notify.send_test(cfg, title, "the old body")
+    assert r.ok is True and out.read_text().startswith(f"{emoji} superlooper@mini · ")
+
+
+def test_a_pre_doorway_runbook_is_capped_and_journaled_under_the_legacy_caller(tmp_path, monkeypatch):
+    monkeypatch.setenv("SL_CMUX", str(tmp_path / "no-cmux"))
+    monkeypatch.setenv("SL_HOME", str(tmp_path / "slhome"))
+    cfg, out = _cmd_cfg(tmp_path)
+    assert notify.send(cfg, "superlooper ALERT", "runbook " * 1500) == "sent via cmd"
+    assert len(out.read_text().encode("utf-8")) <= notify.TEXT_MAX_BYTES
+    recs = _journal(tmp_path / "slhome" / "willprout__superlooper")
+    assert [r["caller"] for r in recs if r["act"] == "notify_truncated"] == ["legacy:pre-493-engine"]
+
+
+def test_only_the_exact_legacy_shape_is_rendered_everything_else_is_still_refused(tmp_path,
+                                                                                  monkeypatch):
+    monkeypatch.setenv("SL_CMUX", str(tmp_path / "no-cmux"))
+    cfg, out = _cmd_cfg(tmp_path)
+    t = notify.render(cfg, notify.DOWN, "x")
+    assert notify.send(cfg, "a raw title").startswith("refused")            # two args: refused
+    assert notify.send(cfg, t, str(tmp_path)).startswith("refused")         # positional home
+    assert notify.send(cfg, "t", "b", "c").startswith("refused")            # four args
+    assert notify.send_test(cfg, t, "b").ok is False
+    assert not out.exists()
+
+
+def test_render_never_raises_on_a_lone_surrogate_in_a_memo(tmp_path, monkeypatch):
+    # A memo decoded from a JSON "\\ud800" escape carries a lone surrogate, which UTF-8 cannot encode.
+    # Before the doorway it failed quietly at send time; the doorway must not turn it into a raise.
+    monkeypatch.setenv("SL_CMUX", str(tmp_path / "no-cmux"))
+    cfg, out = _cmd_cfg(tmp_path)
+    t = notify.render(cfg, notify.WAITING, "i7 parked", ask="memo \ud800 tail " + "\ud800" * 400)
+    assert len(t.text.encode("utf-8")) <= notify.TEXT_MAX_BYTES
+    assert notify.send(cfg, t, home=tmp_path) == "sent via cmd"
+    assert out.read_text().startswith("🟠 superlooper@mini · i7 parked\nmemo ? tail")

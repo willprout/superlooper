@@ -561,8 +561,8 @@ journaled, never fatal; notifications are a convenience layer, never a safety la
 report, the morning report and `doctor --stack` — is rendered by one doorway into at most three
 lines: `<tier emoji> <repo>@<machine> · <what happened>`, then what is asked of you (when anything
 is), then the issue or PR URL (only when one exists). A text is capped at three lines and 280 bytes.
-A sender that says more is cut to fit — the ask first, then the headline; the identity and the URL
-never — and the cut is journaled as `notify_truncated`, which the morning report lists under **Gate
+A sender that says more is cut to fit — the ask first, then the headline, keeping the identity and
+the URL — and the cut is journaled as `notify_truncated`, which the morning report lists under **Gate
 health** by sender: a sender too verbose for a phone, whose full wording is still in the journal.
 
 ```
