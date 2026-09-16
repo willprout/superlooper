@@ -562,7 +562,7 @@ report, the morning report and `doctor --stack` — is rendered by one doorway i
 lines: `<tier emoji> <repo>@<machine> · <what happened>`, then what is asked of you (when anything
 is), then the issue or PR URL (only when one exists). A text is capped at three lines and 280 bytes.
 A sender that says more is cut to fit — the ask first, then the headline, keeping the identity and
-the URL — and the cut is journaled as `notify_truncated`, which the morning report lists under **Gate
+the URL whenever they fit — and the cut is journaled as `notify_truncated`, which the morning report lists under **Gate
 health** by sender: a sender too verbose for a phone, whose full wording is still in the journal.
 
 ```

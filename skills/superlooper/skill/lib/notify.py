@@ -18,14 +18,6 @@ identity alone leaves no room for them — and send()/send_test() journal the ov
 reaching the phone unseen. send() and send_test() deliver only a Text the renderer produced; a raw
 string (the old free title) is refused.
 
-THE PUBLISH SEAM. A runner started on the engine before this doorway keeps its old modules in memory
-but imports this one lazily, at its first send after the publish — and calls it with the old
-(config, title, body) shape. Refusing that call would silence a live runner's every text until
-someone restarts it, so exactly that three-positional shape is RENDERED (a tier inferred from the old
-title, caller `legacy:pre-493-engine`) rather than refused. It is still capped, still journaled when
-cut, and the engine's own senders can never use it (tests/test_notify.py scans for any call that
-passes more than (config, text[, home=])).
-
 DELIVERY, by a fixed precedence (line 1 of the envelope rides as the title, the rest as the body):
 
     notify.imessage_to  → text via Messages.app (skill/bin/imessage-notify.sh, an osascript
@@ -230,7 +222,15 @@ def _rendered(text):
     """True only for a Text render() could have produced: a closed-set tier whose emoji leads line 1,
     1..TEXT_MAX_LINES single lines within TEXT_MAX_BYTES. A raw string, a tuple, or a Text tampered
     past the cap (namedtuple._replace) is refused exactly like the old free title — the cap is a
-    property of what is delivered, not merely of what render() happened to return."""
+    property of what is delivered, not merely of what render() happened to return. Never raises: a
+    hand-built line UTF-8 cannot carry is refused, not measured into an exception."""
+    try:
+        return _shape_ok(text)
+    except Exception:
+        return False
+
+
+def _shape_ok(text):
     if not isinstance(text, Text):
         return False
     if not (isinstance(text.tier, str) and text.tier in TIER_EMOJI):
@@ -347,48 +347,16 @@ def _deliver(config, text):
     return SendResult("log-only", True, 0, "")
 
 
-_LEGACY_CALLER = "legacy:pre-493-engine"
-
-
-def _legacy_text(config, title, body):
-    """Render the PRE-#493 call shape send(config, title, body) — made only by a runner still running
-    the engine that predates this doorway (see THE PUBLISH SEAM above). The tier is inferred from the
-    old engine's fixed title words, failing toward the owner: its morning push is MORNING, its
-    `superlooper: <id> ...` hand-backs and freeze notice are WAITING, and everything else (ALERT, the
-    boot HELD) is DOWN. Returns None when even that cannot render."""
-    title = _one_line(title)
-    if title.startswith("superlooper morning report"):
-        tier = MORNING
-    elif title.startswith("superlooper: "):
-        tier = WAITING
-    else:
-        tier = DOWN
-    try:
-        return render(config, tier, title, ask=body, caller=_LEGACY_CALLER)
-    except ValueError:
-        return None
-
-
-def _accepted(config, text, legacy):
-    """The Text send()/send_test() may deliver, or None to refuse: a rendered Text as-is; the exact
-    pre-#493 three-positional shape rendered through _legacy_text; anything else refused."""
-    if not legacy:
-        return text if _rendered(text) else None
-    if len(legacy) == 1 and not isinstance(text, Text):
-        t = _legacy_text(config, text, legacy[0])
-        return t if _rendered(t) else None
-    return None
-
-
-def send(config, text, *legacy, home=None):
+def send(config, text, home=None):
     """Deliver one rendered owner text by the configured precedence; return a short outcome string
     the caller journals. Never raises. `text` must come from render() — anything else (a raw title
-    string, a tampered copy past the cap) is REFUSED, never delivered; the one exception is the
-    pre-#493 (config, title, body) shape, rendered by _legacy_text (THE PUBLISH SEAM). A truncated
-    text journals its `notify_truncated` act into `home` (default: the configured state home) before
-    it goes out."""
-    text = _accepted(config, text, legacy)
-    if text is None:
+    string, a tampered copy past the cap) is REFUSED, never delivered. A truncated text journals its
+    `notify_truncated` act into `home` (default: the configured state home) before it goes out.
+
+    No compatibility shape for the pre-#493 (config, title, body) call is needed across the publish:
+    a runner lives inside `superlooper run`, which imports this module at start-up, so a runner
+    started on the old engine keeps the old module in memory until it is restarted."""
+    if not _rendered(text):
         return _REFUSED
     _journal_truncation(config, text, home)
     r = _deliver(config, text)
@@ -398,15 +366,14 @@ def send(config, text, *legacy, home=None):
     return ok_msg if r.ok else fail_msg.format(rc=r.rc)
 
 
-def send_test(config, text, *legacy, home=None):
+def send_test(config, text, home=None):
     """Deliver ONE rendered text through the configured precedence and return the full SendResult
     (channel, ok, rc, stderr) — the stack doctor's hook for PROVING the channel works, and the
     morning report's canary. Same precedence, same refusal, same truncation journal, same never-raise
     guarantee as send(); the only difference is the caller gets rc + stderr instead of a flattened
     string, so a failed send can be reported with its actual reason. A real message really goes out:
     callers announce the side effect first."""
-    text = _accepted(config, text, legacy)
-    if text is None:
+    if not _rendered(text):
         return SendResult("refused", False, 2, _REFUSED)
     _journal_truncation(config, text, home)
     return _deliver(config, text)

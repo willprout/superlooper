@@ -439,11 +439,21 @@ _ENGINE_SOURCES = sorted(
        if p.is_file() and (p.suffix == ".py" or p.name == "superlooper")])
 
 
+def _notify_aliases(tree):
+    """Every name the module binds the notify module to (`import notify`, `import notify as x`)."""
+    names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names |= {a.asname or a.name for a in node.names if a.name == "notify"}
+    return names
+
+
 def _send_calls(tree):
+    aliases = _notify_aliases(tree) | {"notify"}
     for node in ast.walk(tree):
         if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
                 and node.func.attr in ("send", "send_test")
-                and isinstance(node.func.value, ast.Name) and node.func.value.id == "notify"):
+                and isinstance(node.func.value, ast.Name) and node.func.value.id in aliases):
             yield node
 
 
@@ -454,7 +464,8 @@ def test_no_raw_title_string_reaches_send_anywhere_in_the_engine():
         for call in _send_calls(tree):
             seen += 1
             where = f"{path.name}:{call.lineno}"
-            if len(call.args) != 2 or any(k.arg != "home" for k in call.keywords):
+            if (len(call.args) != 2 or any(isinstance(a, ast.Starred) for a in call.args)
+                    or any(k.arg != "home" for k in call.keywords)):
                 offenders.append(f"{where}: send takes (config, rendered_text[, home=])")
                 continue
             text = call.args[1]
@@ -480,52 +491,29 @@ def test_the_doctor_sender_seam_is_handed_a_rendered_text():
     assert got[0].lines[0].startswith("🧪 superlooper@mini · ")
 
 
-# --- the publish seam (fresh review P1) ---------------------------------------------------------
-# A runner started on the pre-#493 engine keeps its old modules in memory but imports notify LAZILY,
-# at its first send after the gated publish — and calls send(config, title, body). Refusing that
-# shape would silence every text of a live runner until someone restarted it. Exactly that
-# three-positional shape is rendered (tier inferred from the old fixed title words) and capped.
 
-@pytest.mark.parametrize("title,emoji", [
-    ("superlooper: i7 parked", "🟠"),
-    ("superlooper: i7 needs an answer", "🟠"),
-    ("superlooper: merges frozen", "🟠"),
-    ("superlooper morning report — 2026-09-17", "☀️"),
-    ("superlooper ALERT", "🔴"),
-    ("superlooper HELD — a repo migration could not be applied", "🔴"),
-])
-def test_a_pre_doorway_runner_still_reaches_the_phone_through_the_renderer(tmp_path, monkeypatch,
-                                                                           title, emoji):
+# --- inputs UTF-8 cannot carry (fresh review P2) ---------------------------------------------------
+# send()/send_test() never raise, whatever they are handed; render() never raises but for a tier.
+
+def test_the_pre_doorway_call_shape_is_refused_never_delivered(tmp_path, monkeypatch):
+    # A runner started on the old engine never reaches this module (superlooper run imports notify at
+    # start-up, so it keeps the old one until restarted); any (config, title, body) call is a bug.
     monkeypatch.setenv("SL_CMUX", str(tmp_path / "no-cmux"))
     cfg, out = _cmd_cfg(tmp_path)
-    assert notify.send(cfg, title, "the old body") == "sent via cmd"
-    assert out.read_text() == f"{emoji} superlooper@mini · {title}\nthe old body"
-    out.unlink()
-    r = notify.send_test(cfg, title, "the old body")
-    assert r.ok is True and out.read_text().startswith(f"{emoji} superlooper@mini · ")
+    assert notify.send(cfg, "superlooper ALERT", "the old body").startswith("refused")
+    assert notify.send_test(cfg, "superlooper morning report — 2026-09-17", "summary").ok is False
+    assert not out.exists()
+    assert not (tmp_path / "the old body").exists()          # the body never became a journal home
 
 
-def test_a_pre_doorway_runbook_is_capped_and_journaled_under_the_legacy_caller(tmp_path, monkeypatch):
-    monkeypatch.setenv("SL_CMUX", str(tmp_path / "no-cmux"))
-    monkeypatch.setenv("SL_HOME", str(tmp_path / "slhome"))
-    cfg, out = _cmd_cfg(tmp_path)
-    assert notify.send(cfg, "superlooper ALERT", "runbook " * 1500) == "sent via cmd"
-    assert len(out.read_text().encode("utf-8")) <= notify.TEXT_MAX_BYTES
-    recs = _journal(tmp_path / "slhome" / "willprout__superlooper")
-    assert [r["caller"] for r in recs if r["act"] == "notify_truncated"] == ["legacy:pre-493-engine"]
-
-
-def test_only_the_exact_legacy_shape_is_rendered_everything_else_is_still_refused(tmp_path,
-                                                                                  monkeypatch):
+def test_a_hand_built_text_carrying_a_lone_surrogate_is_refused_not_raised(tmp_path, monkeypatch):
     monkeypatch.setenv("SL_CMUX", str(tmp_path / "no-cmux"))
     cfg, out = _cmd_cfg(tmp_path)
     t = notify.render(cfg, notify.DOWN, "x")
-    assert notify.send(cfg, "a raw title").startswith("refused")            # two args: refused
-    assert notify.send(cfg, t, str(tmp_path)).startswith("refused")         # positional home
-    assert notify.send(cfg, "t", "b", "c").startswith("refused")            # four args
-    assert notify.send_test(cfg, t, "b").ok is False
+    bad = t._replace(lines=(t.lines[0] + "\ud800",))
+    assert notify.send(cfg, bad, home=tmp_path).startswith("refused")
+    assert notify.send_test(cfg, bad, home=tmp_path).ok is False
     assert not out.exists()
-
 
 def test_render_never_raises_on_a_lone_surrogate_in_a_memo(tmp_path, monkeypatch):
     # A memo decoded from a JSON "\\ud800" escape carries a lone surrogate, which UTF-8 cannot encode.
