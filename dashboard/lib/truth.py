@@ -216,6 +216,9 @@ def _texts_line(verdict):
             " · last delivered %s" % age if age else "")
     elif state == texts_mod.UNCONFIGURED:
         text = "no text channel configured — texts go to the journal only"
+    elif v.get("delivered_untimed") is True:
+        state = texts_mod.UNPROVEN          # a delivery exists; a clock jump took its age
+        text = "last text's time cannot be read"
     else:
         state = texts_mod.UNPROVEN          # includes a "delivered" verdict with no age to show
         text = "no text delivered yet"
@@ -257,11 +260,13 @@ def banner(source, engine=None, github=None, stopped=None, texts=None):
     # issues correctly and journalling why (#172). It is a thing the owner should KNOW, because the
     # visible symptom is his queue standing still, and a strip that stayed green through it would be
     # the same confident blank this module exists to end.
-    # A channel nothing has proven this week (#495) is a NOTICE too: nothing in the loop is broken, but
-    # a page sent now may not reach the phone, and this strip is where the owner looks before he
-    # approves work that would page him. A working channel says its age and changes nothing.
+    # A channel KNOWN not to reach the phone (#495) — its last send failed, or none is configured — is a
+    # NOTICE: a page sent now will not arrive. A channel merely unproven this week (stale, or nothing on
+    # record yet) is NOT: with no heartbeat text, an idle week is the normal way to get there, and a
+    # strip amber every quiet week is wallpaper that would hide the next drift or blind-data notice
+    # under a colour that already means nothing. Its line says it plainly, in its own ink.
     elif (data["state"] in ("blind", "dark", "unvouched") or eng is not None
-          or (txt is not None and txt["state"] != texts_mod.DELIVERED)):
+          or (txt is not None and txt["state"] in (texts_mod.DEAD, texts_mod.UNCONFIGURED))):
         level = LEVEL_NOTICE
     return {"level": level, "tick": tick, "data": data, "engine": eng, "texts": txt}
 

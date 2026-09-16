@@ -96,6 +96,19 @@ def test_a_delivery_with_an_unusable_time_proves_nothing():
 def test_a_delivery_stamped_far_in_the_future_is_unproven_not_fresh():
     v = texts.last_text([_canary(NOW + DAY)], NOW)
     assert v["state"] == texts.UNPROVEN and v["delivered_age"] is None
+    assert v["delivered_untimed"] is True        # a delivery exists; only its age cannot be read
+
+
+def test_a_desktop_toast_is_not_a_text_that_reached_the_phone():
+    # cmux is the doorway's local fallback when no owner channel is configured (doctor --stack refuses
+    # it as a channel): its delivery must never read as "last text delivered"
+    v = texts.last_text([_canary(NOW - HOUR, channel="cmux")], NOW)
+    assert v["delivered_age"] is None and v["state"] != texts.DELIVERED
+
+
+def test_two_attempts_stamped_the_same_instant_read_the_later_journal_line():
+    j = [_canary(NOW - HOUR), _canary(NOW - HOUR, ok=False, rc=2)]
+    assert texts.last_text(j, NOW)["state"] == texts.DEAD
 
 
 def test_junk_never_raises_into_the_two_second_poll():

@@ -605,8 +605,12 @@ html, body {
    quiet accent — "re-run the installer to switch them on" is an instruction, and an instruction
    the eye slides past is not one. */
 .fld-truth .r.eng { color: #E0B860; }
-/* A text that FAILED to send (issue #495) is the one texts reading that names a broken channel, so it
-   keeps a warm accent even on the notice ground; the other quiet-channel readings ride the level. */
+/* The texts line (issue #495). A text this week is the calm base ink. A channel merely unproven (stale,
+   nothing on record) does NOT raise the strip — an idle week is normal now — so the line carries the
+   reading in the engine line's amber. A send that FAILED, or no channel at all, also raises the strip
+   to notice; the failure keeps a warmer accent on that ground because pages are known not to arrive. */
+.fld-truth .r.texts.stale, .fld-truth .r.texts.unproven, .fld-truth .r.texts.unconfigured {
+  color: #E0B860; }
 .fld-truth .r.texts.dead { color: #F2A48F; }
 
 /* NOTICE — something is drifting; nothing is broken. Amber, the field's existing caution colour

@@ -621,9 +621,11 @@ only matters when there is work to page you about, and you look at the dashboard
 work. Instead, every text the loop tries to send, of any kind and from any sender, is journaled as
 `notify_canary` with whether it was delivered. The morning report's **Notify channel** line and the
 dashboard's truth strip show how long ago a text last reached your phone ("last text delivered 3h
-ago"), and both say plainly when nothing has been delivered in more than a week. A send that failed
-still reads as a dead channel, with its error. `superlooper doctor --stack` is the live test: it
-sends one real message, and that message counts as a delivery too.
+ago"), and both say plainly when nothing has been delivered in more than a week. A desktop toast is
+not a text to your phone and never counts. A quiet week only changes that line; a send that failed,
+or no channel configured at all, also turns the strip amber — the report names the failure's error.
+`superlooper doctor --stack` is the live test: it sends one real message, and that message counts
+as a delivery too.
 
 **One-time setup:** the first time it texts you, macOS asks permission to let the terminal control
 Messages — click **Allow** once. **Every launchd-started job** — the nightly, the watchdog, and (in

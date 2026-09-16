@@ -288,3 +288,15 @@ def test_every_texts_state_but_delivered_has_its_own_boring_mode_ink():
         assert rule, ".btruth has no rule for texts state %r — it would read as a working channel" % state
         assert re.search(r"color|font-weight", rule.group(1)), (
             ".btruth .r.texts.%s must paint its own ink/weight" % state)
+
+
+def test_every_texts_state_but_delivered_has_its_own_field_strip_ink():
+    # stale and unproven do not raise the strip's level (an idle week is not an alarm), so on the
+    # field the LINE has to carry the reading itself — else it is grey text on a calm chip.
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+    import texts
+
+    for state in sorted(set(texts.STATES) - {texts.DELIVERED}):
+        rule = re.search(r"\.fld-truth \.r\.texts\.%s\b[^{]*\{([^}]*)\}" % re.escape(state), _CSS)
+        assert rule, ".fld-truth has no rule for texts state %r" % state
+        assert re.search(r"color", rule.group(1)), ".fld-truth .r.texts.%s must paint its own ink" % state

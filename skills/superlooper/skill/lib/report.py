@@ -359,9 +359,11 @@ CHANNEL_STALE_SECONDS = WEEK_SECONDS
 # jump. A stamp further ahead than this IS one, and proves no age at all.
 CLOCK_SKEW_SECONDS = 3600
 
-# A canary on one of these "channels" delivered nothing to anyone: log-only is no channel configured,
-# and a refusal never reached a channel at all.
-_NOT_A_DELIVERY = frozenset({"log-only", "refused"})
+# A canary on one of these "channels" put no text on the owner's phone: log-only is no channel
+# configured, a refusal never reached a channel at all, and cmux is the local desktop toast the doorway
+# falls back to when no owner channel is set — which `doctor --stack` refuses as a channel for exactly
+# that reason (nobody is at the machine at 03:00).
+_NOT_A_DELIVERY = frozenset({"log-only", "refused", "cmux"})
 
 
 def _last_delivered(canaries):
@@ -412,7 +414,15 @@ def notify_canary(records, now=None, max_age_seconds=None):
     last = {"last_delivered_at": delivered_at, "last_delivered_channel": delivered_channel}
     if not canaries:
         return {"status": "unverified", "channel": "?", "rc": None, "detail": "", **last}
-    latest = max(canaries, key=lambda r: _ts(r) if _ts(r) is not None else float("-inf"))
+    # The newest by ts; on a tie, the later journal line (the dashboard's lib/texts reads it the same
+    # way, so the report file and the strip never disagree about which attempt was last).
+    latest = None
+    for r in canaries:
+        ts = _since(_ts(r))
+        rank = ts if ts is not None else float("-inf")
+        if latest is None or rank >= latest[0]:
+            latest = (rank, r)
+    latest = latest[1]
     channel = latest.get("channel")
     channel = channel if isinstance(channel, str) and channel else "?"
     rc = latest.get("rc")
@@ -812,9 +822,16 @@ def _age(seconds):
 def _since(v):
     """An epoch stamp, or None if it is missing, wrong-typed (bool is an int — exclude it) or
     non-finite (json round-trips `NaN`/`Infinity`). Dropped at the door so no downstream arithmetic —
-    the age render OR the alert threshold comparison — ever sees one."""
-    return v if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) \
-        else None
+    the age render OR the alert threshold comparison — ever sees one. `OverflowError` is caught
+    because json also parses an integer too large for a float, and `math.isfinite` RAISES on one
+    rather than answering False (the dashboard's #458 shape; every journal ts reaches here since
+    #495)."""
+    if not isinstance(v, (int, float)) or isinstance(v, bool):
+        return None
+    try:
+        return v if math.isfinite(v) else None
+    except OverflowError:
+        return None
 
 
 def _iid_num(iid):
@@ -1197,6 +1214,13 @@ def morning(journal_records, gh_view, ledger, config):
                f"{len(merged)} merged · {len(parked)} parked/needs-owner · "
                f"{len(bounces)} bounce(s) · {len(regens)} regen(s) · "
                f"{q_total} question(s) · queue: {len(queue)}.")
+    others = [(len(wanders), "wander(s)"), (len(watchdog), "unattended debugger launch(es)"),
+              (len(resurrections), "runner restart(s)")]
+    if any(n for n, _ in others):
+        # News the tally above does not count (#495). The summary line IS the text body, and the text
+        # now goes out only on news — so a night whose only news is a runner restart must not reach
+        # the phone reading "0 merged · 0 parked … queue: 0.", a text saying nothing happened.
+        summary += " Also: %s." % " · ".join("%d %s" % (n, what) for n, what in others if n)
     if triage_lines:
         # The summary line IS the push body, and it is the ONE place an autonomous delegation could
         # become invisible: a night on which a flight closed three issues would otherwise reach the

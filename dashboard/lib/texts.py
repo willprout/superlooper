@@ -48,8 +48,10 @@ STATES = (DELIVERED, STALE, UNPROVEN, DEAD, UNCONFIGURED)
 
 CANARY_ACT = "notify_canary"
 _LOG_ONLY = "log-only"
-# "Channels" on which nothing reached anyone: no channel configured, or a refusal that never got to one.
-_NOT_A_DELIVERY = frozenset({_LOG_ONLY, "refused"})
+# "Channels" on which no text reached the owner's phone: no channel configured, a refusal that never got
+# to one, and the engine's local desktop-toast fallback (which its own stack doctor refuses as a channel).
+# Mirrors the engine's report._NOT_A_DELIVERY.
+_NOT_A_DELIVERY = frozenset({_LOG_ONLY, "refused", "cmux"})
 
 
 def _finite(v):
@@ -75,9 +77,10 @@ def last_text(journal, now, fmt=None):
     ``now``     the snapshot clock.
     ``fmt``     an injectable seconds → duration formatter (the server passes ``format_duration``).
 
-    Returns ``{state, channel, rc, delivered_age, delivered_age_text, delivered_channel}``:
-    ``channel``/``rc`` describe the LATEST attempt (what a dead channel names); the ``delivered_*``
-    fields describe the newest DELIVERED text, whatever came after it."""
+    Returns ``{state, channel, rc, delivered_age, delivered_age_text, delivered_channel,
+    delivered_untimed}``: ``channel``/``rc`` describe the LATEST attempt (what a dead channel names);
+    the ``delivered_*`` fields describe the newest DELIVERED text, whatever came after it, and
+    ``delivered_untimed`` is True when one exists but its age cannot be read."""
     records = [r for r in journal if isinstance(r, dict)] if isinstance(journal, list) else []
     clock = now if _finite(now) else None
 
@@ -109,7 +112,8 @@ def last_text(journal, now, fmt=None):
            "delivered_age": age,
            "delivered_age_text": ("%s ago" % fmt(age)) if (fmt is not None and age is not None)
            else None,
-           "delivered_channel": delivered_channel if age is not None else None}
+           "delivered_channel": delivered_channel if age is not None else None,
+           "delivered_untimed": delivered_ts is not None and age is None}
 
     if isinstance(latest, dict) and _channel(latest) == _LOG_ONLY:
         out["state"] = UNCONFIGURED

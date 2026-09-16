@@ -10,7 +10,6 @@ steady state the dashboard makes NO GitHub reads of its own" — the second poll
 budget is what helped drain the hourly GraphQL quota behind the 2026-07-08 park/notify storms
 (§1b). A stub that RECORDS every read is the only way to assert an absence of egress.
 """
-import json
 import os
 import shutil
 
@@ -215,10 +214,6 @@ def test_fallback_still_reports_the_tick_timer(home):
 def test_a_vouched_poll_leaves_the_strip_calm(home):
     _heartbeat(home, 10)
     _publish(home, closed_read_ok=True)
-    # a text reached the phone this week (issue #495) — else the strip rightly notes the channel
-    with open(home / "journal.jsonl", "a") as f:
-        f.write(json.dumps({"ts": NOW - 3600, "act": "notify_canary", "ok": True, "channel": "cmd",
-                            "rc": 0, "detail": "", "outcome": "ok"}) + "\n")
     rs = _repo(server.assemble_snapshot(_config(home), now=NOW, gh_mod=_CountingGh()))
     assert rs["source"]["closed_read_ok"] is True
     assert rs["truth"]["data"]["state"] == "ok"

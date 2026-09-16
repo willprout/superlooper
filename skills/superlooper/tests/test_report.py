@@ -1258,3 +1258,51 @@ def test_a_delivery_stamped_far_in_the_future_is_a_clock_jump_and_proves_no_age(
     now = 1_000_000
     line = _channel_line([_canary(now + 2 * DAY)], now)
     assert "cannot be read" in line and "last text delivered" not in line
+
+
+# --- fresh review of #495 -------------------------------------------------------------------------
+
+def test_an_integer_timestamp_too_large_for_a_float_never_takes_the_report_down():
+    # json parses a 400-digit integer happily, and math.isfinite RAISES on it. #495 made every
+    # journal record's ts pass through _since (the channel line's journal-span check), so one such
+    # line would have blanked the morning report — the file AND the text — until it rotated out.
+    now = 1_000_000
+    j = [_rec(10 ** 400, "merge", id="i7", num=7, outcome="ok"),
+         _rec(10 ** 400, "notify_canary", ok=True, channel="cmd", rc=0, outcome="ok")]
+    out = report.morning(j, _view(now=now), ledger={}, config=_cfg())
+    assert "Notify channel" in out
+    assert report.notify_canary(j)["last_delivered_at"] is None
+    assert isinstance(report.morning_news(j, _view(now=now)), list)
+
+
+@pytest.mark.parametrize("act,rec,words", [
+    ("wander", dict(act="hold", id="i12", num=12, wander=True, outcome="ok"), "1 wander(s)"),
+    ("debugger", dict(act="watchdog", outcome="launched", id="d1", signals=["alert"],
+                      authority="full"), "1 unattended debugger launch(es)"),
+    ("resurrection", dict(act="runner_resurrect", outcome="resurrected", id="r1",
+                          signals=["heartbeat_stale"]), "1 runner restart(s)"),
+])
+def test_news_the_tally_does_not_count_is_still_named_in_the_text(act, rec, words):
+    # The summary line IS the text body. A night whose only news is a runner restart used to text
+    # "0 merged · 0 parked … queue: 0." — a text that now means "something happened" saying nothing did.
+    view = _view(now=_NEWS_NOW, queue=[], usage=None)
+    j = [_LAST_REPORT, dict(ts=_OVERNIGHT, **rec)]
+    assert report.morning_news(j, view, config=_cfg())                  # it is news…
+    out = report.morning(j, view, ledger={}, config=_cfg())
+    summary = next(ln for ln in out.splitlines() if ln.strip() and not ln.startswith("#"))
+    assert words in summary                                              # …and the text says which
+
+
+def test_a_desktop_toast_is_not_a_text_that_reached_the_phone():
+    # cmux is the local fallback when no owner channel is configured; doctor --stack already refuses
+    # it as a channel. Its delivery must not read as "last text delivered".
+    now = 1_000_000
+    j = [_canary(now - 3600, channel="cmux")]
+    assert report.notify_canary(j)["last_delivered_at"] is None
+    assert "last text delivered" not in _channel_line(j, now)
+
+
+def test_two_canaries_stamped_the_same_instant_read_the_later_journal_line():
+    # the dashboard reads the later line on a tie; the report must agree with it
+    j = [_canary(1000), _canary(1000, ok=False, rc=2, detail="x")]
+    assert report.notify_canary(j)["status"] == "dead"

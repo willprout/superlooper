@@ -148,7 +148,6 @@ def test_a_runner_that_never_ticked_is_down_not_blank(home):
 def test_a_fresh_runner_reads_calm_and_says_the_tick_age(home):
     _publish(home)
     _heartbeat(home, 10)
-    _texted(home, 3 * 3600)
     t = _strip(server.assemble_snapshot(_config(home), now=NOW, gh_mod=_Gh()))
     assert t["tick"]["state"] == "ok"
     assert t["tick"]["text"].startswith("last tick ")
@@ -230,7 +229,6 @@ def test_a_down_loop_outranks_engine_drift_end_to_end(home):
 def test_the_whole_field_strip_reaches_the_snapshot(home):
     _publish(home)
     _heartbeat(home, 10)
-    _texted(home, 3600)
     snap = server.assemble_snapshot(_config(home), now=NOW, gh_mod=_Gh())
     assert "truth" in snap, "boring mode has no field — it needs the whole-field strip on the snapshot"
     assert [r["name"] for r in snap["truth"]["repos"]] == ["superlooper-sandbox"]
@@ -288,7 +286,6 @@ def test_the_worst_repo_sets_the_level_and_the_healthy_one_keeps_its_own_words(t
         for iid in ("i16", "i23"):
             os.utime(dst / "state" / "activity" / iid, (NOW - 100, NOW - 100))
         _publish(dst)
-        _texted(dst, 3600)
         homes[name] = dst
     _heartbeat(homes["alpha"], 10)                    # healthy
     _heartbeat(homes["bravo"], SILENT_AFTER + 500)    # silent
@@ -327,13 +324,13 @@ def test_the_last_delivered_text_reaches_the_strip_with_its_age(home):
     assert snap["truth"]["repos"][0]["texts"] is t["texts"], "boring mode binds the same verdict"
 
 
-def test_a_week_with_no_delivered_text_turns_the_strip_to_a_notice(home):
+def test_a_week_with_no_delivered_text_is_said_plainly_without_nagging(home):
     _publish(home)
     _heartbeat(home, 10)
     _texted(home, 9 * 86400)
     t = _strip(server.assemble_snapshot(_config(home), now=NOW, gh_mod=_Gh()))
     assert t["texts"]["state"] == "stale" and "over a week" in t["texts"]["text"]
-    assert t["level"] == "notice"
+    assert t["level"] == "ok", "an idle week is not an alarm — the line says it; the strip stays calm"
 
 
 def test_a_failed_text_after_a_delivery_reads_as_dead(home):
@@ -343,12 +340,13 @@ def test_a_failed_text_after_a_delivery_reads_as_dead(home):
     _texted(home, 60, ok=False)
     t = _strip(server.assemble_snapshot(_config(home), now=NOW, gh_mod=_Gh()))
     assert t["texts"]["state"] == "dead" and "last delivered 24h ago" in t["texts"]["text"]
+    assert t["level"] == "notice"
 
 
-def test_a_state_home_with_no_text_on_record_is_never_calm(home):
+def test_a_state_home_with_no_text_on_record_says_so_rather_than_claiming_a_delivery(home):
     # the fixture journal has no canary: nothing has proven the channel, and silence is not proof
     _publish(home)
     _heartbeat(home, 10)
     t = _strip(server.assemble_snapshot(_config(home), now=NOW, gh_mod=_Gh()))
     assert t["texts"]["state"] in ("unproven", "stale")
-    assert t["level"] == "notice"
+    assert "last text delivered" not in t["texts"]["text"]
