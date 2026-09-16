@@ -34,6 +34,7 @@ for _p in (os.path.join(_HERE, "..", "lib"),):
 import actions
 import brief
 import events as events_mod
+from events import WAKE_GAP_SECONDS, WAKE_GRACE_SECONDS
 import evidence
 import gate
 import gh
@@ -54,20 +55,9 @@ TICK_SECONDS = 15
 TICK_ERROR_ALERT = 4           # consecutive tick crashes (~1 min at 15 s) -> ALERT + notify. A
                                # wedged tick never reaches actions.decide, so this alarm is raised
                                # from run()'s own guard, not the decide brain (incident 2026-07-07).
-# Post-wake grace (issue #42). Closing the laptop overnight suspends the runner mid-tick; on wake the
-# next tick lands hours later than the ~15s cadence predicts, so every in-flight worker's activity
-# and the usage meter's last-success look ancient purely from the wall-clock jump — which used to
-# fire a cascade of false frozen-recovery nudges + a self-clearing usage_stale ALERT on a stranger's
-# first sleeping night. A tick whose gap since the previous tick reaches WAKE_GAP_SECONDS is read as
-# a wake (well above any routine tick — even a merge-update recheck maxes near RECHECK_TIMEOUT — and
-# well below the smallest false-alarm window: the usage fail-open grace at 30 min, frozen at 45 min).
-WAKE_GAP_SECONDS = 1200
-# WAKE_GRACE_SECONDS: how long after a detected wake gap the liveness (idle/frozen) and usage_stale
-# alarms stay disarmed. It PROTECTS AGAINST the resume artifact — it is the window a suspended-then-
-# resumed healthy worker needs to re-stamp its activity, and the usage poller (60s cadence) needs to
-# land a fresh fetch, before the alarms re-arm. A genuinely dead session or dark meter still alarms
-# once it expires; short enough that a real death is delayed only minutes atop the 45-min freeze tier.
-WAKE_GRACE_SECONDS = 300
+# Post-wake grace (issue #42): WAKE_GAP_SECONDS / WAKE_GRACE_SECONDS live in lib/events.py, imported
+# above — the watchdog opens the same grace when it sees the machine slept (issue #491), so the two
+# processes read ONE definition.
 # State-home format version (issue #45). The dashboard reads this state home field-by-field and
 # every reader fails CLOSED to empty, so a future change to the on-disk SHAPE would silently BLANK
 # the dashboard rather than error. The runner stamps this number into state/state_format.json at

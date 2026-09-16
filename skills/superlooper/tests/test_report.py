@@ -772,6 +772,33 @@ def test_watchdog_countdowns_reach_the_report_without_breaking_quiet():
     assert "None — the watchdog launched nothing." in old_out
 
 
+
+def test_a_machine_sleep_the_watchdog_saw_reaches_the_report_without_breaking_quiet():
+    # issue #491: the watchdog holds a stale heartbeat across a wake instead of paging — so the report
+    # FILE says the machine slept, and whether the runner came back, rather than saying nothing.
+    six_h = 6 * 3600
+    j = [_rec(1030, "watchdog_wake", outcome="slept", woke_at=1030, slept_seconds=six_h,
+              grace_until=1330),
+         _rec(1090, "watchdog_wake", outcome="runner_resumed", woke_at=1030, slept_seconds=six_h,
+              heartbeat=1080)]
+    out = report.morning(j, _view(queue=[], usage=None), ledger={}, config=_cfg())
+    assert "nothing happened" in out.lower()                   # a sleep is not news
+    assert report.morning_news(j, _view(queue=[], usage=None), _cfg()) == []
+    section = out.split("## Unattended debugger", 1)[1].split("\n## ", 1)[0]
+    assert "Machine slept 6h 0m" in section and "runner resumed" in section
+    # a wake the watchdog has not yet seen the runner resume from says exactly that — never "resumed"
+    pending = report.morning(j[:1], _view(queue=[], usage=None), ledger={}, config=_cfg())
+    line = [l for l in pending.splitlines() if "Machine slept" in l]
+    assert len(line) == 1 and "runner resumed" not in line[0]
+    assert "not yet seen the runner complete a tick" in line[0]
+    # a wrong-typed record renders without a fabricated span and never raises
+    odd = report.morning([_rec(1030, "watchdog_wake", outcome="slept", woke_at="x",
+                               slept_seconds=None)], _view(queue=[], usage=None), ledger={},
+                         config=_cfg())
+    assert "Machine slept" in odd and "None" not in [l for l in odd.splitlines()
+                                                      if "Machine slept" in l][0]
+
+
 # --------------------------- runner resurrection (issue #208) ---------------------------
 
 def test_runner_resurrection_renders_and_breaks_quiet():

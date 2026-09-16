@@ -925,3 +925,90 @@ def test_a_wedge_the_runner_already_texted_is_not_texted_again(tmp_path):
     assert rig.run().returncode == 0
     assert rig.wstate()["episode"]["signals"] == ["heartbeat_stale"]
     assert texts() == []
+
+
+# ============================ the wake grace (issue #491) ============================
+# A machine that slept is not a runner that stalled: the watchdog stamps its own run clock in
+# state/watchdog.json, and a check landing hours after the previous one is the lid opening. The
+# first check after a wake pages nothing and restarts nothing; the wake is journaled.
+
+_SIX_HOURS = 6 * 3600
+
+
+def _slept(rig, seconds=_SIX_HOURS):
+    """The state the last check before the lid closed left behind, `seconds` ago."""
+    (rig.home / "state" / "watchdog.json").write_text(json.dumps(
+        {"episode": None, "no_progress_since": {}, "next_debugger": 1,
+         "last_run_at": time.time() - seconds}))
+
+
+def _wakes(rig):
+    return [r for r in journal.read(str(rig.home)) if r.get("act") == "watchdog_wake"]
+
+
+def _grace_over(rig):
+    """Five minutes on: the next launchd firing lands as the wake's grace runs out."""
+    st = rig.wstate()
+    st["last_run_at"] = time.time() - 300
+    st["wake"]["grace_until"] = time.time() - 1
+    (rig.home / "state" / "watchdog.json").write_text(json.dumps(st))
+
+
+def test_the_first_check_after_a_sleep_neither_pages_nor_restarts_and_journals_the_wake(tmp_path):
+    rig = _Rig(tmp_path)
+    texts = _texts_to(rig, tmp_path)
+    _slept(rig)
+    rig.heartbeat(_SIX_HOURS + 15)                        # the last tick before the lid closed
+    rig.runner_lock(999999)                               # and a pid that reads dead: a restart today
+    rig.anchor()
+    r = rig.run()
+    assert r.returncode == 0, r.stderr
+    assert rig.resurrect_calls() == [] and rig.launch_calls() == []
+    assert texts() == []
+    assert rig.wjournal() == [] and rig.rjournal() == []  # no episode, no resurrection record
+    st = rig.wstate()
+    assert st["episode"] is None and st["resurrection"]["attempts"] == []
+    (slept,) = _wakes(rig)
+    assert slept["outcome"] == "slept" and abs(slept["slept_seconds"] - _SIX_HOURS) < 60
+    assert "woke" in r.stdout and "healthy" not in r.stdout
+    # The runner comes back inside the grace and completes a tick: still quiet, and it is recorded.
+    rig.heartbeat(5)
+    rig.runner_lock(os.getpid(), age=30)
+    r2 = rig.run()
+    assert r2.returncode == 0, r2.stderr
+    assert texts() == [] and rig.resurrect_calls() == [] and rig.wjournal() == []
+    assert [w["outcome"] for w in _wakes(rig)] == ["slept", "runner_resumed"]
+    assert _wakes(rig)[1]["woke_at"] == slept["woke_at"]
+    assert "healthy" in r2.stdout
+
+
+def test_a_dead_runner_still_stale_after_the_wake_grace_is_restarted_as_before(tmp_path):
+    rig = _Rig(tmp_path)
+    _slept(rig)
+    rig.heartbeat(_SIX_HOURS + 15)
+    rig.runner_lock(999999)
+    rig.anchor()
+    assert rig.run().returncode == 0
+    assert rig.resurrect_calls() == []
+    _grace_over(rig)
+    r = rig.run()
+    assert r.returncode == 0, r.stderr
+    assert len(rig.resurrect_calls()) == 1
+    assert [x["outcome"] for x in rig.rjournal()] == ["resurrected"]
+    assert "resurrected the runner" in r.stdout
+
+
+def test_a_wedged_runner_still_stale_after_the_wake_grace_opens_the_episode_as_before(tmp_path):
+    rig = _Rig(tmp_path)
+    texts = _texts_to(rig, tmp_path)
+    _slept(rig)
+    rig.heartbeat(_SIX_HOURS + 15)
+    rig.runner_lock(os.getpid(), age=_SIX_HOURS + 3600)   # alive, up for hours, not ticking
+    assert rig.run().returncode == 0
+    assert rig.wjournal() == [] and texts() == []
+    _grace_over(rig)
+    r = rig.run()
+    assert r.returncode == 0, r.stderr
+    assert [x["outcome"] for x in rig.wjournal()] == ["notified"]
+    assert rig.wstate()["episode"]["signals"] == ["heartbeat_stale"]
+    assert [t.split("|")[0] for t in texts()] == ["🔴 r@mini · watchdog: runner heartbeat stale"]

@@ -28,6 +28,23 @@ import re
 IDLE_SECONDS = 480        # rested-no-marker -> safe peek
 FREEZE_SECONDS = 2700     # hard stall -> recovery ladder
 
+# Post-wake grace (issue #42). Closing the laptop overnight suspends the runner mid-tick; on wake the
+# next tick lands hours later than the ~15s cadence predicts, so every in-flight worker's activity
+# and the usage meter's last-success look ancient purely from the wall-clock jump — which used to
+# fire a cascade of false frozen-recovery nudges + a self-clearing usage_stale ALERT on a stranger's
+# first sleeping night. A tick whose gap since the previous tick reaches WAKE_GAP_SECONDS is read as
+# a wake (well above any routine tick — even a merge-update recheck maxes near RECHECK_TIMEOUT — and
+# well below the smallest false-alarm window: the usage fail-open grace at 30 min, frozen at 45 min).
+WAKE_GAP_SECONDS = 1200
+# WAKE_GRACE_SECONDS: how long after a detected wake gap the liveness (idle/frozen) and usage_stale
+# alarms stay disarmed. It PROTECTS AGAINST the resume artifact — it is the window a suspended-then-
+# resumed healthy worker needs to re-stamp its activity, and the usage poller (60s cadence) needs to
+# land a fresh fetch, before the alarms re-arm. A genuinely dead session or dark meter still alarms
+# once it expires; short enough that a real death is delayed only minutes atop the 45-min freeze tier.
+# Shared with the watchdog (issue #491): a watchdog check that finds the machine slept holds its
+# heartbeat_stale signal for this same window, so the runner's first post-wake tick can land.
+WAKE_GRACE_SECONDS = 300
+
 
 def _hash_file(path):
     try:

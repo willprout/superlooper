@@ -5344,6 +5344,12 @@ def cmd_watchdog(args):
                                if cfg["watchdog"]["resurrection_max_per_hour"] == 0 else
                                "runner is DOWN — auto-restart PAUSED (crash-loop cap hit)") if capped else
                               f"episode open ({', '.join(ep['signals'])})" if ep else
+                              # The machine just woke (issue #491): the heartbeat IS stale, and this
+                              # check held it for the wake grace. "healthy" would be a claim the
+                              # check never made; the next check past the grace judges it.
+                              "machine woke from sleep — the stale runner heartbeat is held for the "
+                              "wake grace; a check after it judges the runner as usual"
+                              if res.get("wake_excused") else
                               # A runner that has not stamped its first tick is not healthy — it is
                               # unproven, and saying so is the difference between a summary a
                               # person can act on and one that reads the same either way.
