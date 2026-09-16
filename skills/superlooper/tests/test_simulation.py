@@ -85,9 +85,10 @@ class Sim:
                  required_checks=("ci",), session=None, retry_cap=None, conflict_cap=None,
                  cleanup_merged_worktrees=True, qa=None, touches_required=False,
                  night_batching=False):
-        # night_batching=False (the default) keeps notify.quiet_hours=None, so notify MECHANICS are
-        # asserted at any wall-clock hour (see the config note below). A test opts night_batching ON
-        # ONLY together with pin_clock(), so the batch path is driven deterministically (#217).
+        # night_batching=False (the default) runs the ENGINE's notify.quiet_hours default — off since
+        # #492 — so notify MECHANICS are asserted at any wall-clock hour (see the config note below).
+        # A test opts night_batching ON ONLY together with pin_clock(), so the batch path is driven
+        # deterministically (#217).
         self.night_batching = night_batching
         self.pinned_local = None                     # None => the injected clock uses the real wall clock
         self.tmp = tmp_path
@@ -138,26 +139,33 @@ class Sim:
             # in test_actions and exercised end-to-end by the touches_required=True sim below).
             "touches_required": touches_required,
             "session": sess, "cleanup_merged_worktrees": cleanup_merged_worktrees,
-            # quiet_hours=None DISABLES night-batching (#164), same as test_runner's make_config
-            # and for the same reason: the sim asserts notify MECHANICS ("every park notifies"),
-            # and the sim's runner reads the REAL machine clock — on CI (UTC) every run between
-            # 21:00 and 08:00 UTC fell inside the default quiet window, so park/bounce notifies
-            # batched to the morning report and nine sim tests went red nightly (the #217
-            # false-red, live since #164 merged). The batching POLICY is tested where it belongs:
-            # test_actions.py with a PINNED local_hhmm, immune to the wall clock. A night_batching=True
-            # test turns the DEFAULT window back on and drives it deterministically by PINNING the
-            # runner's local clock (pin_clock) — the #217 seam that ends the wall-clock coupling.
+            # quiet_hours is left UNSET, so the sim runs the engine default: null since #492 (every
+            # text sends when it happens). The sim asserts notify MECHANICS ("every park notifies")
+            # and its runner reads the REAL machine clock — under #164's old 21:00–08:00 default,
+            # every CI (UTC) run in that window batched park/bounce notifies to the morning report
+            # and nine sim tests went red nightly (the #214/#217 false-red). The guard below keeps
+            # that coupling from returning silently if the default ever flips back. The batching
+            # POLICY is tested where it belongs: test_actions.py with a PINNED local_hhmm, immune to
+            # the wall clock. A night_batching=True test configures #164's window EXPLICITLY and
+            # drives it deterministically by PINNING the runner's local clock (pin_clock) — the
+            # #217 seam that ends the wall-clock coupling.
             # One RECORD per text, \036-terminated: since the notify doorway (#493) a text's body
             # is up to two lines (the ask, the issue URL), so a newline no longer separates texts.
             "notify": {"cmd": "printf '%s|%s\\036\\n' \"$SL_TITLE\" \"$SL_BODY\" >> "
-                              + str(self.notify_log),
-                       "quiet_hours": ({"start": "21:00", "end": "08:00"}
-                                       if night_batching else None)},
+                              + str(self.notify_log)},
         }
+        if night_batching:
+            cfg["notify"]["quiet_hours"] = {"start": "21:00", "end": "08:00"}
         if qa:
             cfg["qa"] = qa
         (self.repo / ".superlooper").mkdir()
         (self.repo / ".superlooper" / "config.json").write_text(json.dumps(cfg, indent=1))
+        if not night_batching:
+            # The #214 guard: an unpinned sim reads the wall clock, so it is only hour-independent
+            # while the LOADED config carries no quiet window. Fail loudly here, not nightly on CI.
+            assert config_lib.load(self.repo)["notify"]["quiet_hours"] is None, (
+                "the engine's notify.quiet_hours default is no longer null: an unpinned sim would "
+                "batch park/bounce/question texts by the wall clock (the #214 false-red)")
 
         # ---- fake-gh's little GitHub ----
         self.state_json = self.gh_dir / "state.json"
@@ -2549,8 +2557,8 @@ def test_a_hollow_launch_holds_the_queue_and_never_parks_the_issue(sim_factory, 
 
 # =====================================================================================
 # Night-batching end to end (issue #164, hardened by #217). The rest of this suite runs
-# with quiet_hours DISABLED (notify.quiet_hours=None) so notify MECHANICS are asserted at
-# any wall-clock hour. These three tests are the ONLY ones that turn batching ON — and they
+# the engine default — no quiet window since #492 — so notify MECHANICS are asserted at
+# any wall-clock hour. These three tests are the ONLY ones that configure a window — and they
 # do it deterministically by PINNING the runner's local clock (sim.pin_clock), the seam #217
 # adds so a time-of-day policy can be driven through the real runner->notify wiring without
 # inheriting the machine's timezone. Before #217 the sim's runner read the real wall clock,
@@ -2558,7 +2566,7 @@ def test_a_hollow_launch_holds_the_queue_and_never_parks_the_issue(sim_factory, 
 # =====================================================================================
 
 def test_night_batching_withholds_the_park_page_but_lands_it_in_the_morning_report(sim_factory):
-    # Quiet-hours clock (03:00, inside the default 21:00-08:00 window): a routine owner-decision
+    # Quiet-hours clock (03:00, inside the configured 21:00-08:00 window): a routine owner-decision
     # park is a SAFE, batchable hand-back, so its PAGE is withheld — but the park ACTION still
     # fires (label moves, journal records it) and the decision surfaces in the morning report.
     sim = sim_factory(night_batching=True)

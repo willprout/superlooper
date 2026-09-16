@@ -70,10 +70,11 @@ def test_minimal_config_fills_defaults(tmp_path):
     # owner verb resolves the lane.
     assert cfg["auto_close_merged_windows"] is True
     assert cfg["cleanup_parked_worktrees"] is False
-    # notify.quiet_hours (issue #164) defaults ON (21:00–08:00): routine owner-decision pages are
-    # batched to the morning report during these hours; an explicit null disables the batching.
+    # notify.quiet_hours (issue #164) defaults OFF since issue #492 (owner ruling 2026-09-16): every
+    # text sends when it happens and the phone's Do Not Disturb is the night filter. A configured
+    # window still batches routine owner-decision pages to the morning report.
     assert cfg["notify"] == {"imessage_to": None, "cmd": None, "machine_label": None,
-                             "quiet_hours": {"start": "21:00", "end": "08:00"}}
+                             "quiet_hours": None}
     assert cfg["codex"] == {"dangerous_bypass": False, "bypass_hook_trust": True,
                             "no_alt_screen": True}
     assert cfg["report_time"] == "08:45"
@@ -268,7 +269,7 @@ def test_notify_machine_label_is_accepted_and_defaults_to_null(tmp_path):
     _write_cfg(tmp_path, {"repo": "me/tool", "notify": {"machine_label": "mini"}})
     cfg = config.load(tmp_path)
     assert cfg["notify"]["machine_label"] == "mini"
-    assert cfg["notify"]["quiet_hours"] == {"start": "21:00", "end": "08:00"}   # siblings kept
+    assert cfg["notify"]["quiet_hours"] is None                                 # siblings kept
 
 
 def test_notify_machine_label_rejects_a_non_string(tmp_path):
@@ -276,6 +277,31 @@ def test_notify_machine_label_rejects_a_non_string(tmp_path):
     with pytest.raises(ValueError) as e:
         config.load(tmp_path)
     assert "notify.machine_label" in str(e.value)
+
+
+def test_quiet_hours_example_template_is_off_by_default():
+    # issue #492: `adopt` copies config.example.json VERBATIM, so its value is exactly what a fresh
+    # adopt writes — a new repo must arrive paging at any hour, not with #164's old window baked in.
+    raw = json.loads(_EXAMPLE.read_text())
+    assert raw["notify"]["quiet_hours"] is None
+
+
+def test_a_configured_quiet_window_loads_exactly_as_written(tmp_path):
+    # issue #492 flips only the DEFAULT: an adopter who wants batching still gets their window.
+    _write_cfg(tmp_path, {"repo": "me/tool", "notify": {"quiet_hours": {"start": "21:00", "end": "08:00"}}})
+    assert config.load(tmp_path)["notify"]["quiet_hours"] == {"start": "21:00", "end": "08:00"}
+
+
+def test_operator_docs_describe_quiet_hours_as_opt_in_with_do_not_disturb():
+    # issue #492: the operator prose must not tell an owner overnight batching is the default. Both
+    # owner-facing guides name the knob as opt-in and Do Not Disturb as the intended night filter.
+    root = _REPO_ROOT.parents[1]                                    # the monorepo root
+    for rel in ("plugin/skills/superlooper/references/runner-ops.md", "docs/OPERATING.md"):
+        text = (root / rel).read_text()
+        flat = " ".join(text.split())
+        assert "notify.quiet_hours" in text and "opt-in" in flat, rel
+        assert "Do Not Disturb" in flat, rel
+        assert "default 21:00" not in flat, rel
 
 
 def test_quiet_hours_rejects_malformed_windows(tmp_path):

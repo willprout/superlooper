@@ -49,6 +49,13 @@ rest:
 - **`parked`** — the build ran out of retries. Nothing is waiting on a decision; look
   when convenient, then re-scope, re-approve, or drop it.
 
+The loop texts you when something needs you, the moment it happens, day or night. It
+doesn't know your sleep schedule, so it doesn't try to: silence your phone at night with
+Do Not Disturb, and anything that arrived overnight is also in the morning report. If you
+would rather a repo held parks, bounces and questions for the morning report during set
+hours, `notify.quiet_hours` in `.superlooper/config.json` is the opt-in; it is off by
+default.
+
 Everything else — building, reviewing, merging, freezing when the mainline goes red and
 unfreezing when it's green again — is the machine's job. A loop that is frozen but still
 building is in its designed safe state, not an emergency.

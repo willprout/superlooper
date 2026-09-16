@@ -15,10 +15,12 @@ from pathlib import Path
 import runner_home
 import triage as _triage
 
-# The night window during which routine owner-DECISION pages are batched to the morning report
-# (issue #164). The ONE source of truth: the notify default below embeds it, and actions.py imports
-# it as the fallback for an OLD config.json that predates the key — so the two can never drift.
-DEFAULT_QUIET_HOURS = {"start": "21:00", "end": "08:00"}
+# The default quiet-hours window during which routine owner-DECISION pages are batched to the morning
+# report (issue #164): NONE since issue #492 (owner ruling 2026-09-16) — every text sends when it
+# happens, and the phone's Do Not Disturb is the night filter. A repo may still configure a window.
+# The ONE source of truth: the notify default below embeds it, and actions.py imports it as the
+# fallback for a view whose notify block lacks the key — so the two can never drift.
+DEFAULT_QUIET_HOURS = None
 
 # Top-level scalar/structural fields and their defaults (§C.1). `repo` is the ONLY required
 # field (no sensible default — it names the GitHub repo and the state home). `areas` and
@@ -123,18 +125,18 @@ _NESTED_DEFAULTS = {
                 "checks_pending_cap": 10800},
     "qa": {"nightly_cmd": None, "results_glob": None, "retry_once": True,
            "quarantine": [], "nightly_time": "02:00"},
-    # notify.quiet_hours (issue #164): the window during which routine owner-DECISION pages (a park,
-    # a bounce, a durable question) are BATCHED to the morning report instead of pushed — nobody
-    # answers a 3am page and a park is a safe state. Systemic-stop ALERTs (runner/auth dead, whole
-    # queue stalled) and the merge-freeze notice always push; only the owner-decision hand-backs are
-    # held. Defaults ON, 21:00–08:00 (end EXCLUSIVE, wraps midnight); an explicit null DISABLES the
-    # batching (every hand-back pages immediately, the pre-#164 behaviour).
+    # notify.quiet_hours (issue #164): an OPT-IN window during which routine owner-DECISION pages (a
+    # park, a bounce, a durable question) are BATCHED to the morning report instead of pushed.
+    # Systemic-stop ALERTs (runner/auth dead, whole queue stalled) and the merge-freeze notice always
+    # push; only the owner-decision hand-backs are held. Defaults to null since issue #492 (every
+    # hand-back texts when it happens; Do Not Disturb is the night filter); a configured
+    # {"start","end"} window (end EXCLUSIVE, may wrap midnight) batches exactly as #164 built it.
     # notify.machine_label (issue #493): the machine half of every owner text's `<repo>@<machine>`
     # identity line — the owner runs more than one loop on more than one machine and must tell them
     # apart on a lock screen. Null (the default) means the host's short hostname; a string such as
     # "mini" or "laptop" overrides it.
     "notify": {"imessage_to": None, "cmd": None, "machine_label": None,
-               "quiet_hours": dict(DEFAULT_QUIET_HOURS)},
+               "quiet_hours": copy.deepcopy(DEFAULT_QUIET_HOURS)},
     # janitor.aged_park_days (issue #62): how long a parked / needs-william issue may sit with
     # NO activity (GitHub updatedAt) before `superlooper janitor` proposes closing it. A
     # proposal only — nothing closes without the owner's explicit approval in the janitor's

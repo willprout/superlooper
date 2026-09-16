@@ -124,6 +124,19 @@ def test_walkthrough_orders_publish_before_adopt_before_doctor_before_run():
     )
 
 
+def test_notify_quiet_hours_row_shows_the_off_default():
+    # issue #492 (owner ruling 2026-09-16): every text sends when it happens, so the field table's
+    # Default cell is `null` and the row names the window as an opt-in, with Do Not Disturb as the
+    # intended night filter — never #164's old 21:00–08:00 default.
+    row = next((ln for ln in _doc_text().splitlines()
+                if ln.strip().startswith("| `notify.quiet_hours`")), None)
+    assert row is not None, "ADOPTING.md must document notify.quiet_hours in the field table"
+    cells = [c.strip() for c in row.strip().strip("|").split("|")]
+    assert len(cells) >= 3, f"malformed field-table row: {row!r}"
+    assert cells[1] == "`null`", f"unexpected Default cell: {cells[1]!r}"
+    assert "opt-in" in cells[2].lower() and "do not disturb" in cells[2].lower(), cells[2]
+
+
 def test_report_required_sections_default_is_web_agnostic_with_browser_opt_in():
     # issue #57: the field table must document the new honest default — the two sections EVERY worker
     # can produce (Tests, Review) — never the old "Browser evidence" list that a non-web worker can't
