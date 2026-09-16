@@ -97,6 +97,17 @@ TIER_EMOJI = {DOWN: "🔴", WAITING: "🟠", RECOVERED: "🟢", MORNING: "☀️
 TEXT_MAX_LINES = 3
 TEXT_MAX_BYTES = 280
 
+# The part budgets every sender writes to (issue #490). The cap above is the backstop; these are the
+# design: a headline within HEADLINE_MAX_BYTES and an ask within ASK_MAX_BYTES arrive WHOLE for any
+# identity up to IDENTITY_MAX_BYTES (the emoji, a 24-byte repo name, a 24-byte machine label, the
+# separator) and any URL up to URL_MAX_BYTES (a 16-byte owner, a 24-byte name, a six-digit number).
+# They add up to the cap with the two newlines, so a cut at the doorway means a sender overran its
+# budget — the defect the `notify_truncated` act names — never that the budgets were wrong.
+IDENTITY_MAX_BYTES = 60
+HEADLINE_MAX_BYTES = 88
+ASK_MAX_BYTES = 52
+URL_MAX_BYTES = 78
+
 _SEP = " · "            # between the identity and the headline
 _ELLIPSIS = "…"         # marks a cut line, so a truncated text never reads as whole
 _REFUSED = "refused: not a rendered owner text (every text is built by notify.render)"
@@ -151,6 +162,36 @@ def _cut(s, budget):
         return ""
     kept = s.encode("utf-8")[:room].decode("utf-8", "ignore").rstrip()
     return kept + _ELLIPSIS if kept else ""
+
+
+def clip(value, budget):
+    """A dynamic fragment a sender splices into its headline or ask (a check name, a branch), as one
+    line within `budget` bytes — ending in "…" when it had to be shortened. The sender's own choice,
+    made before the doorway sees the text, so the text it writes still fits whole."""
+    return _cut(_one_line(value), budget)
+
+
+def clauses(items, budget=HEADLINE_MAX_BYTES, sep=", ", clip_first=True):
+    """Several short clauses as ONE line within `budget` bytes (issue #490): as many as fit, in order,
+    then "+N more" counting the rest — so a list of reasons, signals or issues names what it can and
+    is honest about what it left out. Blanks are dropped and repeats named once. A first clause that
+    alone overruns the budget is clipped (ending in "…") — or, with clip_first=False, the result is ""
+    so the caller can say something whole instead. Never over `budget`. Pure; never raises."""
+    seen, parts = set(), []
+    for item in items if isinstance(items, (list, tuple)) else []:
+        s = _one_line(item)
+        if s and s not in seen:
+            seen.add(s)
+            parts.append(s)
+    for k in range(len(parts), 0, -1):
+        more = "" if k == len(parts) else " +%d more" % (len(parts) - k)
+        line = sep.join(parts[:k]) + more
+        if _nbytes(line) <= budget:
+            return line
+    if not parts or not clip_first:
+        return ""
+    more = " +%d more" % (len(parts) - 1) if len(parts) > 1 else ""
+    return _cut(_cut(parts[0], budget - _nbytes(more)) + more, budget)
 
 
 def machine(config):

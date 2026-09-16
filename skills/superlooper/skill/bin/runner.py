@@ -1342,13 +1342,11 @@ class Runner:
             return
         try:
             import notify
+            # The headline and the doctor pointer (issue #490); the remedy naming each failed
+            # migration is actions.alert_remedy's, printed by `superlooper doctor`.
             outcome = notify.send(self.config, notify.render(
-                self.config, notify.DOWN, "HELD — a repo migration could not be applied",
-                f"a pending per-repo migration failed to apply at boot ({named}); the loop "
-                "is HELD rather than running against an un-migrated repo and storming a "
-                "failing write every tick. Check gh auth / re-run `superlooper adopt` "
-                "(idempotent), then restart the runner.", caller="runner:migration_hold"),
-                home=self.home)
+                self.config, notify.DOWN, actions.alert_headlines(reasons), actions.ALERT_ASK,
+                caller="runner:migration_hold"), home=self.home)
             self._record_own_page(reasons, delivered=notify.delivered(outcome))
         except Exception:
             pass
@@ -1594,8 +1592,7 @@ class Runner:
             try:
                 import notify
                 outcome = notify.send(self.config, notify.render(
-                    self.config, notify.DOWN, "ALERT: " + paged[0],
-                    f"runner tick has failed {count}x in a row — the loop is wedged",
+                    self.config, notify.DOWN, actions.alert_headline(paged[0]), actions.ALERT_ASK,
                     caller="runner:tick_errors"), home=self.home)
                 self._record_own_page(paged, delivered=notify.delivered(outcome))
             except Exception:
@@ -3791,7 +3788,8 @@ class Runner:
         # a same-cause retry must never re-stamp it (the bound would never elapse); it only repairs an
         # unusable value. `park_comment_posted` makes the verbatim memo comment once-per-episode,
         # retried while the bounce is still re-deriving; once the label lands (terminal) an unposted
-        # memo stays best-effort — the notify text and the journal already carried it to the owner.
+        # memo stays best-effort — the journal carries it, and the command center's card reads it
+        # there (the text points at the dashboard for it; since #490 the text carries no memo).
         # The marker fields are REUSED from the park path (a bounce and a park never overlap on one
         # issue), which also gets this path the `park_label_stuck` alert and the reapprove reset free.
         prev = self._issue_field(iid, "park_notify_cause")
@@ -3867,8 +3865,8 @@ class Runner:
         # so a same-cause retry must never re-stamp it (the bound would never elapse); it only
         # repairs an unusable value. park_comment_posted makes the memo comment once-per-episode
         # too (21 duplicate memos in the storm), retried while the park is still re-deriving;
-        # once the label lands (terminal) an unposted memo stays best-effort — the notify text
-        # and the journal already carried it to the owner.
+        # once the label lands (terminal) an unposted memo stays best-effort — the journal carries
+        # it, and the command center's card reads it there (since #490 the text carries no memo).
         prev = self._issue_field(iid, "park_notify_cause")
         if prev != cause:
             self._update_issue(iid, {"park_notify_cause": cause, "park_notify_at": now,
@@ -5579,8 +5577,8 @@ class Runner:
                 return
             import notify
             notify.send(self.config, notify.render(
-                self.config, notify.RECOVERED, "cleared: " + ", ".join(reasons),
-                "the runner is completing ticks again — the loop is serving its work",
+                self.config, notify.RECOVERED,
+                "cleared: " + actions.alert_headlines(reasons, notify.HEADLINE_MAX_BYTES - 9),
                 caller="runner:own_page_cleared"), home=self.home)
         except Exception as e:
             self._log(f"own page close skipped: {_short_repr(e)}")
@@ -5662,8 +5660,8 @@ class Runner:
     def _morning_report_hook(self, date, now):
         """Task 11 seam (filled): report.morning() renders reports/morning-<date>.md from the
         journal + the live view assembled here, then — only when report.morning_news finds news
-        (issue #495) — the report's one-line summary is pushed as a MORNING-tier text through the
-        notify doorway (issue #493). A quiet report is written and stamped like any other; its skipped
+        (issue #495) — report.morning_headline is pushed as a MORNING-tier text through the notify
+        doorway (issues #493, #490). A quiet report is written and stamped like any other; its skipped
         text is journaled as `morning_push_skipped` with the reason. A
         render/write/notify failure is contained — the action record + the journal it reads are
         already durable, so the report can always be re-rendered by `superlooper morning-report`."""
@@ -5705,6 +5703,8 @@ class Runner:
                 "usage": self.usage_view(), "engine_drift": drift,
                 "queue_hold": {"reasons": held,
                                "since": (alert or {}).get("since")} if held else None,
+                # every standing ALERT reason with its remedy (issue #490) — what no text carries
+                "alerts": actions.standing_alerts(alert),
                 "issues_state": self._load_state()}
         text = report.morning(records, view, ledger, self.config)
         try:
@@ -5726,12 +5726,10 @@ class Runner:
                 pass                            # the report already rendered (contained failure)
             self._log(f"morning report {date}: written; quiet — no text sent")
             return
-        # First non-title, non-blank line is the summary tally — the push body.
-        summary = next((ln for ln in text.splitlines()
-                        if ln.strip() and not ln.startswith("#")), "morning report ready")
-        outcome = notify.send(self.config, notify.render(self.config, notify.MORNING, summary,
-                                                         caller="runner:morning_report"),
-                              home=self.home)
+        # The text is the report's news as one headline (issue #490); the file carries the rest.
+        outcome = notify.send(self.config, notify.render(
+            self.config, notify.MORNING, report.morning_headline(records, view, self.config),
+            caller="runner:morning_report"), home=self.home)
         self._log(f"morning report {date}: notify [{outcome}]")
 
     def _exec_notify(self, a, now):

@@ -42,10 +42,8 @@ _SOCKET_PROBE_SECONDS = 5.0
 # The one message the doctor actually sends to prove the channel. Static (no clock) so the check
 # is deterministic and the owner learns to recognize it. Reads as an explanation on arrival.
 NOTIFY_TEST_HEADLINE = "doctor: notify channel test"
-NOTIFY_TEST_ASK = (
-    "doctor --stack sent this to prove your notify channel delivers. "
-    "Receiving it means overnight stall alerts can reach you here."
-)
+# One line within the doorway's ask budget (issue #490): receiving it is the whole message.
+NOTIFY_TEST_ASK = "no action; this proves alerts reach you here"
 
 
 class _SkipSend:

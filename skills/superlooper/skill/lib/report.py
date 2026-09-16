@@ -740,11 +740,10 @@ def _triage_line(rec, repo):
     return "- REFUSED on #%s: %s%s" % (num, reason, where)
 
 
-def _triage_summary(records, window_start):
-    """The clause the summary tally gains on a night a flight flew — short, because the summary
-    line is the push body. Built from the run's own `triage_finish` counts when it wrote them, and
-    counted from the acts themselves when it did not: a flight that died before finishing still
-    closed whatever it closed, and the owner must still be told."""
+def _triage_counts(records, window_start):
+    """(merged, closed, escalated) for the night's flight. Built from the run's own `triage_finish`
+    counts when it wrote them, and counted from the acts themselves when it did not: a flight that
+    died before finishing still closed whatever it closed, and the owner must still be told."""
     mine = _triage_records(records, window_start)
     counts = None
     for rec in mine:
@@ -754,9 +753,13 @@ def _triage_summary(records, window_start):
         counts = {"merged": sum(1 for r in mine if r.get("act") == "triage_merge"),
                   "closed": sum(1 for r in mine if r.get("act") == "triage_close"),
                   "escalated": sum(1 for r in mine if r.get("act") == "triage_escalate")}
-    return " Triage: %d merged · %d closed · %d escalated." % (
-        _count(counts.get("merged")), _count(counts.get("closed")),
-        _count(counts.get("escalated")))
+    return (_count(counts.get("merged")), _count(counts.get("closed")),
+            _count(counts.get("escalated")))
+
+
+def _triage_summary(records, window_start):
+    """The clause the summary tally gains on a night a flight flew — short, like the tally."""
+    return " Triage: %d merged · %d closed · %d escalated." % _triage_counts(records, window_start)
 
 
 def _triage(records, repo, window_start):
@@ -961,8 +964,8 @@ def _standing_holds(holds, now):
 def _hold_alerts(holds, view, now):
     """The ALERT-tier lines a listing is not enough for (issue #405): a hold, or the freeze, that
     has stood past its threshold. Rendered above the sections, where the owner cannot coffee past
-    them. No new notification is earned — these ride the one daily push the report already sends,
-    via the summary line's own count."""
+    them. No new notification is earned — these ride the one morning text the report already sends
+    (morning_headline counts them), and the file's summary line counts them too."""
     # The threshold is tested against the age _age() would RENDER, never a raw span: an age this
     # module cannot render honestly (wrong-typed, negative, non-finite) is one it cannot alert on
     # either, and the two must agree or an alert could print "held None".
@@ -1027,7 +1030,26 @@ def _queue_hold(view, now):
     return (f"**The launch queue is HELD{for_bit} — nothing is launching** ({', '.join(reasons)}). "
             "This is a PAUSE, not an idle queue: the hold itself parks nothing and moves no label, "
             "so every approved issue keeps its place and launching resumes by itself once the "
-            "cause clears. `superlooper status` prints the same line with the remedy.")
+            "cause clears. Each cause's remedy is below; `superlooper doctor` prints it too.")
+
+
+def _standing_alert_lines(view):
+    """One ALERT-tier line per reason standing in state/ALERT, carrying its REMEDY (issue #490) —
+    the paragraph the owner's text used to carry and no longer can. The caller pre-shapes
+    `view['alerts']` with actions.standing_alerts, the same discipline `queue_hold` follows, so this
+    module never imports the runner's brain. Rows that are not {reason, headline, remedy} strings
+    are skipped. Not news on its own (#495's classes decide the text); the queue hold and the aged
+    holds that are news already have their own lines above these."""
+    rows = view.get("alerts")
+    out = []
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict):
+            continue
+        reason, head, remedy = row.get("reason"), row.get("headline"), row.get("remedy")
+        if not all(isinstance(x, str) and x.strip() for x in (reason, head, remedy)):
+            continue
+        out.append(f"**ALERT standing: {head}** (`{reason}`) — {remedy}")
+    return out
 
 
 def _freeze(view, now):
@@ -1132,6 +1154,7 @@ def _facts(journal_records, gh_view, config):
         "holds": holds,
         "hold_alerts": _hold_alerts(holds, view, now),
         "queue_hold": _queue_hold(view, now),                          # the PAUSED queue (#320)
+        "alert_lines": _standing_alert_lines(view),                    # every remedy (#490)
         "frozen": isinstance(view.get("frozen"), dict) and bool(view.get("frozen")),
         "queue": [q for q in view.get("queue") if isinstance(q, dict)]
         if isinstance(view.get("queue"), list) else [],
@@ -1171,6 +1194,39 @@ def morning_news(journal_records, gh_view, config=None):
     return [cls for cls, key in _NEWS_FACTS if f[key]]
 
 
+# The morning TEXT's clauses (issue #490), in the order they lead: the worst news first, so a headline
+# that has to count "+N more" drops the least urgent. Each is (facts key, how it reads).
+_HEADLINE_CLAUSES = (
+    ("queue_hold", lambda f: "ALERT marker unreadable, queue may be HELD"
+     if _dict(f["view"].get("queue_hold")).get("reasons") == [_ALERT_UNREADABLE]
+     else "launch queue HELD"),
+    ("merged", lambda f: "%d merged" % len(f["merged"])),
+    ("parked", lambda f: "%d parked" % len(f["parked"])),
+    ("bounces", lambda f: "%d bounced" % len(f["bounces"])),
+    ("questions", lambda f: "%d question(s)" % (f["q_total"] or len(f["questions"]))),
+    ("hold_alerts", lambda f: "%d aged hold(s)" % len(f["hold_alerts"])),
+    ("triage_lines", lambda f: "triage: %d merged, %d closed, %d escalated"
+     % _triage_counts(f["records"], f["overnight_start"])),
+    ("regens_overnight", lambda f: "%d regen(s)" % len(f["regens_overnight"])),
+    ("wanders", lambda f: "%d wander(s)" % len(f["wanders"])),
+    ("watchdog", lambda f: "%d debugger event(s)" % len(f["watchdog"])),
+    ("resurrections", lambda f: "%d runner restart event(s)" % len(f["resurrections"])),
+)
+QUIET_HEADLINE = "nothing new overnight"
+
+
+def morning_headline(journal_records, gh_view, config=None):
+    """The morning report's TEXT (issue #490): its news as ONE headline within the doorway's budget —
+    "launch queue HELD · 2 merged · 1 parked" — naming what fits in _HEADLINE_CLAUSES order and
+    counting the rest. The file keeps its own summary line and every detail; the text is a pager. A
+    report sent with no news (`--always-send`) says QUIET_HEADLINE. Same args as morning_news. PURE;
+    never raises."""
+    import notify                   # lazily, like _fp's gate: the part budget and the one joiner
+    f = _facts(journal_records, gh_view, config)
+    clauses = [say(f) for key, say in _HEADLINE_CLAUSES if f[key]]
+    return notify.clauses(clauses, budget=notify.HEADLINE_MAX_BYTES, sep=" · ") or QUIET_HEADLINE
+
+
 def morning(journal_records, gh_view, ledger, config):
     """Render the morning report markdown. Args:
       journal_records  list of journal.read() dicts (the overnight action log).
@@ -1183,7 +1239,9 @@ def morning(journal_records, gh_view, ledger, config):
                           wrong-typed simply yields no holds,
                           "queue_hold": {"reasons": [...], "since": epoch}|None — the PAUSED-queue
                           state (#320), pre-computed by the caller from state/ALERT via
-                          actions.queue_hold_reasons; absent/empty renders no hold}
+                          actions.queue_hold_reasons; absent/empty renders no hold,
+                          "alerts": [{"reason", "headline", "remedy"}, …] — every standing ALERT
+                          reason (#490), from actions.standing_alerts; absent renders none}
       ledger           the known-failure ledger dict {fingerprint: {...}} (accepted-failure count).
       config           the per-repo config (repo for links, qa.quarantine size).
     Never raises; every arg is coerced to a safe empty shape."""
@@ -1221,46 +1279,42 @@ def morning(journal_records, gh_view, ledger, config):
                f"{len(merged)} merged · {len(parked)} parked/needs-owner · "
                f"{len(bounces)} bounce(s) · {len(regens)} regen(s) · "
                f"{q_total} question(s) · queue: {len(queue)}.")
+    # The summary line is the FILE's tally. The TEXT is morning_headline, written to fit a phone
+    # (issue #490); both say the same news, and the clauses below keep this line honest on its own.
     if triage_lines:
-        # The summary line IS the push body, and it is the ONE place an autonomous delegation could
-        # become invisible: a night on which a flight closed three issues would otherwise reach the
-        # owner's phone as "0 merged · 0 parked · queue: 1". Appended as its own clause rather than
-        # folded into the tally above, because those terms are the LOOP's — a merge there is a PR
-        # landing on the mainline, and a flight never merges anything of the kind.
+        # An autonomous delegation must not become invisible here: a night on which a flight closed
+        # three issues would otherwise read "0 merged · 0 parked · queue: 1". Appended as its own
+        # clause rather than folded into the tally above, because those terms are the LOOP's — a
+        # merge there is a PR landing on the mainline, and a flight never merges anything of the kind.
         summary += _triage_summary(records, overnight_start)
     if queue_hold:
-        # The summary line IS the push body, so this rides the report's one notification. It leads
-        # the other alert-tier suffixes because it is the only one that says the whole loop stopped:
-        # a tally reading "0 merged · queue: 6" is otherwise a normal-looking slow night.
+        # It leads the other alert-tier suffixes because it is the only one that says the whole loop
+        # stopped: a tally reading "0 merged · queue: 6" is otherwise a normal-looking slow night.
         summary += " **THE LAUNCH QUEUE IS HELD — nothing is launching; see below.**"
     if hold_alerts:
-        # The summary line IS the push body, so the count rides the one notification the report
-        # already sends — an aged hold reaches the phone without earning a push of its own. It names
-        # no threshold: the count can mix hold and freeze alerts, which are governed by two constants
-        # that only happen to be equal today, and a single hardcoded number would become a lie the
-        # day they diverge. The alert lines below each state their own age.
+        # The count names no threshold: it can mix hold and freeze alerts, which are governed by two
+        # constants that only happen to be equal today, and a single hardcoded number would become a
+        # lie the day they diverge. The alert lines below each state their own age.
         summary += f" **{len(hold_alerts)} standing hold/freeze past its age threshold — see below.**"
     others = [(len(wanders), "wander(s)"), (len(watchdog), "unattended-debugger event(s)"),
               (len(resurrections), "runner-resurrection event(s)")]
     if any(n for n, _ in others):
-        # News the tally above does not count (#495). The summary line IS the text body, and the text
-        # now goes out only on news — so a night whose only news is a runner resurrection must not
-        # reach the phone reading "0 merged · 0 parked … queue: 0.", a text saying nothing happened.
-        # "event", not "restart": a failed or capped attempt is news too, and the file says which.
-        # LAST, because the notify doorway cuts an over-cap text from its end — the bold alert
-        # clauses above must survive a cut before this does.
+        # News the tally above does not count (#495): a night whose only news is a runner
+        # resurrection must not read "0 merged · 0 parked … queue: 0.", a line saying nothing
+        # happened. "event", not "restart": a failed or capped attempt is news too.
         summary += " Also: %s." % " · ".join("%d %s" % (n, what) for n, what in others if n)
 
     parts = [
         f"# superlooper morning report — {date}\n",
         f"{summary}\n",
     ]
-    # Alert-tier lines sit directly under the summary tally — above every section, and after the
-    # first non-title line so they never hijack the push body (the drift nudge's own discipline).
-    # The queue hold leads them: an aged lane hold is one issue, a held queue is every issue.
-    parts += [f"{line}\n" for line in ([queue_hold] if queue_hold else []) + hold_alerts]
-    # The publish-drift nudge sits AFTER the summary tally so it never hijacks the push body (the
-    # first non-title, non-blank line). Drift is a standing condition, not overnight activity, so it
+    # Alert-tier lines sit directly under the summary tally — above every section. The queue hold
+    # leads them: an aged lane hold is one issue, a held queue is every issue. The standing ALERT
+    # remedies follow (#490): the long paragraphs, after the lines a glance must not miss.
+    parts += [f"{line}\n" for line in ([queue_hold] if queue_hold else []) + hold_alerts
+              + f["alert_lines"]]
+    # The publish-drift nudge sits AFTER the summary tally, and never reaches the text (the headline
+    # is built from news only). Drift is a standing condition, not overnight activity, so it
     # is rendered independently of `quiet` — a quiet night with drift still reads "nothing happened".
     drift = _engine_drift(view)
     if drift:

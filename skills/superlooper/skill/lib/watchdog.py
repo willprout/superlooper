@@ -90,8 +90,9 @@ TWO off switches reach this module, and they are deliberately not the same one (
 """
 import math
 
+import config as config_lib
 import issues
-import notify as notify_lib   # the owner-text tier names only (issue #493); the CLI renders + sends
+import notify as notify_lib   # the owner-text tiers + part budgets (#493/#490); the CLI renders + sends
 import scheduler
 
 # Signal codes — sorted alphabetically wherever a list of them is stored or journaled, so
@@ -337,8 +338,24 @@ def _update_no_progress(now, view, state, w):
     return since, sorted(ripe)
 
 
+# Each episode signal in the plain words a headline uses (issue #490). The detail strings _signals
+# builds beside them are journaled with the episode, never texted.
+SIGNAL_WORDS = {HEARTBEAT_STALE: "runner heartbeat stale", ALERT: "runner ALERT standing",
+                NO_PROGRESS: "approved work not launching"}
+# The asks the watchdog's 🔴s carry: one line, what the owner does next.
+CHECK_ASK = "check the loop: `superlooper status`"
+RESTART_ASK = "restart it by hand: `superlooper start`"
+
+
+def _plain(sigs, prefix="watchdog: ", suffix=""):
+    """`prefix` + the signals in plain words + `suffix`, within the headline budget."""
+    room = notify_lib.HEADLINE_MAX_BYTES - len(prefix.encode("utf-8")) - len(suffix.encode("utf-8"))
+    return prefix + notify_lib.clauses([SIGNAL_WORDS.get(x, str(x)) for x in sigs],
+                                       budget=room) + suffix
+
+
 def _signals(now, view, state, w):
-    """(sorted signal codes, detail strings for the notify body, new no_progress_since)."""
+    """(sorted signal codes, detail strings for the journal, new no_progress_since)."""
     sigs, details = [], []
     hb = view.get("heartbeat")
     if isinstance(hb, (int, float)) and not isinstance(hb, bool) \
@@ -367,6 +384,13 @@ def _rec(outcome, signals, **extra):
     return {"act": "watchdog", "outcome": outcome, "signals": list(signals), **extra}
 
 
+def _oldest_waiting(since):
+    """The issue number that has waited longest on the no-progress clock, or None."""
+    clocks = [(ts, k) for k, ts in (since or {}).items()
+              if isinstance(ts, (int, float)) and not isinstance(ts, bool) and str(k).isdigit()]
+    return int(min(clocks)[1]) if clocks else None
+
+
 # The episode signals the watchdog pages on (issue #494): what the runner cannot say about itself.
 # `alert` is the runner's own finding, and the runner already texted it (under the same demand rule).
 PAGED_SIGNALS = frozenset({HEARTBEAT_STALE, NO_PROGRESS})
@@ -377,12 +401,15 @@ MARK_EPISODE = "episode"
 MARK_RUNNER = "runner"
 
 
-def _text(tier, headline, ask, caller, marks=None):
-    """One owner text, as DATA (issue #493): a tier from the closed set, a one-clause headline, the
-    sentence as the ask, and the caller the doorway names if it has to cut the text to fit. The pure
-    core never composes or sends; `superlooper watchdog` renders each through notify.render.
-    `marks` (issue #494) rides on a 🔴: which record the CLI stamps when the send is delivered."""
-    text = {"tier": tier, "headline": headline, "ask": ask, "caller": "watchdog:" + caller}
+def _text(tier, headline, ask, caller, marks=None, url=None):
+    """One owner text, as DATA (issue #493): a tier from the closed set, a one-clause headline, at
+    most one short ask line, the issue URL when the text concerns one, and the caller the doorway
+    names in a truncation record. Headline and ask are written to the doorway's part budgets (issue
+    #490), so the text arrives whole. The pure core never composes or sends; `superlooper watchdog`
+    renders each through notify.render. `marks` (issue #494) rides on a 🔴: which record the CLI
+    stamps when the send is delivered."""
+    text = {"tier": tier, "headline": headline, "ask": ask, "url": url,
+            "caller": "watchdog:" + caller}
     if marks is not None:
         text["marks"] = marks
     return text
@@ -412,8 +439,8 @@ def _runner_paged_wedge(view):
         isinstance(r, str) and r.startswith("runner_tick_errors:") for r in paged)
 
 
-def _green(headline, ask, caller):
-    return _text(notify_lib.RECOVERED, headline, ask, caller)
+def _green(headline, caller):
+    return _text(notify_lib.RECOVERED, headline, None, caller)
 
 
 def _rrec(outcome, signals, **extra):
@@ -475,9 +502,7 @@ def _resurrection(now, view, w, sigs, details, new_state, demand=True):
         r["booting_since"] = None            # it ticked: whatever it was booting from is finished
         if r["down_delivered"]:              # issue #494: close the 🔴 that reached the phone
             r["down_delivered"] = False
-            notify.append(_green("runner is back",
-                                 "the runner is completing ticks again — the loop is serving its "
-                                 "work.", "runner_back"))
+            notify.append(_green("runner is back, completing ticks again", "runner_back"))
 
     attempts = [t for t in r["attempts"]
                 if isinstance(t, (int, float)) and not isinstance(t, bool)]
@@ -502,22 +527,17 @@ def _resurrection(now, view, w, sigs, details, new_state, demand=True):
                 r["capped_paged"] = True
                 if cap == 0:                               # auto-restart disabled by config
                     notify.append(_text(
-                        notify_lib.DOWN, "runner is DOWN — auto-restart is DISABLED",
-                        "the runner is provably gone (heartbeat stale, pid dead) but automatic "
-                        "restart is disabled (watchdog.resurrection_max_per_hour = 0). The loop is "
-                        "down and will stay down until you restart it.", "resurrect_disabled",
-                        marks=MARK_RUNNER))
+                        notify_lib.DOWN, "runner down, auto-restart disabled", RESTART_ASK,
+                        "resurrect_disabled", marks=MARK_RUNNER))
                 else:                                      # genuine crash-loop cap hit
                     # ATTEMPTED, never "was restarted": an attempt is recorded before delivery, so an
                     # undeliverable one (no_pane — no tab made, nothing launched) burns a slot too.
                     # Counting it is deliberate; asserting a restart that never happened is not
                     # (fresh-review P1-2 — fabricated history is this codebase's cardinal sin).
                     notify.append(_text(
-                        notify_lib.DOWN, "runner keeps dying — auto-restart PAUSED",
-                        f"automatic restart has been attempted {len(recent)} time(s) in the last "
-                        "hour and the runner is still down. That is a real incident, not a flap, so "
-                        "automatic resurrection is paused — the loop needs you.", "resurrect_capped",
-                        marks=MARK_RUNNER))
+                        notify_lib.DOWN,
+                        f"runner still down after {len(recent)} restart attempt(s), auto-restart "
+                        "paused", RESTART_ASK, "resurrect_capped", marks=MARK_RUNNER))
         else:
             n = new_state.get("next_resurrection", 1)
             resurrect = {"id": f"r{n}", "signals": present}
@@ -689,8 +709,8 @@ def evaluate(now, config, view, state):
                     new_state["resurrection"] = dict(new_state["resurrection"],
                                                      down_delivered=True)
                 else:
-                    notify.append(_green("watchdog: " + ", ".join(ep_signals) + " cleared",
-                                         "the signal that tripped it is gone.", "episode_cleared"))
+                    notify.append(_green(_plain(ep_signals, suffix=" cleared"),
+                                         "episode_cleared"))
         new_state["episode"] = None
         return {"state": new_state, "journal": journal, "notify": notify, "launch": launch,
                 "resurrect": resurrect, "runner_down": runner_down}
@@ -719,14 +739,17 @@ def evaluate(now, config, view, state):
         pageable -= {HEARTBEAT_STALE}
     texted = False
     if not ep.get("paged", "paged" not in ep) and demand and pageable:
-        notify.append(_text(notify_lib.DOWN, "watchdog: " + ", ".join(sigs), "; ".join(details),
-                            "episode", marks=MARK_EPISODE))
+        # The detail (how stale, which issues wait) is the journal's, beside the countdown; a
+        # no-progress page points at the issue that has waited longest.
+        waiting = _oldest_waiting(new_state.get("no_progress_since")) if NO_PROGRESS in sigs else None
+        notify.append(_text(notify_lib.DOWN, _plain(sigs), CHECK_ASK, "episode",
+                            marks=MARK_EPISODE, url=config_lib.issue_url(config, waiting)))
         ep = dict(ep, paged=True)
         texted = True
     if opened:
         journal.append(_rec("notified", sigs, grace_seconds=w["grace_seconds"],
                             authority=w["authority"], launch_due_at=now + w["grace_seconds"],
-                            texted=texted))
+                            texted=texted, detail=ep.get("detail")))
     new_state["episode"] = ep
 
     grace_elapsed = now - ep["opened_at"] >= w["grace_seconds"]
@@ -772,12 +795,9 @@ def after_launch(now, config, state, launch, rc, demand=True):
         journal.append(_rec("launch_failed", sigs, id=launch.get("id"), rc=rc))
         if demand and not ep.get("launch_failure_notified"):
             ep["launch_failure_notified"] = True
-            notify.append(_text(notify_lib.DOWN, "watchdog could NOT launch sl-debugger",
-                                f"launch of session {launch.get('id')} failed (rc={rc}) — most "
-                                "likely no resolvable cmux pane (loop stopped and its tab gone?). "
-                                "The tripped signal still stands: " + ", ".join(sigs)
-                                + ". The loop needs you.", "debugger_launch_failed",
-                                marks=MARK_EPISODE))
+            notify.append(_text(notify_lib.DOWN,
+                                _plain(sigs, prefix="debugger could not launch: "),
+                                CHECK_ASK, "debugger_launch_failed", marks=MARK_EPISODE))
     return {"state": dict(state, episode=ep), "journal": journal, "notify": notify}
 
 
@@ -804,21 +824,14 @@ def after_resurrect(now, config, state, resurrect, rc, demand=True):
         journal.append(_rrec("resurrected", sigs, id=rid))
         if r.get("down_delivered"):
             r["down_delivered"] = False
-            notify.append(_text(
-                notify_lib.RECOVERED, "runner was down — restarted it",
-                f"the runner was provably gone (signals: {', '.join(sigs) or 'heartbeat_stale'}) and "
-                f"has been automatically restarted ({rid}) in its cmux tab. It reconciles from GitHub "
-                "+ disk exactly like a manual restart — no work lost, no counters reset.",
-                "resurrected"))
+            notify.append(_green("runner was down, restarted it", "resurrected"))
     else:
         journal.append(_rrec("resurrect_failed", sigs, id=rid, rc=rc))
         if demand and not r.get("failure_notified"):
             r["failure_notified"] = True
             notify.append(_text(
-                notify_lib.DOWN, "could NOT restart the runner",
-                f"the runner is down and the automatic restart ({rid}) failed (rc={rc}) — most "
-                "likely its cmux tab/pane is gone, so a new one cannot be placed without you. The "
-                "loop is not running.", "resurrect_failed", marks=MARK_RUNNER))
+                notify_lib.DOWN, "runner down, auto-restart failed", RESTART_ASK,
+                "resurrect_failed", marks=MARK_RUNNER))
     return {"state": dict(state, resurrection=r), "journal": journal, "notify": notify}
 
 

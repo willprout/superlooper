@@ -507,12 +507,65 @@ def test_boot_migration_hold_texts_down_through_the_doorway(rig, tmp_path):
     seed_issue(rig, "i5", status="running")            # work in flight: the hold is worth a page
     rig.r._hold_boot_migration([("create", "awaiting-answer")], NOW)
     title, body = marker.read_text().split("|", 1)
-    assert title == "🔴 r@mini · HELD — a repo migration could not be applied"
-    assert "awaiting-answer" in body and body.count("\n") <= 1
+    assert title == "🔴 r@mini · repo migration failed, loop held"
+    assert body == "`superlooper doctor` prints the fix"            # the remedy names the label there
     alert = _alert(rig)                                # ...and the page is on the record: paged on
     assert alert["paged"] == alert["reasons"] and alert["delivered"] == []   # the ALERT, delivered in
     own = json.loads((rig.home / "state" / "runner_paged.json").read_text())  # the runner's own record
     assert own["reasons"] == alert["reasons"]
+
+
+# --------------------------- every runner send arrives whole (issue #490) ---------------------------
+# The runner's half of the full-surface run (test_owner_text_headlines.py holds decide, the watchdog,
+# the doctor and the CLI, and cannot share this rig): each direct send is captured as the doorway was
+# asked for it and re-rendered for the longest identity and URL the part budgets name.
+
+def test_every_runner_direct_send_arrives_whole(rig, tmp_path, monkeypatch):
+    import notify as notify_mod
+    worst = {"repo": "o" * 16 + "/" + "r" * 24, "notify": {"machine_label": "m" * 24}}
+    asked = []
+    real_render = notify_mod.render
+
+    def capture(config, tier, headline, ask=None, url=None, caller=None):
+        asked.append((tier, headline, ask, url, caller))
+        return real_render(config, tier, headline, ask=ask, url=url, caller=caller)
+    monkeypatch.setattr(notify_mod, "render", capture)
+    rig.r.config["notify"]["cmd"] = f"printf x >> {tmp_path / 'sent.txt'}"
+    seed_issue(rig, "i5", status="running")
+    rig.r._hold_boot_migration([("create", "awaiting-answer"), ("create", "needs-owner"),
+                                ("update", "a-label-with-a-long-name-" * 4)], NOW)
+    rig.r._raise_tick_error_alert(123456)
+    loopstate.save(str(rig.home / "state" / "runner_paged.json"),
+                   {"reasons": ["runner_tick_errors:123456", "migration_hold:create:x"]})
+    rig.r._close_own_pages()
+    for i in range(30):
+        journal.append(str(rig.home), {"act": "merge", "id": "i%d" % i, "num": i, "pr": 900 + i,
+                                       "wander": True, "outcome": "ok"}, now=NOW - 100 + i)
+        journal.append(str(rig.home), {"act": "park", "id": "p%d" % i, "num": 200 + i,
+                                       "memo": "m " * 400, "outcome": "ok"}, now=NOW - 50 + i)
+    loopstate.save(str(rig.home / "state" / "ALERT"),
+                   {"reasons": ["gh_auth_dead_workers", "usage_stale"], "since": NOW - 7200})
+    rig.r._morning_report_hook("2026-07-02", NOW)
+    callers = {c for *_, c in asked}
+    assert callers == {"runner:migration_hold", "runner:tick_errors", "runner:own_page_cleared",
+                       "runner:morning_report"}, callers
+    for tier, headline, ask, url, caller in asked:
+        assert len(headline.encode("utf-8")) <= notify_mod.HEADLINE_MAX_BYTES, (caller, headline)
+        assert ask is None or len(ask.encode("utf-8")) <= notify_mod.ASK_MAX_BYTES, (caller, ask)
+        t = real_render(worst, tier, headline, ask=ask, url=url, caller=caller)
+        assert not t.truncated, (caller, t.lines)
+    assert not [j for j in _journal(rig) if j.get("act") == "notify_truncated"]
+
+
+def test_the_morning_file_carries_the_remedy_for_each_standing_alert(rig):
+    import actions as actions_mod
+    loopstate.save(str(rig.home / "state" / "ALERT"),
+                   {"reasons": ["gh_auth_dead_workers", "usage_stale"], "since": NOW - 7200})
+    rig.r._morning_report_hook("2026-07-02", NOW)
+    text = " ".join((rig.home / "reports" / "morning-2026-07-02.md").read_text().split())
+    for reason in ("gh_auth_dead_workers", "usage_stale"):
+        assert actions_mod.alert_headline(reason) in text
+        assert " ".join(actions_mod.alert_remedy(reason).split()) in text
 
 
 # --------------------------- owner pages need work to serve (issue #494) ---------------------------
@@ -568,7 +621,7 @@ def test_a_runner_restarted_into_a_github_outage_still_pages_for_the_queue_it_pu
         rig.r.tick(now=NOW + k * (runner_mod.GH_POLL_SECONDS + 1))
     assert "gh_unreachable" in _alert(rig)["reasons"]
     reds = [t for t in marker.read_text().split("\036") if t.startswith("🔴")]
-    assert len(reds) == 1 and "gh_unreachable" in reds[0]
+    assert len(reds) == 1 and "GitHub unreachable" in reds[0]
     view = json.loads((rig.home / "state" / "gh_view.json").read_text())
     assert view["polled_at"] is None                   # the blanked republish is not evidence
 
@@ -608,7 +661,7 @@ def test_a_wedge_page_is_closed_by_a_clean_tick_never_by_a_decide_that_then_cras
     rig.r.tick = real_tick
     rig.r.run(max_ticks=1, sleep=lambda s: None)                          # a tick that completes
     texts = _texts_in(marker)
-    assert [t[:1] for t in texts] == ["🔴", "🟢"] and "runner_tick_errors" in texts[1]
+    assert [t[:1] for t in texts] == ["🔴", "🟢"] and "cleared: runner ticks failing" in texts[1]
     assert not (rig.home / "state" / "runner_paged.json").exists()
     rig.r.run(max_ticks=1, sleep=lambda s: None)
     assert len(_texts_in(marker)) == 2                                    # one 🟢, not one per tick
@@ -667,7 +720,8 @@ def test_a_delivered_page_is_closed_by_one_green_when_the_tick_recovers(rig, tmp
     rig.r.tick(now=NOW + 15)                          # the first clean tick: decide has no reasons
     assert _alert(rig) is None
     texts = [t for t in marker.read_text().split("\036") if t and not t.startswith("☀️")]
-    assert len(texts) == 1 and texts[0].startswith("🟢 r@") and "runner_tick_errors:4" in texts[0]
+    assert len(texts) == 1 and texts[0].startswith("🟢 r@")
+    assert texts[0].endswith("cleared: runner ticks failing (4x in a row)")
 
 
 # --------------------------- freeze ownership (Codex R2 C2) ---------------------------
@@ -6001,7 +6055,7 @@ def test_consecutive_tick_crashes_raise_alert_and_notify_once(rig, tmp_path):
     assert any("tick" in r for r in alert["reasons"]) # ALERT raised for the wedge
     assert marker.read_text().count("\n") == 1        # notify fired EXACTLY once, not per-tick
     assert marker.read_text().startswith("🔴 r@")      # ...through the doorway, as a DOWN text
-    assert "ALERT: runner_tick_errors:" in marker.read_text()
+    assert "· runner ticks failing (" in marker.read_text()
 
 
 def test_tick_error_counter_resets_on_a_clean_tick(rig, tmp_path):

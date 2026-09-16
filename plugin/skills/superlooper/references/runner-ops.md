@@ -359,8 +359,8 @@ named here that the running system no longer has shows up as a docs finding.
 ## The morning report
 
 Every day at **`report_time` (default 08:45, Mac-local)** the runner writes a report to
-`reports/morning-YYYY-MM-DD.md` in the repo's state home, and **texts you its summary line only when
-the report has news**. It is the one batched, one-touch surface for everything that happened
+`reports/morning-YYYY-MM-DD.md` in the repo's state home, and **texts you a one-line headline of its
+news, only when the report has news** ("2 merged · 1 parked"). It is the one batched, one-touch surface for everything that happened
 overnight — read it with coffee, act on the few items that need you, ignore the rest.
 
 Sections:
@@ -382,7 +382,7 @@ Sections:
 
 A quiet night renders "nothing happened, queue empty" honestly — no news is real news.
 
-**The text goes out only on news.** News is something the summary line reports: a merge, a park or
+**The text goes out only on news.** News is something the report counts: a merge, a park or
 needs-owner hand-back, a bounce, an owner question, a conflict regeneration since the last report, a
 wander, an unattended debugger, a runner resurrection, a triage-flight verdict, a held launch queue,
 or a standing hold or merge freeze past its age threshold. A queue of approved issues waiting is not
@@ -391,7 +391,11 @@ freeze younger than its threshold isn't either, because every freeze already tex
 starts. The installed-engine drift nudge stays in the file and never goes in the text. On a quiet
 morning the file is still written, the day still counts as reported, and the journal records
 `morning_push_skipped` with the reason. `superlooper morning-report` follows the same rule when you
-run it by hand; add `--always-send` to text the summary anyway.
+run it by hand; add `--always-send` to text it anyway.
+
+**Standing ALERTs carry their fix here.** For every reason standing in `state/ALERT`, the file has an
+alert-tier line under the summary: the reason's headline, its code, and the full remedy — the
+paragraph the text no longer carries.
 
 Routine owner-decision pages (a park, a bounce, a durable question) are **batched here instead of
 pushed** during `notify.quiet_hours` (default 21:00–08:00): nobody answers a 3am page and a park is
@@ -598,15 +602,50 @@ so a restart doesn't forget.
 report, the morning report and `doctor --stack` — is rendered by one doorway into at most three
 lines: `<tier emoji> <repo>@<machine> · <what happened>`, then what is asked of you (when anything
 is), then the issue or PR URL (only when one exists). A text is capped at three lines and 280 bytes.
-A sender that says more is cut to fit — the ask first, then the headline, keeping the identity and
-the URL whenever they fit — and the cut is journaled as `notify_truncated`, which the morning report lists under **Gate
-health** by sender: a sender too verbose for a phone, whose full wording is still in the journal.
+Every sender writes a one-clause headline and at most one short ask line that fit that cap, so the
+explanation and the fix are never in the text: a park's or a bounce's memo is on the dashboard's
+card (and normally on the issue the URL points at), a question is on the issue, and an ALERT's
+remedy is printed by `superlooper doctor` and written into the morning report file. If a sender ever does overrun, the doorway cuts it to fit — the ask first,
+then the headline, keeping the identity and the URL whenever they fit — and the cut is journaled as
+`notify_truncated`, which the morning report lists under **Gate health** by sender.
 
 ```
 🟠 superlooper@mini · i412 needs-owner
-retry cap hit (2 relaunches, still no report)
+your call; the memo is on the dashboard
 https://github.com/willprout/superlooper/issues/412
 ```
+
+**ALERT headlines, and where the fix is.** A 🔴 ALERT text names every standing reason in one line
+of plain words ("usage meter unreadable, runner's gh auth dead") and asks you to run `superlooper
+doctor`, which prints the remedy for each reason in `state/ALERT` (`doctor --stack` prints them
+too). The same remedies are in the morning report file. The dashboard shows that an ALERT is up but
+not its reasons yet. The headline for each reason code:
+
+| Reason code | Headline |
+|---|---|
+| `usage_stale` | usage meter unreadable |
+| `launch_anchor_down` | launch anchor gone |
+| `launch_systemic_failure` | launches failing to deliver |
+| `gh_unreachable` | GitHub unreachable |
+| `gh_auth_dead_runner` | runner's gh auth dead |
+| `gh_auth_dead_workers` | workers' gh auth dead |
+| `claude_auth_dead_machine` | no session can start on this machine |
+| `claude_identity_wrong_runner` | runner's Claude login wrong |
+| `claude_identity_wrong_workers` | workers' Claude login wrong |
+| `env_poisoned_workers` | workers' environment poisoned |
+| `session_host_unreachable` | session host unreachable |
+| `fence_down` | fence check refusing every launch |
+| `auth_dead` | Claude auth dead |
+| `session_logged_out:<i>[:<banner>]` | `<i>` session auth dead (`<banner>`) |
+| `session_at_dialog:<i>` | `<i>` waiting at its own dialog |
+| `park_label_stuck:<i>` | `<i>` hand-back label not landing |
+| `launch_runaway:<i>` | `<i>` relaunching past its cap |
+| `update_errors:<i>` | `<i>` branch update failing |
+| `runner_tick_errors:<n>` | runner ticks failing (`<n>`x in a row) |
+| `migration_hold:<kind>:<label>` | repo migration failed, loop held |
+
+A 🟢 names what cleared the same way ("cleared: GitHub unreachable"), with "still down: …" when
+something else still stands.
 
 **Tiers and the machine name.** The emoji is the priority, from a closed set: 🔴 the loop is down
 with work to do and cannot fix itself (it needs you); 🟠 a decision or answer is waiting on you while
