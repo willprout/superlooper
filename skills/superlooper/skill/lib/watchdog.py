@@ -230,7 +230,7 @@ def coerce_state(raw):
     if isinstance(wake, dict) and all(_real(wake.get(k)) for k in _WAKE_TIMES) \
             and (wake.get("heartbeat") is None or _real(wake.get("heartbeat"))):
         st["wake"] = {**{k: wake[k] for k in _WAKE_TIMES}, "heartbeat": wake.get("heartbeat"),
-                      "resumed": wake.get("resumed") is True}
+                      "resumed": wake.get("resumed") is True, "carried": wake.get("carried") is True}
     return st
 
 
@@ -350,8 +350,9 @@ def _wake(now, view, state, w):
 
       * RESOLVE the last wake: a heartbeat that has ADVANCED past its value at that wake was stamped
         by a tick completed after it, so the runner came back — journaled once, as `runner_resumed`,
-        or as `runner_restarted` when the watchdog attempted a restart after the wake (the reborn
-        process ticking is not the runner resuming, and the record must not say it is). Advanced,
+        or as `runner_restarted` when a new runner process is behind it: the watchdog attempted a
+        restart after the wake, or the live runner started after it (the owner, or launchd's
+        KeepAlive). A reborn process ticking is not the runner resuming. Advanced,
         not merely fresh: after a short sleep the pre-sleep heartbeat can sit inside the staleness
         bound. Freshness is NOT required, so a tick landed between two sleeps still resolves the
         first one when the second wake's check reads it (fresh-agent review).
@@ -362,7 +363,12 @@ def _wake(now, view, state, w):
         runner has not come back from, in which case that wake's `since` carries over (fresh-agent
         review P1: wake, one excused check, the lid closes again — measured from the excused check,
         the pre-sleep heartbeat would read as stale before the gap and page a runner about to tick).
-        Bounded all the same: any check past a grace judges the heartbeat and breaks the chain.
+        ONCE per chain, never again (review round 2, P1): when every check lands past the wake gap —
+        a job installed at a long interval, or checks run by hand — every check is a wake whose
+        previous check sat in the last one's grace, and a carry that renewed itself would excuse a
+        dead runner forever. Carrying once bounds that to two intervals, and a check past any grace
+        judges the heartbeat and breaks the chain sooner. A check dated before the wake (a clock
+        stepped back) is not in its grace, so it breaks the chain too.
     A runner that never comes back leaves the wake unresolved; its stale heartbeat, once the grace is
     over, speaks through the episode and resurrection records exactly as before."""
     wake, journal = state.get("wake"), []
@@ -371,16 +377,19 @@ def _wake(now, view, state, w):
     if wake is not None and not wake["resumed"] and hb is not None \
             and (wake["heartbeat"] is None or hb > wake["heartbeat"]):
         attempts = (state.get("resurrection") or {}).get("attempts") or []
-        restarted = any(_real(t) and t >= wake["woke_at"] for t in attempts)
+        started = view.get("runner_started_at")
+        restarted = any(_real(t) and t >= wake["woke_at"] for t in attempts) \
+            or (_real(started) and started >= wake["woke_at"])
         wake = dict(wake, resumed=True)
         journal.append(_wrec("runner_restarted" if restarted else "runner_resumed", wake,
                              heartbeat=hb))
     if last is not None and now - last > WAKE_GAP_INTERVALS * INTERVAL_SECONDS:
-        carried = wake is not None and not wake["resumed"] and last < wake["grace_until"]
+        carried = wake is not None and not wake["resumed"] and not wake["carried"] \
+            and wake["woke_at"] <= last < wake["grace_until"]
         wake = {"woke_at": now, "since": wake["since"] if carried else last,
                 "slept_seconds": int(now - last),
                 "grace_until": now + events_lib.WAKE_GRACE_SECONDS, "heartbeat": hb,
-                "resumed": False}
+                "resumed": False, "carried": carried}
         journal.append(_wrec("slept", wake, grace_until=wake["grace_until"]))
     return wake, journal
 

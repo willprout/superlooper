@@ -5349,10 +5349,11 @@ def cmd_watchdog(args):
                               # check never made; the next check past the grace judges it. What was
                               # OBSERVED is a gap in the watchdog's own checks, so that is what the
                               # line names — a job booted out for an hour reads the same way.
-                              "no watchdog check for %dh %dm, read as the machine sleeping — the "
-                              "stale runner heartbeat is held for the wake grace; a check after it "
-                              "judges the runner as usual"
-                              % divmod(int(final["wake"]["slept_seconds"]) // 60, 60)
+                              "a %dh %dm gap in watchdog checks, %ds ago, read as the machine "
+                              "sleeping — the stale runner heartbeat is held for the wake grace; a "
+                              "check after it judges the runner as usual"
+                              % (divmod(int(final["wake"]["slept_seconds"]) // 60, 60)
+                                 + (max(0, int(now - final["wake"]["woke_at"])),))
                               if res.get("wake_excused") else
                               # A runner that has not stamped its first tick is not healthy — it is
                               # unproven, and saying so is the difference between a summary a

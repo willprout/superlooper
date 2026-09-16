@@ -626,9 +626,9 @@ def _wakes(records, window_start):
     before held the stale heartbeat for the wake grace rather than paging, so the file says the machine
     slept — and whether the runner came back — instead of saying nothing. Deliberately NOT a quiet-
     breaker: a closed lid is not news. "Resumed" is only ever the watchdog's own `runner_resumed`
-    record (the heartbeat advanced after the wake, with no restart attempted); a runner the watchdog
-    restarted after the wake says so, and one that did not come back is the episode and resurrection
-    sections' to tell."""
+    record (the heartbeat advanced after the wake, with no new runner process behind it); a runner
+    restarted after the wake — by the watchdog, the owner or launchd — says so, and one that did not
+    come back is the episode and resurrection sections' to tell."""
     came_back = {}
     for r in records:
         woke = _ts({"ts": r.get("woke_at")})
@@ -645,8 +645,8 @@ def _wakes(records, window_start):
         back = came_back.get(r.get("woke_at")) if _ts({"ts": r.get("woke_at")}) is not None else None
         lines.append(f"- {slept} (no watchdog check ran in that span); "
                      + ("runner resumed." if back == "runner_resumed" else
-                        "the runner came back after a watchdog restart attempt — see Runner "
-                        "resurrection." if back == "runner_restarted" else
+                        "the runner came back restarted, not resumed — a new runner process "
+                        "started after the wake." if back == "runner_restarted" else
                         "the watchdog has not yet seen the runner complete a tick since."))
     return lines
 

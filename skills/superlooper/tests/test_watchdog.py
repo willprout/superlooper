@@ -1550,3 +1550,48 @@ def test_an_excused_check_is_no_evidence_the_runner_is_back():
 def notify_tiers():
     import notify
     return notify
+
+
+def test_checks_further_apart_than_the_wake_gap_still_act_on_a_dead_runner_within_two_intervals():
+    # Review round 2, P1: when EVERY check lands past the wake gap (a job installed at a long interval,
+    # or hand-run checks), every check is a wake. A carried `since` that never expires would excuse a
+    # dead runner forever; carrying at most once per chain bounds the delay to two intervals.
+    step = 1800
+    st = _asleep_at(T0)
+    dead_from = T0 + 60                                # the last tick the runner ever completes
+    acted = None
+    for k in range(1, 9):
+        now = T0 + k * step
+        r = _run(now, _busy(_view(now, heartbeat=dead_from, runner_dead=True)), st)
+        st = r["state"]
+        if r["resurrect"] is not None:
+            acted = k
+            break
+    assert acted is not None and acted <= 3, acted
+
+
+def test_a_wake_does_not_carry_across_checks_dated_before_it():
+    # Review round 2, P2: a clock stepped back behind a wake; checks there judged the heartbeat (they
+    # are not inside the wake's grace). A sleep after them measures from them, not from the old chain.
+    live = dict(runner_live=True, runner_started_at=T0 - 2 * HOUR)
+    st = _asleep_at(T0)
+    woke = T0 + SLEEP
+    held = _run(woke, _busy(_view(woke, heartbeat=T0 - 15, **live)), st)
+    stepped = woke - 2 * HOUR
+    judged = _run(stepped, _busy(_view(stepped, heartbeat=T0 - 15, **live)), held["state"])
+    assert judged["wake_excused"] is False and judged["state"]["episode"] is not None
+    again = stepped + SLEEP
+    r = _run(again, _busy(_view(again, heartbeat=T0 - 15, **live)), judged["state"])
+    assert r["wake_excused"] is False
+
+
+def test_a_runner_that_started_after_the_wake_is_restarted_not_resumed():
+    # Review round 2, P2: a new runner process — started by the owner or by launchd's KeepAlive after
+    # the wake — ticking is not the runner resuming from the sleep.
+    st = _asleep_at(T0)
+    woke = T0 + SLEEP
+    held = _run(woke, _view(woke, heartbeat=T0 - 15, runner_dead=True), st)
+    later = woke + 2 * MIN
+    back = _run(later, _view(later, heartbeat=later - 10, runner_live=True,
+                             runner_started_at=woke + 60), held["state"])
+    assert [(w["outcome"], w["woke_at"]) for w in _wakes(back)] == [("runner_restarted", woke)]

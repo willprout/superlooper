@@ -971,7 +971,7 @@ def test_the_first_check_after_a_sleep_neither_pages_nor_restarts_and_journals_t
     (slept,) = _wakes(rig)
     assert slept["outcome"] == "slept" and abs(slept["slept_seconds"] - _SIX_HOURS) < 60
     # the summary names what it read as a sleep — a gap in its own checks — and never "healthy"
-    assert "no watchdog check for 6h 0m" in r.stdout and "wake grace" in r.stdout
+    assert "a 6h 0m gap in watchdog checks" in r.stdout and "wake grace" in r.stdout
     assert "healthy" not in r.stdout
     # The runner comes back inside the grace and completes a tick: still quiet, and it is recorded.
     rig.heartbeat(5)

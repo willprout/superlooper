@@ -797,7 +797,7 @@ def test_a_machine_sleep_the_watchdog_saw_reaches_the_report_without_breaking_qu
     rline = [l for l in report.morning(restarted, _view(queue=[], usage=None), ledger={},
                                        config=_cfg()).splitlines() if "Machine slept" in l]
     assert len(rline) == 1 and "runner resumed" not in rline[0]
-    assert "restart" in rline[0] and "Runner resurrection" in rline[0]
+    assert "restarted" in rline[0] and "new runner process" in rline[0]
     # a wrong-typed record renders without a fabricated span and never raises
     odd = report.morning([_rec(1030, "watchdog_wake", outcome="slept", woke_at="x",
                                slept_seconds=None)], _view(queue=[], usage=None), ledger={},
