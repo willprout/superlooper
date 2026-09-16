@@ -1329,11 +1329,13 @@ class Runner:
             pass
         try:
             import notify
-            notify.send(self.config, "superlooper HELD — a repo migration could not be applied",
-                        f"a pending per-repo migration failed to apply at boot ({named}); the loop "
-                        "is HELD rather than running against an un-migrated repo and storming a "
-                        "failing write every tick. Check gh auth / re-run `superlooper adopt` "
-                        "(idempotent), then restart the runner.")
+            notify.send(self.config, notify.render(
+                self.config, notify.DOWN, "HELD — a repo migration could not be applied",
+                f"a pending per-repo migration failed to apply at boot ({named}); the loop "
+                "is HELD rather than running against an un-migrated repo and storming a "
+                "failing write every tick. Check gh auth / re-run `superlooper adopt` "
+                "(idempotent), then restart the runner.", caller="runner:migration_hold"),
+                home=self.home)
         except Exception:
             pass
         self._log(f"BOOT HELD: migration could not be applied: {named}")
@@ -1565,8 +1567,10 @@ class Runner:
                 pass
             try:
                 import notify
-                notify.send(self.config, "superlooper ALERT",
-                            f"runner tick has failed {count}x in a row — the loop is wedged")
+                notify.send(self.config, notify.render(
+                    self.config, notify.DOWN, "ALERT: " + reasons[0],
+                    f"runner tick has failed {count}x in a row — the loop is wedged",
+                    caller="runner:tick_errors"), home=self.home)
             except Exception:
                 pass
             self._tick_alert_notified = True   # notify.send never raises; dedupe regardless
@@ -5504,7 +5508,8 @@ class Runner:
 
     def _morning_report_hook(self, date, now):
         """Task 11 seam (filled): report.morning() renders reports/morning-<date>.md from the
-        journal + the live view assembled here, then notify.send() pushes a one-line summary. A
+        journal + the live view assembled here, then the report's one-line summary is pushed as a
+        MORNING-tier text through the notify doorway (issue #493). A
         render/write/notify failure is contained — the action record + the journal it reads are
         already durable, so the report can always be re-rendered by `superlooper morning-report`."""
         import report                                # lazy: keep the agent-agnostic runner light
@@ -5561,7 +5566,9 @@ class Runner:
         # channel (once dead for days, found only by a human reading the journal) on the owner-read
         # report + dashboard — the one surface a dead channel can't itself reach. This is the morning
         # heartbeat, at a reasonable hour: it adds NO 3am ping, unlike a synthetic nightly probe.
-        r = notify.send_test(self.config, f"superlooper morning report — {date}", summary)
+        r = notify.send_test(self.config, notify.render(self.config, notify.MORNING, summary,
+                                                        caller="runner:morning_report"),
+                             home=self.home)
         self._log(f"morning report {date}: notify [{r.channel} ok={r.ok} rc={r.rc}]")
         try:
             journal.append(self.home, {"act": "notify_canary", "date": date, "ok": bool(r.ok),
@@ -5574,10 +5581,22 @@ class Runner:
     def _exec_notify(self, a, now):
         """Task 11 seam (filled): notify.send() delivers by the configured precedence
         (imessage_to → cmd → cmux → log-only) and never raises — its outcome string is what the
-        tick loop journals for this action, so the content is never lost, only (at worst) unsent."""
+        tick loop journals for this action, so the content is never lost, only (at worst) unsent.
+
+        decide() names a tier, headline, ask and URL; notify.render — the one doorway (issue #493) —
+        composes the text. An act it cannot render (no tier from the closed set: an act shaped by an
+        older engine, or a bug) is REFUSED as the journaled outcome: never delivered unshaped, never
+        raised into the tick. A truncation the doorway makes journals into THIS runner's home."""
         import notify
-        outcome = notify.send(self.config, a.get("title"), a.get("body"))
-        self._log(f"NOTIFY [{outcome}] {a.get('title')}: {a.get('body')}")
+        caller = a.get("caller") if isinstance(a.get("caller"), str) else "decide:unknown"
+        try:
+            text = notify.render(self.config, a.get("tier"), a.get("headline"), ask=a.get("ask"),
+                                 url=a.get("url"), caller=caller)
+        except ValueError as e:
+            self._log(f"NOTIFY REFUSED {a.get('headline') or a.get('title')!r}: {e}")
+            return f"refused: {e}"
+        outcome = notify.send(self.config, text, home=self.home)
+        self._log(f"NOTIFY [{outcome}] {a.get('headline')}: {a.get('ask')}")
         return outcome
 
 

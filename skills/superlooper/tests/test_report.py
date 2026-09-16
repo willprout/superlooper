@@ -841,6 +841,47 @@ def test_latest_canary_wins_and_absence_reads_as_not_verified():
     assert "notify channel" in none_out.lower() and "not verified" in none_out.lower()
 
 
+# --------------------------- owner-text truncations (issue #493) ---------------------------
+# The notify doorway cuts an overflowing text to the 3-line cap and journals `notify_truncated`. The
+# report lists those under gate health: a verbose sender is a defect, and this is where it is seen
+# and fixed — never on the phone, where it arrived cut short.
+
+def _gate_health_section(out):
+    return out.split("## Gate health", 1)[1].split("\n## ", 1)[0]
+
+
+def test_gate_health_lists_truncated_owner_texts_by_caller():
+    j = [_rec(1000, "notify_truncated", caller="decide:alert", tier="down", dropped_bytes=10500,
+              full_bytes=10780, outcome="ok"),
+         _rec(1001, "notify_truncated", caller="cli:nightly", tier="waiting", dropped_bytes=40,
+              full_bytes=320, outcome="ok"),
+         _rec(1002, "notify_truncated", caller="decide:alert", tier="down", dropped_bytes=600,
+              full_bytes=880, outcome="ok")]
+    health = _gate_health_section(report.morning(j, _view(), ledger={}, config=_cfg()))
+    line = next(ln for ln in health.splitlines() if "truncat" in ln.lower() or "cut" in ln.lower())
+    assert "3" in line
+    assert "decide:alert ×2" in line and "cli:nightly ×1" in line
+    assert line.index("decide:alert") < line.index("cli:nightly")     # most frequent first
+    assert "10500" in line                                             # the worst drop is named
+
+
+def test_gate_health_is_silent_about_truncations_when_there_are_none():
+    health = _gate_health_section(report.morning(_full_journal(), _view(), ledger={}, config=_cfg()))
+    assert "truncat" not in health.lower() and "cut to fit" not in health.lower()
+
+
+def test_gate_health_truncations_honour_the_7_day_window_and_skip_corrupt_records():
+    now = 10 * 24 * 3600
+    j = [_rec(now - 8 * 24 * 3600, "notify_truncated", caller="decide:park", dropped_bytes=9),
+         {"act": "notify_truncated", "ts": now - 60, "caller": 7, "dropped_bytes": "lots"},
+         _rec(now - 60, "notify_truncated", caller="runner:tick_errors", dropped_bytes=12)]
+    health = _gate_health_section(report.morning(j, _view(now=now), ledger={}, config=_cfg()))
+    line = next(ln for ln in health.splitlines() if "cut to fit" in ln.lower())
+    assert "decide:park" not in line                                  # outside the 7-day window
+    assert "runner:tick_errors ×1" in line and "(unknown) ×1" in line  # a corrupt caller still counts
+    assert line.startswith("- ")
+
+
 # --------------------------- the triage flight's section (issue #449) ---------------------------
 # The flight's acts reach the owner exactly where every other overnight act does. The section is
 # SILENT on a day with no run: a heading reading "None." over a delegation that never flew would

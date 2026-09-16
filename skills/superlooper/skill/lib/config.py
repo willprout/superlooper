@@ -129,7 +129,12 @@ _NESTED_DEFAULTS = {
     # queue stalled) and the merge-freeze notice always push; only the owner-decision hand-backs are
     # held. Defaults ON, 21:00–08:00 (end EXCLUSIVE, wraps midnight); an explicit null DISABLES the
     # batching (every hand-back pages immediately, the pre-#164 behaviour).
-    "notify": {"imessage_to": None, "cmd": None, "quiet_hours": dict(DEFAULT_QUIET_HOURS)},
+    # notify.machine_label (issue #493): the machine half of every owner text's `<repo>@<machine>`
+    # identity line — the owner runs more than one loop on more than one machine and must tell them
+    # apart on a lock screen. Null (the default) means the host's short hostname; a string such as
+    # "mini" or "laptop" overrides it.
+    "notify": {"imessage_to": None, "cmd": None, "machine_label": None,
+               "quiet_hours": dict(DEFAULT_QUIET_HOURS)},
     # janitor.aged_park_days (issue #62): how long a parked / needs-william issue may sit with
     # NO activity (GitHub updatedAt) before `superlooper janitor` proposes closing it. A
     # proposal only — nothing closes without the owner's explicit approval in the janitor's
@@ -489,7 +494,7 @@ def _validate_and_fill(raw):
     v = out["janitor"]["aged_park_days"]
     if isinstance(v, bool) or not isinstance(v, int) or v < 0:
         _err(f"'janitor.aged_park_days' must be an integer >= 0, got {v!r}")
-    for nk in ("imessage_to", "cmd"):
+    for nk in ("imessage_to", "cmd", "machine_label"):
         v = out["notify"][nk]
         if v is not None and (not isinstance(v, str) or not v.strip()):
             _err(f"'notify.{nk}' must be null or a non-empty string, got {v!r}")
@@ -611,6 +616,19 @@ def path_to_area(config, path):
             if fnmatch.fnmatch(path, g):
                 return area
     return "*"
+
+
+def issue_url(config, num):
+    """The GitHub URL of issue (or PR) `num` in the configured repo — the pointer an owner text
+    carries on its last line (issue #493; GitHub redirects /issues/N to /pull/N for a PR). None when
+    the repo or the number is unusable, so a text simply carries no URL line rather than a broken
+    one. Never raises."""
+    repo = config.get("repo") if isinstance(config, dict) else None
+    if not (isinstance(repo, str) and repo.count("/") == 1 and all(repo.split("/"))):
+        return None
+    if isinstance(num, bool) or not isinstance(num, int) or num <= 0:
+        return None
+    return f"https://github.com/{repo}/issues/{num}"
 
 
 def state_home(config):

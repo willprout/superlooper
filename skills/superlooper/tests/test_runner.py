@@ -410,6 +410,7 @@ def test_a_reexec_adopted_start_journals_the_completed_restart(rig):
 def test_morning_report_seam_writes_the_file_and_pushes(rig, tmp_path):
     marker = tmp_path / "notified.txt"
     rig.r.config["notify"]["cmd"] = f'printf "%s" {{title}} > {marker}'   # bare {title}: adapter quotes it
+    rig.r.config["notify"]["machine_label"] = "mini"
     journal.append(str(rig.home), {"act": "merge", "id": "i5", "num": 5, "pr": 9, "outcome": "ok"},
                    now=NOW)
     rig.r._exec_morning_report({"act": "morning_report", "date": "2026-07-02"}, NOW)
@@ -419,23 +420,59 @@ def test_morning_report_seam_writes_the_file_and_pushes(rig, tmp_path):
     text = report_file.read_text()
     assert "superlooper morning report" in text and "#5" in text
     assert (rig.home / "state" / "last_morning_report").read_text() == "2026-07-02"  # due stamp
-    assert marker.exists() and "morning report" in marker.read_text()               # push fired
+    # push fired, through the doorway: the morning tier, the identity, the report's own tally line
+    assert marker.exists() and marker.read_text().startswith("☀️ r@mini · 1 merged")
+    canary = [j for j in _journal(rig) if j.get("act") == "notify_canary"]
+    assert canary and canary[-1]["channel"] == "cmd" and canary[-1]["ok"] is True
 
 
-def test_exec_notify_delivers_and_returns_the_channel_outcome(rig, tmp_path):
+def test_exec_notify_renders_the_act_through_the_doorway(rig, tmp_path):
     marker = tmp_path / "note.txt"
     # bare {title}/{body} — notify shell-quotes them, so a spaced/backtick memo can't break the cmd
     rig.r.config["notify"]["cmd"] = f'printf "%s|%s" {{title}} {{body}} > {marker}'
-    out = rig.r._exec_notify({"act": "notify", "title": "superlooper: i7 parked",
-                              "body": "retry cap hit"}, NOW)
+    rig.r.config["notify"]["machine_label"] = "mini"
+    out = rig.r._exec_notify({"act": "notify", "tier": "waiting", "headline": "i7 parked",
+                              "title": "i7 parked", "ask": "retry cap hit",
+                              "url": "https://github.com/o/r/issues/7", "caller": "decide:park"}, NOW)
     assert out.startswith("sent via cmd")            # the journaled outcome names the channel
-    assert marker.read_text() == "superlooper: i7 parked|retry cap hit"
+    assert marker.read_text() == "🟠 r@mini · i7 parked|retry cap hit\nhttps://github.com/o/r/issues/7"
+
+
+def test_exec_notify_journals_a_truncation_into_the_runner_home(rig, monkeypatch):
+    monkeypatch.setenv("SL_CMUX", str(rig.home / "no-such-cmux"))
+    out = rig.r._exec_notify({"act": "notify", "tier": "down", "headline": "ALERT: usage_stale",
+                              "title": "ALERT: usage_stale", "ask": "a runbook " * 400, "url": None,
+                              "caller": "decide:alert"}, NOW)
+    assert out == "log-only"
+    recs = [j for j in _journal(rig) if j.get("act") == "notify_truncated"]
+    assert len(recs) == 1 and recs[0]["caller"] == "decide:alert" and recs[0]["dropped_bytes"] > 3000
+
+
+def test_exec_notify_refuses_an_act_without_a_closed_tier_and_never_raises(rig, tmp_path):
+    marker = tmp_path / "note.txt"
+    rig.r.config["notify"]["cmd"] = f'printf x > {marker}'
+    for act in ({"act": "notify", "title": "superlooper ALERT", "body": "b"},     # the old free title
+                {"act": "notify", "tier": "urgent", "headline": "x"},
+                {"act": "notify", "tier": None, "headline": None}):
+        out = rig.r._exec_notify(act, NOW)
+        assert out.startswith("refused"), out
+    assert not marker.exists()                        # nothing unshaped ever reaches the phone
 
 
 def test_exec_notify_never_raises_when_no_channel(rig, monkeypatch):
     monkeypatch.setenv("SL_CMUX", str(rig.home / "no-such-cmux"))
-    out = rig.r._exec_notify({"act": "notify", "title": "t", "body": "b"}, NOW)
+    out = rig.r._exec_notify({"act": "notify", "tier": "down", "headline": "t", "ask": "b"}, NOW)
     assert out == "log-only"
+
+
+def test_boot_migration_hold_texts_down_through_the_doorway(rig, tmp_path):
+    marker = tmp_path / "held.txt"
+    rig.r.config["notify"]["cmd"] = f'printf "%s|%s" {{title}} {{body}} > {marker}'
+    rig.r.config["notify"]["machine_label"] = "mini"
+    rig.r._hold_boot_migration([("create", "awaiting-answer")], NOW)
+    title, body = marker.read_text().split("|", 1)
+    assert title == "🔴 r@mini · HELD — a repo migration could not be applied"
+    assert "awaiting-answer" in body and body.count("\n") <= 1
 
 
 # --------------------------- freeze ownership (Codex R2 C2) ---------------------------
@@ -5753,6 +5790,8 @@ def test_consecutive_tick_crashes_raise_alert_and_notify_once(rig, tmp_path):
     alert = json.loads((rig.home / "state" / "ALERT").read_text())
     assert any("tick" in r for r in alert["reasons"]) # ALERT raised for the wedge
     assert marker.read_text().count("\n") == 1        # notify fired EXACTLY once, not per-tick
+    assert marker.read_text().startswith("🔴 r@")      # ...through the doorway, as a DOWN text
+    assert "ALERT: runner_tick_errors:" in marker.read_text()
 
 
 def test_tick_error_counter_resets_on_a_clean_tick(rig, tmp_path):

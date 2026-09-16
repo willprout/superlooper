@@ -1,5 +1,24 @@
 """The notification adapter (plan Task 11, spec §2 "long-running work finishing / stalling /
-needing input reaches William"). ONE function — send() — with a fixed precedence:
+needing input reaches William"), and the ONE doorway every owner text passes (issue #493).
+
+THE DOORWAY. A text is a pager, never a runbook (owner ruling 2026-09-16): the owner runs more than
+one loop on more than one machine, reads it on a lock screen, and cannot reply from the phone. So
+no sender composes its own text any more. render() takes a TIER (a closed set — the emoji carries
+the priority), a one-clause headline, an optional ask line and an optional URL, and produces:
+
+    <tier emoji> <repo>@<machine> · <what happened, one clause>
+    <one line: what is asked of the owner, or nothing>
+    <one GitHub URL, only when an issue or PR exists>
+
+`repo` is the name half of the configured owner/name; `machine` is `notify.machine_label`, else the
+host's short hostname. The cap (TEXT_MAX_LINES, TEXT_MAX_BYTES) is enforced HERE: an overflowing
+input is cut to fit — the ask first, then the headline; the identity and the URL survive unless the
+identity alone leaves no room for them — and send()/send_test() journal the overflow as its own
+`notify_truncated` act, so a verbose caller surfaces in the morning report's gate health instead of
+reaching the phone unseen. send() and send_test() deliver only a Text the renderer produced; a raw
+string (the old free title) is refused.
+
+DELIVERY, by a fixed precedence (line 1 of the envelope rides as the title, the rest as the body):
 
     notify.imessage_to  → text via Messages.app (skill/bin/imessage-notify.sh, an osascript
                           one-liner; the first send triggers a one-time macOS permission click —
@@ -12,8 +31,10 @@ needing input reaches William"). ONE function — send() — with a fixed preced
 
 Two hard rules, both bought by the autocode postmortems (desktop-only alerts that never reached
 the phone, a hung notifier that wedged a tick):
-  1. NEVER raises. Every channel is wrapped; a failure — missing binary, nonzero exit, timeout —
-     becomes a returned outcome STRING the runner journals, never an exception into the tick.
+  1. send()/send_test() NEVER raise. Every channel is wrapped; a failure — missing binary, nonzero
+     exit, timeout — becomes a returned outcome STRING the runner journals, never an exception into
+     the tick. (render() raises only on a tier outside the closed set: a programmer error the tests
+     pin, never a runtime condition — and the runner's executor still catches it as a refusal.)
   2. Bounded. Every subprocess carries a hard timeout so a hung Messages/cmux cannot stall the
      loop. Notifications are a convenience layer, never a safety layer (the ALERT file + journal
      are the real signal); so a best-effort send that fails is fine, it is just recorded.
@@ -24,7 +45,9 @@ misconfigured primary channel behind a desktop toast William may never see). Pre
 the ONE channel to use; log-only is only reached when nothing higher is configured/available.
 """
 import os
+import socket
 import subprocess
+import sys
 from collections import namedtuple
 
 # The full outcome of one delivery attempt. send() flattens this to a journaled string (its
@@ -47,6 +70,204 @@ _CMUX_DEFAULT = "/Applications/cmux.app/Contents/Resources/bin/cmux"
 
 SEND_TIMEOUT = 15   # generous: Messages can be slow to hand off; still bounds a hung notifier.
 
+
+# ------------------------------------------------------------------------------------------------
+# The doorway (issue #493)
+# ------------------------------------------------------------------------------------------------
+
+# The closed tier set. A sender names one of these; it never writes its own title word. The emoji is
+# the priority, so a lock screen sorts itself.
+DOWN = "down"            # the loop is down with work to do and cannot fix itself — needs the owner
+WAITING = "waiting"      # a decision or answer is waiting on the owner; the loop keeps running
+RECOVERED = "recovered"  # the loop came back from a DOWN condition
+MORNING = "morning"      # the morning report
+TEST = "test"            # a test send (doctor)
+TIER_EMOJI = {DOWN: "🔴", WAITING: "🟠", RECOVERED: "🟢", MORNING: "☀️", TEST: "🧪"}
+
+# The hard cap. Three lines (identity + what, the ask, the URL) and a byte budget on the order of a
+# short SMS: a text that needs more than this is a runbook, and runbooks belong where a human at a
+# keyboard reads them (the journal, the morning-report file, the dashboard, the issue). Bytes, not
+# characters, because the channel limits are bytes and the emoji and the separator are multi-byte.
+TEXT_MAX_LINES = 3
+TEXT_MAX_BYTES = 280
+
+_SEP = " · "            # between the identity and the headline
+_ELLIPSIS = "…"         # marks a cut line, so a truncated text never reads as whole
+_REFUSED = "refused: not a rendered owner text (every text is built by notify.render)"
+
+
+class Text(namedtuple("Text", ["tier", "lines", "caller", "full_bytes", "dropped_bytes"])):
+    """One rendered owner text: what render() produced and the ONLY thing send()/send_test() deliver.
+      tier:          one of the closed tier names
+      lines:         the envelope, 1..TEXT_MAX_LINES single lines, within TEXT_MAX_BYTES together
+      caller:        who asked for it ("decide:park", "cli:nightly", ...) — named in the truncation act
+      full_bytes:    the size the envelope WOULD have had uncut
+      dropped_bytes: how many bytes shorter the delivered text is than the uncut one (0 when the
+                     input fit; net of the "…" the cut adds)"""
+    __slots__ = ()
+
+    @property
+    def text(self):
+        return "\n".join(self.lines)
+
+    @property
+    def truncated(self):
+        return self.dropped_bytes > 0
+
+
+def _notify_block(config):
+    cfg = config if isinstance(config, dict) else {}
+    return cfg.get("notify") if isinstance(cfg.get("notify"), dict) else {}
+
+
+def _one_line(v):
+    """Any input as ONE line: every run of whitespace — newlines included — becomes a single space.
+    Collapsing is not truncation (nothing is lost); it is what keeps a multi-paragraph memo from
+    breaking the three-line envelope. A character UTF-8 cannot carry (a lone surrogate decoded out of
+    a JSON escape in a memo) becomes "?", so measuring and delivering the text can never raise."""
+    if v is None:
+        return ""
+    s = str(v).encode("utf-8", "replace").decode("utf-8")
+    return " ".join(s.split())
+
+
+def _nbytes(s):
+    return len(s.encode("utf-8"))
+
+
+def _cut(s, budget):
+    """`s` within `budget` UTF-8 bytes, ending in an ellipsis when anything was cut; "" when nothing
+    but the ellipsis would fit. Cuts on a character boundary (a partial multi-byte tail is dropped)."""
+    if _nbytes(s) <= budget:
+        return s
+    room = budget - _nbytes(_ELLIPSIS)
+    if room <= 0:
+        return ""
+    kept = s.encode("utf-8")[:room].decode("utf-8", "ignore").rstrip()
+    return kept + _ELLIPSIS if kept else ""
+
+
+def machine(config):
+    """The machine half of the identity: `notify.machine_label` when set, else the short hostname
+    (the first label of gethostname — "Williams-Mac-mini.local" reads "Williams-Mac-mini"). Never
+    raises; a host that will not say reads "unknown-host"."""
+    label = _notify_block(config).get("machine_label")
+    label = _one_line(label) if isinstance(label, str) else ""
+    if label:
+        return label
+    try:
+        host = socket.gethostname()
+    except OSError:
+        host = ""
+    host = _one_line(host).split(".")[0] if isinstance(host, str) else ""
+    return host or "unknown-host"
+
+
+def _repo_name(config):
+    """The name half of the configured owner/name — the repo half of the identity."""
+    repo = config.get("repo") if isinstance(config, dict) else None
+    name = repo.split("/", 1)[-1] if isinstance(repo, str) else ""
+    return _one_line(name) or "unknown-repo"
+
+
+def _fit(prefix, head, ask, url):
+    """The envelope's lines within the cap. The order things give way is the design: the ask line is
+    cut first (it is the part that grows into a runbook), then the headline; the identity prefix and
+    the URL are never cut (a cut URL is useless). Only an identity + URL that alone leave no room — an
+    absurd label or repo — lose the URL, and past that line 1 is hard-cut, so the cap always holds."""
+    def lines(h, a, u):
+        return [prefix + h] + ([a] if a else []) + ([u] if u else [])
+
+    def size(h, a, u):
+        return _nbytes("\n".join(lines(h, a, u)))
+
+    cap = TEXT_MAX_BYTES
+    if size(head, ask, url) <= cap:
+        return lines(head, ask, url)
+    if ask:
+        cut_ask = _cut(ask, cap - size(head, "", url) - 1)       # -1: the newline the ask line needs
+        if cut_ask and size(head, cut_ask, url) <= cap:
+            return lines(head, cut_ask, url)
+    for u in ((url, "") if url else ("",)):
+        cut_head = _cut(head, cap - size("", "", u))
+        if size(cut_head, "", u) <= cap:
+            return lines(cut_head, "", u)
+    return [_cut(prefix + head, cap)]
+
+
+def render(config, tier, headline, ask=None, url=None, caller=None):
+    """THE rendering entry point: the one place an owner text is composed. Returns a Text whose lines
+    are exactly the envelope (see the module docstring) within the cap. `tier` must be one of the
+    closed set (DOWN / WAITING / RECOVERED / MORNING / TEST) — a free title raises ValueError, because
+    the tier set being closed is the contract. `caller` names the sender in a truncation record; it
+    defaults to the calling module:function. Pure apart from the hostname read."""
+    if not isinstance(tier, str) or tier not in TIER_EMOJI:
+        raise ValueError("notify.render needs a tier from %s, got %r" % (sorted(TIER_EMOJI), tier))
+    if caller is None:
+        frame = sys._getframe(1)
+        caller = "%s:%s" % (frame.f_globals.get("__name__", "?"), frame.f_code.co_name)
+    prefix = "%s %s@%s%s" % (TIER_EMOJI[tier], _repo_name(config), machine(config), _SEP)
+    head = _one_line(headline) or "(no headline)"     # line 1 always says SOMETHING after the ·
+    ask, url = _one_line(ask), _one_line(url)
+    full_bytes = _nbytes("\n".join([prefix + head] + ([ask] if ask else []) + ([url] if url else [])))
+    lines = tuple(_fit(prefix, head, ask, url))
+    return Text(tier, lines, str(caller), full_bytes, full_bytes - _nbytes("\n".join(lines)))
+
+
+def _int(v):
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def _rendered(text):
+    """True only for a Text render() could have produced: a closed-set tier whose emoji leads line 1,
+    1..TEXT_MAX_LINES single lines within TEXT_MAX_BYTES. A raw string, a tuple, or a Text tampered
+    past the cap (namedtuple._replace) is refused exactly like the old free title — the cap is a
+    property of what is delivered, not merely of what render() happened to return. Never raises: a
+    hand-built line UTF-8 cannot carry is refused, not measured into an exception."""
+    try:
+        return _shape_ok(text)
+    except Exception:
+        return False
+
+
+def _shape_ok(text):
+    if not isinstance(text, Text):
+        return False
+    if not (isinstance(text.tier, str) and text.tier in TIER_EMOJI):
+        return False
+    lines = text.lines
+    if not (isinstance(lines, tuple) and 1 <= len(lines) <= TEXT_MAX_LINES
+            and all(isinstance(ln, str) and "\n" not in ln and "\r" not in ln for ln in lines)):
+        return False
+    return (lines[0].startswith(TIER_EMOJI[text.tier] + " ")
+            and _nbytes("\n".join(lines)) <= TEXT_MAX_BYTES
+            and isinstance(text.caller, str) and _int(text.full_bytes)
+            and _int(text.dropped_bytes) and text.dropped_bytes >= 0)
+
+
+def _journal_truncation(config, text, home):
+    """Journal a truncated text as its own `notify_truncated` act — the class-killer: a verbose
+    caller can never reach the phone unseen, and the morning report's gate health lists it where the
+    defect can be fixed. Written whether or not the channel then delivers (the defect is the caller's
+    verbosity, not the channel). Never raises: a journal hiccup must not stop the text itself."""
+    if not text.truncated:
+        return
+    try:
+        import journal
+        if home is None:
+            import config as config_lib
+            home = config_lib.state_home(config)
+        journal.append(home, {"act": "notify_truncated", "caller": text.caller, "tier": text.tier,
+                              "headline": text.lines[0], "full_bytes": text.full_bytes,
+                              "dropped_bytes": text.dropped_bytes, "cap_bytes": TEXT_MAX_BYTES,
+                              "outcome": "ok"})
+    except Exception:
+        pass
+
+
+# ------------------------------------------------------------------------------------------------
+# Delivery
+# ------------------------------------------------------------------------------------------------
 
 def _str_or_none(v):
     """A configured channel value is a non-empty string; anything else (None, wrong-typed) reads
@@ -86,16 +307,15 @@ _OUTCOME = {
 }
 
 
-def _deliver(config, title, body):
+def _deliver(config, text):
     """Select the ONE channel by precedence, run it, and return the full SendResult. Never raises.
     This is the single home of precedence + the never-raise guarantee: both send() (which flattens
     it to a journaled string) and send_test() (which the doctor reads whole) call it, so the two
-    can never drift apart. `title`/`body` are coerced to str so a stray non-string payload can
-    never break the send."""
-    title = "" if title is None else str(title)
-    body = "" if body is None else str(body)
-    cfg = config if isinstance(config, dict) else {}
-    n = cfg.get("notify") if isinstance(cfg.get("notify"), dict) else {}
+    can never drift apart. `text` is an already-validated rendered Text: its first line is the
+    title every channel shows, the remaining (at most two) lines the body."""
+    title = text.lines[0]
+    body = "\n".join(text.lines[1:])
+    n = _notify_block(config)
     imessage_to = _str_or_none(n.get("imessage_to"))
     cmd = _str_or_none(n.get("cmd"))
 
@@ -127,20 +347,33 @@ def _deliver(config, title, body):
     return SendResult("log-only", True, 0, "")
 
 
-def send(config, title, body):
-    """Deliver one notification by the configured precedence; return a short outcome string the
-    caller journals. Never raises."""
-    r = _deliver(config, title, body)
+def send(config, text, home=None):
+    """Deliver one rendered owner text by the configured precedence; return a short outcome string
+    the caller journals. Never raises. `text` must come from render() — anything else (a raw title
+    string, a tampered copy past the cap) is REFUSED, never delivered. A truncated text journals its
+    `notify_truncated` act into `home` (default: the configured state home) before it goes out.
+
+    No compatibility shape for the pre-#493 (config, title, body) call is needed across the publish:
+    a runner lives inside `superlooper run`, which imports this module at start-up, so a runner
+    started on the old engine keeps the old module in memory until it is restarted."""
+    if not _rendered(text):
+        return _REFUSED
+    _journal_truncation(config, text, home)
+    r = _deliver(config, text)
     if r.channel == "log-only":
         return "log-only"
     ok_msg, fail_msg = _OUTCOME[r.channel]
     return ok_msg if r.ok else fail_msg.format(rc=r.rc)
 
 
-def send_test(config, title, body):
-    """Deliver ONE notification through the configured precedence and return the full SendResult
-    (channel, ok, rc, stderr) — the stack doctor's hook for PROVING the channel works. Same
-    precedence, same never-raise guarantee as send(); the only difference is the caller gets rc +
-    stderr instead of a flattened string, so a failed send can be reported with its actual reason.
-    A real message really goes out: callers announce the side effect first."""
-    return _deliver(config, title, body)
+def send_test(config, text, home=None):
+    """Deliver ONE rendered text through the configured precedence and return the full SendResult
+    (channel, ok, rc, stderr) — the stack doctor's hook for PROVING the channel works, and the
+    morning report's canary. Same precedence, same refusal, same truncation journal, same never-raise
+    guarantee as send(); the only difference is the caller gets rc + stderr instead of a flattened
+    string, so a failed send can be reported with its actual reason. A real message really goes out:
+    callers announce the side effect first."""
+    if not _rendered(text):
+        return SendResult("refused", False, 2, _REFUSED)
+    _journal_truncation(config, text, home)
+    return _deliver(config, text)

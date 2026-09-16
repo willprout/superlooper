@@ -76,7 +76,7 @@ def test_stale_heartbeat_trips_and_notifies_once():
     assert ep["signals"] == ["heartbeat_stale"]
     assert ep["opened_at"] == T0
     assert len(r["notify"]) == 1
-    title, body = r["notify"][0]
+    title, body = r["notify"][0]["headline"], r["notify"][0]["ask"]
     assert "watchdog" in title.lower()
     assert "30" in body                       # names the grace window
     assert "full" in body                     # names the authority tier
@@ -94,7 +94,7 @@ def test_present_alert_trips():
     r = _run(T0, _view(alert={"reasons": ["gh_unreachable"], "since": T0 - 300}))
     ep = r["state"]["episode"]
     assert ep is not None and ep["signals"] == ["alert"]
-    assert "gh_unreachable" in r["notify"][0][1]
+    assert "gh_unreachable" in r["notify"][0]["ask"]
 
 
 def test_unreadable_alert_still_counts_as_present():
@@ -113,7 +113,7 @@ def test_no_progress_trips_only_after_the_bound():
     r3 = _run(T0 + 30 * MIN, _view(T0 + 30 * MIN, eligible_nums=[42]), r2["state"])
     ep = r3["state"]["episode"]
     assert ep is not None and ep["signals"] == ["no_progress"]
-    assert "#42" in r3["notify"][0][1]                  # names the waiting work
+    assert "#42" in r3["notify"][0]["ask"]                  # names the waiting work
 
 
 def test_no_progress_clock_survives_a_changing_queue_neighbour():
@@ -334,7 +334,7 @@ def test_grace_elapsed_emits_exactly_one_launch_request():
     assert ep["launched_at"] == now and ep["launch_id"] == "d1"
     assert _outcomes(done) == ["launched"]
     assert done["journal"][0]["id"] == "d1"
-    assert len(done["notify"]) == 1 and "d1" in done["notify"][0][1]
+    assert len(done["notify"]) == 1 and "d1" in done["notify"][0]["ask"]
     # ...and the SAME standing episode never launches again
     later = _run(now + 60 * MIN, _view(now + 60 * MIN, heartbeat=T0 - 21 * MIN), done["state"])
     assert later["launch"] is None
@@ -570,7 +570,7 @@ def test_after_resurrect_success_journals_a_distinct_act_and_texts_loudly():
     assert done["journal"][0]["outcome"] == "resurrected"
     assert done["journal"][0]["id"] == "r1"
     assert len(done["notify"]) == 1                        # loud, not silent (the DoD)
-    assert "r1" in done["notify"][0][1] or "runner" in done["notify"][0][1].lower()
+    assert "r1" in done["notify"][0]["ask"] or "runner" in done["notify"][0]["ask"].lower()
 
 
 def test_dead_runner_with_a_fresh_heartbeat_is_not_resurrected():
@@ -639,7 +639,7 @@ def test_cap_of_zero_disables_resurrection_and_escalates_immediately():
     assert r["journal"][0]["max_per_hour"] == 0
     assert len(r["notify"]) == 1
     # the message must reflect DISABLED, never "restarted 0 time(s)" (misleading when never enabled)
-    body = r["notify"][0][1]
+    body = r["notify"][0]["ask"]
     assert "disabled" in body.lower()
     assert "0 time" not in body
 
@@ -657,7 +657,7 @@ def test_cap_escalation_claims_attempts_never_asserted_restarts():
     later = T0 + 6 * MIN
     capped = _run(later, _dead(later), st, cfg=cfg)
     assert [j.get("outcome") for j in capped["journal"]] == ["resurrect_capped"]
-    body = capped["notify"][0][1].lower()
+    body = capped["notify"][0]["ask"].lower()
     assert "attempt" in body                          # honest: restart was TRIED
     assert "been auto-restarted" not in body          # never assert a restart that did not happen
     assert "restarted 1 time" not in body
@@ -977,3 +977,61 @@ def test_a_corpse_takes_the_booting_excuse_with_it():
     reborn = _run(T0 + 10 * MIN, _view(T0 + 10 * MIN, heartbeat=T0 - 60 * MIN, runner_live=True,
                                        runner_started_at=T0 + 10 * MIN - 20), dead["state"])
     assert reborn["state"]["episode"] is None
+
+
+# --------------------------- owner texts go through the doorway (issue #493) ---------------------------
+# evaluate()/after_* never compose a text: each notify entry names a TIER from the closed set, a
+# headline, the (unchanged) sentence as its ask, and the caller the doorway names if it must truncate.
+# bin/superlooper renders each entry through notify.render before anything is sent.
+
+import notify as notify_mod
+
+
+def _entries(*results):
+    return [n for r in results for n in r["notify"]]
+
+
+def _shape_ok(n):
+    return (set(n) == {"tier", "headline", "ask", "caller"} and n["tier"] in notify_mod.TIER_EMOJI
+            and isinstance(n["headline"], str) and n["headline"].strip()
+            and n["caller"].startswith("watchdog:"))
+
+
+def test_an_opened_episode_texts_down_with_its_signals_as_the_headline():
+    r = _run(T0, _view(heartbeat=T0 - 21 * MIN))
+    (n,) = r["notify"]
+    assert _shape_ok(n)
+    assert n["tier"] == notify_mod.DOWN and n["headline"] == "watchdog: heartbeat_stale"
+    assert n["caller"] == "watchdog:episode"
+
+
+def test_resurrection_outcomes_carry_recovered_and_down_tiers():
+    r = _run(T0, _dead(T0))
+    ok = wd.after_resurrect(T0, _cfg(), r["state"], r["resurrect"], rc=0)["notify"][0]
+    bad = wd.after_resurrect(T0, _cfg(), r["state"], r["resurrect"], rc=2)["notify"][0]
+    assert _shape_ok(ok) and _shape_ok(bad)
+    assert ok["tier"] == notify_mod.RECOVERED and ok["caller"] == "watchdog:resurrected"
+    assert bad["tier"] == notify_mod.DOWN and bad["caller"] == "watchdog:resurrect_failed"
+    for n in (ok, bad):
+        assert not n["headline"].lower().startswith("superlooper")   # the identity line names it
+
+
+def test_capped_and_disabled_resurrection_and_debugger_launch_texts_are_down():
+    disabled = _run(T0, _dead(T0), cfg=_cfg(resurrection_max_per_hour=0))["notify"][0]
+    assert _shape_ok(disabled) and disabled["tier"] == notify_mod.DOWN
+    assert disabled["caller"] == "watchdog:resurrect_disabled"
+    r = _run(T0, _view(heartbeat=T0 - 21 * MIN), cfg=_cfg(grace_minutes=0))
+    launched = wd.after_launch(T0, _cfg(), r["state"], r["launch"], rc=0)["notify"][0]
+    failed = wd.after_launch(T0, _cfg(), r["state"], r["launch"], rc=3)["notify"][0]
+    assert _shape_ok(launched) and _shape_ok(failed)
+    assert launched["tier"] == notify_mod.DOWN and launched["caller"] == "watchdog:debugger_launched"
+    assert failed["tier"] == notify_mod.DOWN and failed["caller"] == "watchdog:debugger_launch_failed"
+
+
+def test_a_capped_crash_loop_escalation_is_down():
+    cfg = _cfg(resurrection_max_per_hour=1)
+    r1 = _run(T0, _dead(T0), wd.new_state(), cfg=cfg)
+    st = wd.after_resurrect(T0, cfg, r1["state"], r1["resurrect"], rc=0)["state"]
+    capped = _run(T0 + 6 * MIN, _dead(T0 + 6 * MIN), st, cfg=cfg)["notify"][0]
+    assert _shape_ok(capped) and capped["tier"] == notify_mod.DOWN
+    assert capped["caller"] == "watchdog:resurrect_capped"

@@ -72,7 +72,7 @@ def test_minimal_config_fills_defaults(tmp_path):
     assert cfg["cleanup_parked_worktrees"] is False
     # notify.quiet_hours (issue #164) defaults ON (21:00–08:00): routine owner-decision pages are
     # batched to the morning report during these hours; an explicit null disables the batching.
-    assert cfg["notify"] == {"imessage_to": None, "cmd": None,
+    assert cfg["notify"] == {"imessage_to": None, "cmd": None, "machine_label": None,
                              "quiet_hours": {"start": "21:00", "end": "08:00"}}
     assert cfg["codex"] == {"dangerous_bypass": False, "bypass_hook_trust": True,
                             "no_alt_screen": True}
@@ -258,6 +258,24 @@ def test_quiet_hours_can_be_overridden_and_disabled(tmp_path):
 
     _write_cfg(tmp_path, {"repo": "me/tool", "notify": {"quiet_hours": None}})
     assert config.load(tmp_path)["notify"]["quiet_hours"] is None   # explicit disable is allowed
+
+
+def test_notify_machine_label_is_accepted_and_defaults_to_null(tmp_path):
+    # issue #493: the machine half of every owner text's `<repo>@<machine>` identity. Null (the
+    # default) means the host's short hostname; a string such as "mini" / "laptop" overrides it.
+    _write_cfg(tmp_path, {"repo": "me/tool"})
+    assert config.load(tmp_path)["notify"]["machine_label"] is None
+    _write_cfg(tmp_path, {"repo": "me/tool", "notify": {"machine_label": "mini"}})
+    cfg = config.load(tmp_path)
+    assert cfg["notify"]["machine_label"] == "mini"
+    assert cfg["notify"]["quiet_hours"] == {"start": "21:00", "end": "08:00"}   # siblings kept
+
+
+def test_notify_machine_label_rejects_a_non_string(tmp_path):
+    _write_cfg(tmp_path, {"repo": "me/tool", "notify": {"machine_label": 42}})
+    with pytest.raises(ValueError) as e:
+        config.load(tmp_path)
+    assert "notify.machine_label" in str(e.value)
 
 
 def test_quiet_hours_rejects_malformed_windows(tmp_path):
@@ -504,6 +522,10 @@ def test_bad_nested_field_types_rejected(tmp_path):
         {"qa": {"nightly_cmd": []}},            # null or non-empty string
         {"notify": {"cmd": []}},                # null or non-empty string
         {"notify": {"imessage_to": 5551234}},   # null or non-empty string
+        {"notify": {"machine_label": 7}},       # null or non-empty string (issue #493)
+        {"notify": {"machine_label": True}},    # null or non-empty string
+        {"notify": {"machine_label": ["mini"]}},  # null or non-empty string
+        {"notify": {"machine_label": "  "}},    # null or non-empty string
         {"codex": {"dangerous_bypass": "yes"}}, # must be a real bool
         {"codex": {"bypass_hook_trust": 1}},     # bool only, not int
         {"codex": {"no_alt_screen": None}},      # bool only

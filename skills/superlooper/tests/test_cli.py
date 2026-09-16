@@ -1901,6 +1901,103 @@ def test_morning_report_renders_standing_holds_from_loopstate(rig):
     assert "None — nothing is held." in text.split("## Standing holds")[1]
 
 
+# --------------------------- owner texts through the doorway (issue #493) ---------------------------
+# Every CLI sender renders through notify.render: the text that leaves names its tier and the
+# `<repo>@<machine>` identity, stays within the cap, and points at the issue when one exists.
+
+def _texting_config(rig, sent, **extra):
+    cfg_path = rig.repo / ".superlooper" / "config.json"
+    cfg = json.loads(cfg_path.read_text())
+    cfg.update(extra)
+    cfg["notify"] = {"machine_label": "mini", "imessage_to": None,
+                     "cmd": f'printf "%s|%s\\n==\\n" "$SL_TITLE" "$SL_BODY" >> {sent}'}
+    cfg_path.write_text(json.dumps(cfg))
+
+
+def _texts(sent):
+    out = []
+    for chunk in sent.read_text().split("\n==\n"):
+        if chunk.strip():
+            title, body = chunk.split("|", 1)
+            out.append((title, body))
+    return out
+
+
+def test_nightly_red_texts_waiting_and_points_at_the_fix_issue(rig, tmp_path):
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    fx = tmp_path / "junit.xml"
+    _write_junit(fx, failing=True)
+    sent = tmp_path / "sent.txt"
+    _write_qa(rig, {"nightly_cmd": f"mkdir -p results && cp {fx} results/junit.xml",
+                    "results_glob": "results/*.xml", "retry_once": True})
+    _texting_config(rig, sent)
+    r = cli(rig, "nightly", "--repo", str(rig.repo), env_over={"SL_NIGHTLY_WORKTREE": str(wt)})
+    assert r.returncode == 0, r.stdout + r.stderr
+    _, recs = _nightly_records(rig)
+    filed = recs[-1]["filed"]
+    (title, body), = _texts(sent)
+    assert title.startswith("🟠 r@mini · nightly RED (")
+    lines = body.split("\n")
+    assert len(lines) <= 2 and "persistent failure" in lines[0]
+    if filed:
+        assert lines[-1] == f"https://github.com/o/r/issues/{filed[0]}"
+
+
+def test_nightly_unparseable_results_text_waiting_through_the_doorway(rig, tmp_path):
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    sent = tmp_path / "sent.txt"
+    _write_qa(rig, {"nightly_cmd": "true", "results_glob": "results/*.xml"})
+    _texting_config(rig, sent)
+    r = cli(rig, "nightly", "--repo", str(rig.repo), env_over={"SL_NIGHTLY_WORKTREE": str(wt)})
+    assert r.returncode == 1
+    (title, body), = _texts(sent)
+    assert title.startswith("🟠 r@mini · nightly — could not parse results (")
+    assert len((title + "\n" + body).encode("utf-8")) <= 280
+
+
+def test_promote_report_texts_waiting_through_the_doorway(rig, tmp_path):
+    home = rig.tmp / "slhome" / "o__r"
+    (home / "state").mkdir(parents=True, exist_ok=True)
+    (home / "state" / "last_nightly.json").write_text(json.dumps(
+        {"date": "2026-07-01", "ok": True, "failures": []}))
+    sent = tmp_path / "sent.txt"
+    _texting_config(rig, sent)
+    r = cli(rig, "promote-report", "--use-latest-nightly", "--repo", str(rig.repo))
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "notify: sent via cmd" in r.stdout
+    (title, body), = _texts(sent)
+    assert title.startswith("🟠 r@mini · promotion evidence — ")
+    assert body == "promotion evidence ready — no verdict, your call (Gate 2)."
+
+
+def test_morning_report_cli_texts_the_morning_tier_and_journals_the_canary(rig, tmp_path):
+    import journal
+    home = rig.tmp / "slhome" / "o__r"
+    journal.append(str(home), {"act": "merge", "id": "i5", "num": 5, "pr": 9, "outcome": "ok"})
+    sent = tmp_path / "sent.txt"
+    _texting_config(rig, sent)
+    r = cli(rig, "morning-report", "--repo", str(rig.repo))
+    assert r.returncode == 0, r.stdout + r.stderr
+    (title, body), = _texts(sent)
+    assert title.startswith("☀️ r@mini · 1 merged")
+    assert body == ""
+    canary = [x for x in journal.read(str(home)) if x.get("act") == "notify_canary"]
+    assert canary and canary[-1]["ok"] is True and canary[-1]["channel"] == "cmd"
+
+
+def test_doctor_stack_sends_a_test_tier_text(rig, tmp_path):
+    sent = tmp_path / "sent.txt"
+    _texting_config(rig, sent)
+    (rig.home / ".zshrc").write_text('source "$HOME/.superlooper/launch-shim.zsh"\n')
+    r = cli(rig, "doctor", "--stack", "--repo", str(rig.repo), env_over=_stack_env(rig))
+    assert "notify channel" in r.stdout
+    (title, body), = _texts(sent)
+    assert title.startswith("🧪 r@mini · ")
+    assert title in r.stdout                        # the announce shows exactly what goes out
+
+
 # --------------------------- D1: gh pinned to config.repo, never cwd ---------------------------
 
 def _recording_gh(rig):

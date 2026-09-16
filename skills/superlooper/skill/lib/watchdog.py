@@ -76,6 +76,7 @@ TWO off switches reach this module, and they are deliberately not the same one (
 import math
 
 import issues
+import notify as notify_lib   # the owner-text tier names only (issue #493); the CLI renders + sends
 import scheduler
 
 # Signal codes — sorted alphabetically wherever a list of them is stored or journaled, so
@@ -346,6 +347,13 @@ def _rec(outcome, signals, **extra):
     return {"act": "watchdog", "outcome": outcome, "signals": list(signals), **extra}
 
 
+def _text(tier, headline, ask, caller):
+    """One owner text, as DATA (issue #493): a tier from the closed set, a one-clause headline, the
+    sentence as the ask, and the caller the doorway names if it has to cut the text to fit. The pure
+    core never composes or sends; `superlooper watchdog` renders each through notify.render."""
+    return {"tier": tier, "headline": headline, "ask": ask, "caller": "watchdog:" + caller}
+
+
 def _rrec(outcome, signals, **extra):
     """A resurrection journal record — a DISTINCT act (issue #208) so the morning report and
     journal greps separate runner restarts from debugger episodes (`watchdog`) and from the
@@ -416,21 +424,21 @@ def _resurrection(now, view, w, sigs, details, new_state):
                 journal.append(_rrec("resurrect_capped", present,
                                      attempts=len(recent), max_per_hour=cap))
                 if cap == 0:                               # auto-restart disabled by config
-                    notify.append((
-                        "superlooper runner is DOWN — auto-restart is DISABLED",
+                    notify.append(_text(
+                        notify_lib.DOWN, "runner is DOWN — auto-restart is DISABLED",
                         "the runner is provably gone (heartbeat stale, pid dead) but automatic "
                         "restart is disabled (watchdog.resurrection_max_per_hour = 0). The loop is "
-                        "down and will stay down until you restart it."))
+                        "down and will stay down until you restart it.", "resurrect_disabled"))
                 else:                                      # genuine crash-loop cap hit
                     # ATTEMPTED, never "was restarted": an attempt is recorded before delivery, so an
                     # undeliverable one (no_pane — no tab made, nothing launched) burns a slot too.
                     # Counting it is deliberate; asserting a restart that never happened is not
                     # (fresh-review P1-2 — fabricated history is this codebase's cardinal sin).
-                    notify.append((
-                        "superlooper runner keeps dying — auto-restart PAUSED",
+                    notify.append(_text(
+                        notify_lib.DOWN, "runner keeps dying — auto-restart PAUSED",
                         f"automatic restart has been attempted {len(recent)} time(s) in the last "
                         "hour and the runner is still down. That is a real incident, not a flap, so "
-                        "automatic resurrection is paused — the loop needs you."))
+                        "automatic resurrection is paused — the loop needs you.", "resurrect_capped"))
         else:
             n = new_state.get("next_resurrection", 1)
             resurrect = {"id": f"r{n}", "signals": present}
@@ -480,7 +488,8 @@ def evaluate(now, config, view, state):
       state    the new state to persist (episode + no-progress clocks + id counter);
       journal  act:"watchdog" records for TRANSITIONS only (open/stand-down/launch outcomes
                live in after_launch; quiet waiting checks journal nothing);
-      notify   [(title, body)] — at most one entry (the episode-opening text);
+      notify   [{tier, headline, ask, caller}] — at most one entry (the episode-opening text),
+               rendered + sent by the CLI through notify.render (issue #493);
       launch   None, or the launch request {"id","signals","authority","allowlist"} the
                caller executes through the launch shim, then feeds to after_launch.
       resurrect  None, or the restart request {"id","signals"} the caller executes through
@@ -595,12 +604,12 @@ def evaluate(now, config, view, state):
         ep = {"signals": sigs, "opened_at": now, "detail": "; ".join(details),
               "launched_at": None, "launch_id": None, "launch_attempts": 0,
               "launch_failure_notified": False}
-        notify.append((
-            "superlooper watchdog",
+        notify.append(_text(
+            notify_lib.DOWN, "watchdog: " + ", ".join(sigs),
             "; ".join(details) + f". If this still stands in {int(w['grace_minutes'])} min, "
             f"an unattended sl-debugger session launches (authority: {w['authority']}). It "
             "stands down automatically if the signal clears; touch state/"
-            f"{KILL_SWITCH_FILENAME} to disable."))
+            f"{KILL_SWITCH_FILENAME} to disable.", "episode"))
         journal.append(_rec("notified", sigs, grace_seconds=w["grace_seconds"],
                             authority=w["authority"]))
     else:
@@ -645,20 +654,20 @@ def after_launch(now, config, state, launch, rc):
         ep = dict(ep, launched_at=now, launch_id=launch.get("id"))
         journal.append(_rec("launched", sigs, id=launch.get("id"),
                             authority=launch.get("authority")))
-        notify.append(("superlooper watchdog launched sl-debugger",
-                       f"unattended session {launch.get('id')} launched — signals: "
-                       + ", ".join(sigs) + f" (authority: {launch.get('authority')}). Its "
-                       "memo will land in the state home's reports/."))
+        notify.append(_text(notify_lib.DOWN, "watchdog launched sl-debugger",
+                            f"unattended session {launch.get('id')} launched — signals: "
+                            + ", ".join(sigs) + f" (authority: {launch.get('authority')}). Its "
+                            "memo will land in the state home's reports/.", "debugger_launched"))
     else:
         ep = dict(ep, launch_attempts=(ep.get("launch_attempts") or 0) + 1)
         journal.append(_rec("launch_failed", sigs, id=launch.get("id"), rc=rc))
         if not ep.get("launch_failure_notified"):
             ep["launch_failure_notified"] = True
-            notify.append(("superlooper watchdog could NOT launch sl-debugger",
-                           f"launch of session {launch.get('id')} failed (rc={rc}) — most "
-                           "likely no resolvable cmux pane (loop stopped and its tab gone?). "
-                           "The tripped signal still stands: " + ", ".join(sigs)
-                           + ". The loop needs you."))
+            notify.append(_text(notify_lib.DOWN, "watchdog could NOT launch sl-debugger",
+                                f"launch of session {launch.get('id')} failed (rc={rc}) — most "
+                                "likely no resolvable cmux pane (loop stopped and its tab gone?). "
+                                "The tripped signal still stands: " + ", ".join(sigs)
+                                + ". The loop needs you.", "debugger_launch_failed"))
     return {"state": dict(state, episode=ep), "journal": journal, "notify": notify}
 
 
@@ -681,20 +690,20 @@ def after_resurrect(now, config, state, resurrect, rc):
     if rc == 0:
         r["failure_notified"] = False
         journal.append(_rrec("resurrected", sigs, id=rid))
-        notify.append((
-            "superlooper runner was down — restarted it",
+        notify.append(_text(
+            notify_lib.RECOVERED, "runner was down — restarted it",
             f"the runner was provably gone (signals: {', '.join(sigs) or 'heartbeat_stale'}) and "
             f"has been automatically restarted ({rid}) in its cmux tab. It reconciles from GitHub + "
-            "disk exactly like a manual restart — no work lost, no counters reset."))
+            "disk exactly like a manual restart — no work lost, no counters reset.", "resurrected"))
     else:
         journal.append(_rrec("resurrect_failed", sigs, id=rid, rc=rc))
         if not r.get("failure_notified"):
             r["failure_notified"] = True
-            notify.append((
-                "superlooper could NOT restart the runner",
+            notify.append(_text(
+                notify_lib.DOWN, "could NOT restart the runner",
                 f"the runner is down and the automatic restart ({rid}) failed (rc={rc}) — most "
                 "likely its cmux tab/pane is gone, so a new one cannot be placed without you. The "
-                "loop is not running."))
+                "loop is not running.", "resurrect_failed"))
     return {"state": dict(state, resurrection=r), "journal": journal, "notify": notify}
 
 
