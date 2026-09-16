@@ -49,6 +49,13 @@ def _outcomes(result):
     return [j.get("outcome") for j in result["journal"]]
 
 
+def _kept_cadence(state, now):
+    """`state` as the watchdog holds it at `now` had it kept checking on its launchd cadence in the
+    meantime. A test that skips ahead past quiet checks is not about a sleep — without this, a skip
+    longer than WAKE_GAP_INTERVALS intervals IS one to the watchdog's own clock (issue #491)."""
+    return dict(state, last_run_at=now - wd.INTERVAL_SECONDS)
+
+
 # --------------------------- signals: healthy is silent ---------------------------
 
 def test_healthy_instance_is_no_signal_no_action():
@@ -114,7 +121,8 @@ def test_no_progress_trips_only_after_the_bound():
     r1 = _run(T0, _view(eligible_nums=[42]), st)
     assert r1["state"]["episode"] is None               # one glimpse is not an episode
     assert r1["state"]["no_progress_since"] == {"42": T0}
-    r2 = _run(T0 + 29 * MIN, _view(T0 + 29 * MIN, eligible_nums=[42]), r1["state"])
+    r2 = _run(T0 + 29 * MIN, _view(T0 + 29 * MIN, eligible_nums=[42]),
+              _kept_cadence(r1["state"], T0 + 29 * MIN))
     assert r2["state"]["episode"] is None               # bound not yet reached
     r3 = _run(T0 + 30 * MIN, _view(T0 + 30 * MIN, eligible_nums=[42]), r2["state"])
     ep = r3["state"]["episode"]
@@ -319,7 +327,7 @@ def _open_episode(now=T0, cfg=None):
 
 
 def test_within_grace_is_silent_waiting():
-    st = _open_episode(T0)
+    st = _kept_cadence(_open_episode(T0), T0 + 29 * MIN)
     r = _run(T0 + 29 * MIN, _view(T0 + 29 * MIN, heartbeat=T0 - 21 * MIN), st)
     assert r["notify"] == []
     assert r["journal"] == []
@@ -355,7 +363,8 @@ def test_signal_clearing_during_grace_stands_down_silently():
     assert r["notify"] == []                              # silent stand-down: journal only
     assert _outcomes(r) == ["stand_down"]
     # a LATER re-trip is a genuinely new episode: it notifies again
-    r2 = _run(T0 + 60 * MIN, _view(T0 + 60 * MIN, heartbeat=T0 + 30 * MIN), r["state"])
+    r2 = _run(T0 + 60 * MIN, _view(T0 + 60 * MIN, heartbeat=T0 + 30 * MIN),
+              _kept_cadence(r["state"], T0 + 60 * MIN))
     assert r2["state"]["episode"] is not None
     assert len(r2["notify"]) == 1
 
@@ -396,8 +405,8 @@ def test_zero_grace_launches_on_the_tripping_check():
 # --------------------------- rails: singleton, retry cap, kill-switch ---------------------------
 
 def test_a_live_debugger_session_blocks_a_new_launch():
-    st = _open_episode(T0)
     now = T0 + 30 * MIN
+    st = _kept_cadence(_open_episode(T0), now)
     r = _run(now, _view(now, heartbeat=T0 - 21 * MIN, debugger_live=True), st)
     assert r["launch"] is None
     assert _outcomes(r) == ["skipped_live_session"]
@@ -455,8 +464,8 @@ def test_kill_switch_journals_once_per_distinct_observation():
 
 
 def test_kill_switch_mid_episode_holds_the_launch():
-    st = _open_episode(T0)
     now = T0 + 30 * MIN
+    st = _kept_cadence(_open_episode(T0), now)
     r = _run(now, _view(now, heartbeat=T0 - 21 * MIN, kill_switch=True), st)
     assert r["launch"] is None
     assert _outcomes(r) == ["disabled"]
@@ -681,7 +690,7 @@ def test_attempts_age_out_of_the_rolling_window():
     r1 = _run(T0, _dead(T0), st, cfg=cfg)
     st = wd.after_resurrect(T0, cfg, r1["state"], r1["resurrect"], rc=0)["state"]
     later = T0 + 61 * MIN
-    r2 = _run(later, _dead(later), st, cfg=cfg)
+    r2 = _run(later, _dead(later), _kept_cadence(st, later), cfg=cfg)
     assert r2["resurrect"] is not None                     # the first attempt aged out of the window
     assert r2["state"]["resurrection"]["attempts"] == [later]
 
@@ -811,7 +820,7 @@ def test_starting_the_runner_again_re_arms_the_whole_watchdog():
     # The stop marker is cleared by the deliberate start, so the very next check watches normally —
     # including resurrecting a runner that dies after being restarted.
     st = _run(T0, _dead(T0, stopped_by_owner=True))["state"]
-    back = _run(T0 + 30 * MIN, _dead(T0 + 30 * MIN), st)
+    back = _run(T0 + 30 * MIN, _dead(T0 + 30 * MIN), _kept_cadence(st, T0 + 30 * MIN))
     assert back["resurrect"] is not None
     assert back["state"]["stopped_observed"] is None      # the dedup marker re-armed
 
@@ -868,7 +877,7 @@ def test_a_stop_stands_an_open_episode_down_instead_of_freezing_its_grace():
     assert stopped["state"]["episode"] is None
     assert "stand_down" in _outcomes(stopped)
     back = _run(T0 + 600 * MIN, _view(T0 + 600 * MIN, heartbeat=T0 + 579 * MIN,
-                                      runner_live=True), stopped["state"])
+                                      runner_live=True), _kept_cadence(stopped["state"], T0 + 600 * MIN))
     assert back["launch"] is None, "no debugger on the first check after a start"
     assert back["state"]["episode"] is not None                   # a fresh episode, fresh grace
     assert back["state"]["episode"]["opened_at"] == T0 + 600 * MIN
@@ -1241,3 +1250,348 @@ def test_an_episode_written_by_the_old_engine_is_not_paged_again():
                                            "launch_attempts": 0, "launch_failure_notified": False})
     r = _run(T0, _busy(_view(heartbeat=T0 - 26 * MIN)), legacy)
     assert r["notify"] == [] and r["state"]["episode"]["signals"] == ["heartbeat_stale"]
+
+
+# ============================ the wake grace (issue #491) ============================
+# A machine that slept is not a runner that stalled. The watchdog stamps its own run clock
+# (state ▸ last_run_at); a check that lands more than WAKE_GAP_INTERVALS × INTERVAL_SECONDS after
+# the previous one means the machine was asleep between them, so it journals the wake and opens a
+# grace of the RUNNER's own WAKE_GRACE_SECONDS. Inside it a stale heartbeat opens no episode and
+# restarts nothing; a heartbeat still stale when the grace is over is judged exactly as before.
+import events
+
+HOUR = 60 * MIN
+SLEEP = 6 * HOUR
+
+
+def _wakes(result):
+    return [j for j in result["journal"] if j.get("act") == "watchdog_wake"]
+
+
+def _asleep_at(now=T0):
+    """The state a healthy check at `now` leaves behind — the last check before the lid closed."""
+    return _run(now, _busy(_view(now, runner_live=True)))["state"]
+
+
+def test_a_six_hour_gap_then_a_fresh_heartbeat_within_the_grace_opens_nothing():
+    st = _asleep_at(T0)
+    woke = T0 + SLEEP
+    # The first check after the wake: the heartbeat is six hours old and the recorded pid reads dead
+    # (the runner process has not been scheduled yet) — every input that pages or restarts today.
+    r = _run(woke, _busy(_view(woke, heartbeat=T0 - 15, runner_dead=True)), st)
+    assert r["state"]["episode"] is None
+    assert r["notify"] == [] and r["launch"] is None
+    assert r["resurrect"] is None and r["runner_down"] is False
+    assert r["state"]["resurrection"]["attempts"] == []
+    assert r["wake_excused"] is True
+    [slept] = _wakes(r)
+    assert slept["outcome"] == "slept" and slept["slept_seconds"] == SLEEP
+    assert slept["woke_at"] == woke and slept["grace_until"] == woke + events.WAKE_GRACE_SECONDS
+    assert all(j["act"] == "watchdog_wake" for j in r["journal"])   # nothing else happened
+    # Inside the grace the runner completes a tick: still nothing, and the resumption is journaled.
+    later = woke + 2 * MIN
+    back = _run(later, _busy(_view(later, heartbeat=later - 10, runner_live=True)), r["state"])
+    assert back["state"]["episode"] is None
+    assert back["notify"] == [] and back["launch"] is None and back["resurrect"] is None
+    [resumed] = _wakes(back)
+    assert resumed["outcome"] == "runner_resumed" and resumed["woke_at"] == woke
+    assert resumed["slept_seconds"] == SLEEP
+    # ...once: the next healthy check has nothing more to say about that wake.
+    again = _run(later + 5 * MIN, _busy(_view(later + 5 * MIN, runner_live=True)), back["state"])
+    assert _wakes(again) == [] and again["journal"] == []
+
+
+def test_a_six_hour_gap_with_a_heartbeat_still_stale_after_the_grace_opens_the_episode_as_before():
+    st = _asleep_at(T0)
+    woke = T0 + SLEEP
+    wedged = dict(heartbeat=T0 - 15, runner_live=True, runner_started_at=T0 - 2 * HOUR)
+    held = _run(woke, _busy(_view(woke, **wedged)), st)
+    assert held["state"]["episode"] is None and held["notify"] == []
+    after = woke + events.WAKE_GRACE_SECONDS
+    r = _run(after, _busy(_view(after, **wedged)), held["state"])
+    assert r["wake_excused"] is False
+    # Exactly what the same check does with no sleep in its history.
+    baseline = _run(after, _busy(_view(after, **wedged)), dict(held["state"], wake=None))
+    assert r["state"]["episode"] == baseline["state"]["episode"]
+    assert r["state"]["episode"]["signals"] == ["heartbeat_stale"]
+    assert r["notify"] == baseline["notify"] and len(r["notify"]) == 1
+    assert _outcomes(r) == _outcomes(baseline) == ["notified"]
+    assert _wakes(r) == []                        # the runner did not resume: no such claim
+
+
+def test_a_dead_runner_still_stale_after_the_grace_is_restarted_as_before():
+    st = _asleep_at(T0)
+    woke = T0 + SLEEP
+    held = _run(woke, _busy(_view(woke, heartbeat=T0 - 15, runner_dead=True)), st)
+    assert held["resurrect"] is None
+    after = woke + events.WAKE_GRACE_SECONDS + 1
+    r = _run(after, _busy(_view(after, heartbeat=T0 - 15, runner_dead=True)), held["state"])
+    assert r["resurrect"] is not None and r["runner_down"] is True
+    assert r["state"]["resurrection"]["attempts"] == [after]
+
+
+def test_the_wake_grace_never_excuses_a_heartbeat_that_was_already_stale_before_the_gap():
+    # The sleep explains only staleness it could have caused. A runner whose heartbeat was already
+    # stale at the last check before the lid closed stalled BEFORE the sleep — its episode must not
+    # stand down (and green a delivered page) because the laptop happened to close afterwards.
+    wedged = dict(heartbeat=T0 - 25 * MIN, runner_live=True, runner_started_at=T0 - 2 * HOUR)
+    opened = _run(T0, _busy(_view(T0, **wedged)))
+    assert opened["state"]["episode"]["signals"] == ["heartbeat_stale"]
+    st = _delivered(opened)
+    woke = T0 + SLEEP
+    r = _run(woke, _busy(_view(woke, **wedged)), st)
+    assert r["wake_excused"] is False
+    assert r["state"]["episode"]["signals"] == ["heartbeat_stale"]
+    assert "stand_down" not in _outcomes(r) and r["notify"] == []
+    assert [w["outcome"] for w in _wakes(r)] == ["slept"]     # the wake is still recorded
+
+
+def test_checks_on_their_cadence_never_read_as_a_wake():
+    st = wd.new_state()
+    now = T0
+    for gap in (wd.INTERVAL_SECONDS, 2 * wd.INTERVAL_SECONDS,
+                wd.WAKE_GAP_INTERVALS * wd.INTERVAL_SECONDS):    # AT the bound is not past it
+        now += gap
+        r = _run(now, _view(now), st)
+        st = r["state"]
+        assert _wakes(r) == [] and st["wake"] is None and st["last_run_at"] == now
+    now += wd.WAKE_GAP_INTERVALS * wd.INTERVAL_SECONDS + 1
+    assert [w["outcome"] for w in _wakes(_run(now, _view(now), st))] == ["slept"]
+
+
+def test_a_first_check_or_a_state_from_an_older_engine_never_reads_as_a_wake():
+    # No recorded previous run is no evidence of a gap: judged exactly as before.
+    for st in (wd.new_state(), {"episode": None, "no_progress_since": {}, "next_debugger": 1}):
+        r = _run(T0 + SLEEP, _busy(_view(T0 + SLEEP, heartbeat=T0 - 15, runner_live=True,
+                                         runner_started_at=T0 - 2 * HOUR)), st)
+        assert _wakes(r) == [] and r["state"]["episode"] is not None
+        assert r["state"]["last_run_at"] == T0 + SLEEP
+
+
+def test_the_wake_grace_is_the_runners_constant_read_where_it_is_defined(monkeypatch):
+    # Shared, not a copy: the watchdog reads the one definition at check time.
+    monkeypatch.setattr(events, "WAKE_GRACE_SECONDS", 900)
+    st = _asleep_at(T0)
+    r = _run(T0 + SLEEP, _view(T0 + SLEEP, heartbeat=T0 - 15), st)
+    assert r["state"]["wake"]["grace_until"] == T0 + SLEEP + 900
+
+
+def test_the_wake_constants_are_defined_exactly_once():
+    import pathlib
+    import re
+    import runner
+    skill = pathlib.Path(wd.__file__).resolve().parent.parent
+    for name in ("WAKE_GAP_SECONDS", "WAKE_GRACE_SECONDS"):
+        defs = [str(p.relative_to(skill)) for p in sorted(skill.rglob("*"))
+                if p.is_file() and p.suffix in ("", ".py")
+                and re.search(r"^%s\s*=" % name, p.read_text(errors="ignore"), re.M)]
+        assert defs == ["lib/events.py"], (name, defs)
+        assert getattr(runner, name) == getattr(events, name)
+
+
+def test_the_booting_and_settle_excuses_are_unchanged_after_a_wake():
+    # A runner that restarted across the sleep (a reboot, or a KeepAlive respawn) is still judged by
+    # the booting excuse once the wake grace is over — the grace neither consumes nor replaces it.
+    st = _asleep_at(T0)
+    woke = T0 + SLEEP
+    held = _run(woke, _busy(_view(woke, heartbeat=T0 - 15, runner_live=True,
+                                  runner_started_at=woke - 30)), st)
+    assert held["state"]["resurrection"]["booting_since"] is None    # the grace decided, not boot
+    after = woke + events.WAKE_GRACE_SECONDS
+    booting = _run(after, _busy(_view(after, heartbeat=T0 - 15, runner_live=True,
+                                      runner_started_at=woke - 30)), held["state"])
+    assert booting["state"]["episode"] is None and booting["notify"] == []
+    assert booting["state"]["resurrection"]["booting_since"] == woke - 30
+    # ...and the settle window after a restart the watchdog made still holds on its own terms.
+    st2 = wd.after_resurrect(after, _cfg(), dict(held["state"], resurrection=dict(
+        held["state"]["resurrection"], attempts=[after - 60])), {"id": "r1", "signals": []},
+        rc=0)["state"]
+    settling = _run(after + MIN, _busy(_view(after + MIN, heartbeat=T0 - 15, runner_live=True,
+                                             runner_started_at=after - 25 * MIN)), st2)
+    assert settling["state"]["episode"] is None
+
+
+def test_the_kill_switch_and_a_stop_still_stamp_the_check_clock():
+    # Both off switches observe and change nothing — but the watchdog DID run, so its own clock
+    # advances; otherwise the first check after the switch is lifted reads the whole off period as
+    # a sleep.
+    for off in (dict(kill_switch=True), dict(stopped_by_owner=True, runner_live=False)):
+        st = _asleep_at(T0)
+        r = _run(T0 + 5 * MIN, _view(T0 + 5 * MIN, **off), st)
+        assert r["state"]["last_run_at"] == T0 + 5 * MIN
+        assert r["launch"] is None and r["resurrect"] is None
+        assert r["wake_excused"] is False
+
+
+def test_a_heartbeat_that_has_not_advanced_since_the_wake_is_not_a_resumption():
+    # "Resumed" is a claim about a tick completed AFTER the wake. A heartbeat that is merely within
+    # the staleness bound at the waking check (a short sleep) proves nothing until it moves.
+    st = _asleep_at(T0)
+    hb = T0 + 2 * MIN                          # the runner ticked after the last check, then slept
+    woke = hb + 19 * MIN                       # a gap past the bound, heartbeat still "fresh"
+    r = _run(woke, _view(woke, heartbeat=hb), st)
+    assert [w["outcome"] for w in _wakes(r)] == ["slept"]
+    same = _run(woke + MIN, _view(woke + MIN, heartbeat=hb), r["state"])
+    assert _wakes(same) == []
+    moved = _run(woke + 2 * MIN, _view(woke + 2 * MIN, heartbeat=woke + 90), same["state"])
+    assert [w["outcome"] for w in _wakes(moved)] == ["runner_resumed"]
+
+
+def test_wrong_typed_wake_state_degrades_to_no_wake():
+    for garbage in ({"last_run_at": "yesterday", "wake": "asleep"},
+                    {"last_run_at": True, "wake": {"woke_at": "x"}},
+                    {"last_run_at": float("nan"), "wake": {"woke_at": T0, "since": T0 - SLEEP}},
+                    {"last_run_at": None, "wake": []}):
+        st = wd.coerce_state(garbage)
+        assert st["last_run_at"] is None and st["wake"] is None
+        r = _run(T0, _view(T0, heartbeat=T0 - 25 * MIN), st)
+        assert r["state"]["episode"] is not None and _wakes(r) == []
+
+
+# --- fresh-agent review of #491 ---
+
+def test_a_second_sleep_before_any_check_judged_the_first_wake_is_still_excused():
+    # Review P1: wake, one check inside the grace (the runner's first tick has not landed), the lid
+    # closes again. The next wake's "last check" is that excused one — measured from it, the
+    # pre-sleep heartbeat would read as stale BEFORE the gap and page a runner that is about to tick.
+    live = dict(runner_live=True, runner_started_at=T0 - 2 * HOUR)
+    st = _asleep_at(T0)
+    w1 = T0 + SLEEP
+    r1 = _run(w1, _busy(_view(w1, heartbeat=T0 - 15, **live)), st)
+    assert r1["wake_excused"] is True
+    w2 = w1 + 2 * HOUR
+    r2 = _run(w2, _busy(_view(w2, heartbeat=T0 - 15, **live)), r1["state"])
+    assert r2["wake_excused"] is True
+    assert r2["state"]["episode"] is None and r2["notify"] == []
+    # ...and still bounded: the first check past the grace judges it as before
+    after = w2 + events.WAKE_GRACE_SECONDS
+    r3 = _run(after, _busy(_view(after, heartbeat=T0 - 15, **live)), r2["state"])
+    assert r3["state"]["episode"]["signals"] == ["heartbeat_stale"] and len(r3["notify"]) == 1
+    # A check that DID judge the heartbeat after a grace breaks the chain: a sleep after it does not
+    # excuse the staleness that check already saw.
+    w3 = after + 2 * HOUR
+    r4 = _run(w3, _busy(_view(w3, heartbeat=T0 - 15, **live)), r3["state"])
+    assert r4["wake_excused"] is False
+    assert r4["state"]["episode"]["signals"] == ["heartbeat_stale"]
+
+
+def test_a_runner_the_watchdog_restarted_after_a_wake_is_not_said_to_have_resumed():
+    # Review P2: a dead runner past the grace is resurrected; its reborn process ticking is not
+    # the runner resuming from the sleep, and the record must not say so.
+    st = _asleep_at(T0)
+    woke = T0 + SLEEP
+    held = _run(woke, _busy(_view(woke, heartbeat=T0 - 15, runner_dead=True)), st)
+    after = woke + events.WAKE_GRACE_SECONDS + 1
+    r = _run(after, _busy(_view(after, heartbeat=T0 - 15, runner_dead=True)), held["state"])
+    assert r["resurrect"] is not None
+    st2 = wd.after_resurrect(after, _cfg(), r["state"], r["resurrect"], rc=0)["state"]
+    back = _run(after + 2 * MIN, _view(after + 2 * MIN, heartbeat=after + 100, runner_live=True), st2)
+    assert [(w["outcome"], w["woke_at"]) for w in _wakes(back)] == [("runner_restarted", woke)]
+
+
+def test_a_clock_stepped_back_after_a_wake_does_not_stretch_the_grace():
+    # Review P2: grace_until is a deadline in wall-clock time; a check dated BEFORE the wake it
+    # belongs to is not inside that wake's grace.
+    st = _asleep_at(T0)
+    woke = T0 + SLEEP
+    held = _run(woke, _busy(_view(woke, heartbeat=T0 - 15, runner_dead=True)), st)
+    back = woke - HOUR
+    r = _run(back, _busy(_view(back, heartbeat=T0 - 15, runner_dead=True)), held["state"])
+    assert r["wake_excused"] is False and r["resurrect"] is not None
+
+
+def test_a_tick_between_two_sleeps_resolves_the_first_wake():
+    # Review P2: the runner ticked after the first wake and the lid closed before any check saw it.
+    # The check at the second wake reads that newer heartbeat: the first wake DID resume.
+    st = _asleep_at(T0)
+    w1 = T0 + SLEEP
+    r1 = _run(w1, _view(w1, heartbeat=T0 - 15, runner_live=True), st)
+    w2 = w1 + 2 * HOUR
+    r2 = _run(w2, _view(w2, heartbeat=w1 + 30, runner_live=True), r1["state"])
+    assert [(w["outcome"], w["woke_at"]) for w in _wakes(r2)] == [("runner_resumed", w1),
+                                                                   ("slept", w2)]
+    assert r2["wake_excused"] is True                 # stale only from the second sleep
+
+
+def test_an_excused_check_holds_an_open_heartbeat_episode_rather_than_clearing_it():
+    # Review P2: an excused heartbeat is unobservable, not fresh. An episode whose 🔴 went out is
+    # neither stood down nor greened on it; the first check that can see the heartbeat decides.
+    wedged = dict(runner_live=True, runner_started_at=T0 - 2 * HOUR)
+    opened = _run(T0, _busy(_view(T0, heartbeat=T0 - 25 * MIN, **wedged)))
+    st = _delivered(opened)
+    woke = T0 + SLEEP                                  # the runner ticked at T0+60, then the lid closed
+    r = _run(woke, _busy(_view(woke, heartbeat=T0 + 60, **wedged)), st)
+    assert r["wake_excused"] is True
+    assert r["state"]["episode"] == st["episode"]
+    assert r["notify"] == [] and r["launch"] is None and "stand_down" not in _outcomes(r)
+    later = woke + 2 * MIN
+    cleared = _run(later, _busy(_view(later, heartbeat=later - 10, **wedged)), r["state"])
+    assert cleared["state"]["episode"] is None and "stand_down" in _outcomes(cleared)
+    assert [n["tier"] for n in cleared["notify"]] == [notify_tiers().RECOVERED]
+
+
+def test_an_excused_check_is_no_evidence_the_runner_is_back():
+    # Review P2: a delivered runner-down 🔴 is closed by a check that SEES the runner tick — never by
+    # one whose stale heartbeat was merely excused.
+    cfg = _cfg(resurrection_max_per_hour=0)
+    down = _run(T0, _busy(_dead(T0)), cfg=cfg)
+    st = _delivered(down)
+    assert st["resurrection"]["down_delivered"] is True
+    woke = T0 + SLEEP                                  # restarted by hand, ticked at T0+60, lid closed
+    r = _run(woke, _busy(_view(woke, heartbeat=T0 + 60, runner_live=True)), st, cfg=cfg)
+    assert r["wake_excused"] is True
+    assert r["notify"] == [] and r["state"]["resurrection"]["down_delivered"] is True
+    later = woke + 2 * MIN
+    back = _run(later, _busy(_view(later, heartbeat=later - 10, runner_live=True)), r["state"],
+                cfg=cfg)
+    assert [n["headline"] for n in back["notify"]] == ["runner is back, completing ticks again"]
+
+
+def notify_tiers():
+    import notify
+    return notify
+
+
+def test_checks_further_apart_than_the_wake_gap_still_act_on_a_dead_runner_within_two_intervals():
+    # Review round 2, P1: when EVERY check lands past the wake gap (a job installed at a long interval,
+    # or hand-run checks), every check is a wake. A carried `since` that never expires would excuse a
+    # dead runner forever; carrying at most once per chain bounds the delay to two intervals.
+    step = 1800
+    st = _asleep_at(T0)
+    dead_from = T0 + 60                                # the last tick the runner ever completes
+    acted = None
+    for k in range(1, 9):
+        now = T0 + k * step
+        r = _run(now, _busy(_view(now, heartbeat=dead_from, runner_dead=True)), st)
+        st = r["state"]
+        if r["resurrect"] is not None:
+            acted = k
+            break
+    assert acted is not None and acted <= 3, acted
+
+
+def test_a_wake_does_not_carry_across_checks_dated_before_it():
+    # Review round 2, P2: a clock stepped back behind a wake; checks there judged the heartbeat (they
+    # are not inside the wake's grace). A sleep after them measures from them, not from the old chain.
+    live = dict(runner_live=True, runner_started_at=T0 - 2 * HOUR)
+    st = _asleep_at(T0)
+    woke = T0 + SLEEP
+    held = _run(woke, _busy(_view(woke, heartbeat=T0 - 15, **live)), st)
+    stepped = woke - 2 * HOUR
+    judged = _run(stepped, _busy(_view(stepped, heartbeat=T0 - 15, **live)), held["state"])
+    assert judged["wake_excused"] is False and judged["state"]["episode"] is not None
+    again = stepped + SLEEP
+    r = _run(again, _busy(_view(again, heartbeat=T0 - 15, **live)), judged["state"])
+    assert r["wake_excused"] is False
+
+
+def test_a_runner_that_started_after_the_wake_is_restarted_not_resumed():
+    # Review round 2, P2: a new runner process — started by the owner or by launchd's KeepAlive after
+    # the wake — ticking is not the runner resuming from the sleep.
+    st = _asleep_at(T0)
+    woke = T0 + SLEEP
+    held = _run(woke, _view(woke, heartbeat=T0 - 15, runner_dead=True), st)
+    later = woke + 2 * MIN
+    back = _run(later, _view(later, heartbeat=later - 10, runner_live=True,
+                             runner_started_at=woke + 60), held["state"])
+    assert [(w["outcome"], w["woke_at"]) for w in _wakes(back)] == [("runner_restarted", woke)]

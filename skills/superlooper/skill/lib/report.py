@@ -621,6 +621,36 @@ def _watchdog_countdowns(records, window_start):
     return lines
 
 
+def _wakes(records, window_start):
+    """Every machine sleep the watchdog saw (issue #491): a check that landed long after the one
+    before held the stale heartbeat for the wake grace rather than paging, so the file says the machine
+    slept — and whether the runner came back — instead of saying nothing. Deliberately NOT a quiet-
+    breaker: a closed lid is not news. "Resumed" is only ever the watchdog's own `runner_resumed`
+    record (the heartbeat advanced after the wake, with no new runner process behind it); a runner
+    restarted after the wake — by the watchdog, the owner or launchd — says so, and one that did not
+    come back is the episode and resurrection sections' to tell."""
+    came_back = {}
+    for r in records:
+        woke = _ts({"ts": r.get("woke_at")})
+        if (r.get("act") == "watchdog_wake" and woke is not None
+                and r.get("outcome") in ("runner_resumed", "runner_restarted")):
+            came_back.setdefault(woke, r.get("outcome"))
+    lines = []
+    for r in records:
+        if (r.get("act") != "watchdog_wake" or r.get("outcome") != "slept"
+                or not _in_window(r, window_start)):
+            continue
+        span = _age(r.get("slept_seconds"))
+        slept = f"Machine slept {span}" if span else "Machine slept"
+        back = came_back.get(r.get("woke_at")) if _ts({"ts": r.get("woke_at")}) is not None else None
+        lines.append(f"- {slept} (no watchdog check ran in that span); "
+                     + ("runner resumed." if back == "runner_resumed" else
+                        "the runner came back restarted, not resumed — a new runner process "
+                        "started after the wake." if back == "runner_restarted" else
+                        "the watchdog has not yet seen the runner complete a tick since."))
+    return lines
+
+
 def _resurrection(records, window_start):
     """Runner resurrection activity (issue #208): every automatic RESTART of a provably-gone runner —
     succeeded, failed, or cap-paused — reaches the owner's morning surface. The runner going down and
@@ -1148,6 +1178,7 @@ def _facts(journal_records, gh_view, config):
         "wanders": _wanders(records, overnight_start),
         "watchdog": _watchdog(records, overnight_start),
         "countdowns": _watchdog_countdowns(records, overnight_start),  # never a quiet-breaker (#494)
+        "wakes": _wakes(records, overnight_start),                     # nor is a sleep (#491)
         "resurrections": _resurrection(records, overnight_start),      # runner auto-restarts (#208)
         "questions": questions, "q_total": q_total,
         "triage_lines": _triage(records, repo, overnight_start),       # the triage flight (#449)
@@ -1250,6 +1281,7 @@ def morning(journal_records, gh_view, ledger, config):
     week_start, overnight_start = f["week_start"], f["overnight_start"]
     merged, parked, bounces, regens = f["merged"], f["parked"], f["bounces"], f["regens"]
     wanders, watchdog, countdowns = f["wanders"], f["watchdog"], f["countdowns"]
+    wakes = f["wakes"]
     resurrections, questions, q_total = f["resurrections"], f["questions"], f["q_total"]
     triage_lines, holds, hold_alerts = f["triage_lines"], f["holds"], f["hold_alerts"]
     queue_hold, frozen, queue = f["queue_hold"], f["frozen"], f["queue"]
@@ -1326,7 +1358,7 @@ def morning(journal_records, gh_view, ledger, config):
         _section("Owner questions", questions, "None — no worker needed an owner decision."),
         _section("Conflict regenerations (last 7 days)", regens),
         _section("Wanders", wanders),
-        _section("Unattended debugger", countdowns + watchdog,
+        _section("Unattended debugger", wakes + countdowns + watchdog,
                  "None — the watchdog launched nothing."),
         _section("Runner resurrection", resurrections, "None — the runner did not go down."),
         # SILENT on a day with no flight (the list is empty, so no heading at all) — unlike every

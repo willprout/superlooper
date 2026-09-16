@@ -72,6 +72,15 @@ Who gets texted (issue #494, owner ruling 2026-09-16) — three rules on top of 
   🟢 AFTER 🔴   a recovery texts only when its 🔴 was DELIVERED — recorded on disk by the CLI
                 (record_delivered) — and clears that record; a silent episode recovers silently.
 
+A machine that slept is not a runner that stalled (issue #491). A closed lid suspends the runner and
+this job alike, so on wake the heartbeat reads hours stale on a loop about to tick normally. The
+watchdog runs on a launchd interval and stamps its own run clock (state ▸ last_run_at), so a check
+landing more than WAKE_GAP_INTERVALS × INTERVAL_SECONDS after the previous one is the machine
+waking: it journals the wake (`act: "watchdog_wake"`) and holds heartbeat_stale for the runner's own
+post-wake grace (events.WAKE_GRACE_SECONDS) — no episode, no resurrection. A heartbeat still stale
+when the grace is over is judged exactly as before, and a heartbeat that was ALREADY stale before
+the gap is never excused: the sleep explains only staleness it could have caused.
+
 TWO off switches reach this module, and they are deliberately not the same one (issue #239):
   WATCHDOG_OFF     the WATCHDOG is off. Every check observes and changes nothing, whatever the
                    runner is doing. The broader switch, and it wins when both are present.
@@ -91,6 +100,7 @@ TWO off switches reach this module, and they are deliberately not the same one (
 import math
 
 import config as config_lib
+import events as events_lib   # WAKE_GRACE_SECONDS — the runner's post-wake grace, one definition (#491)
 import issues
 import notify as notify_lib   # the owner-text tiers + part budgets (#493/#490); the CLI renders + sends
 import scheduler
@@ -120,6 +130,15 @@ RESURRECTION_SETTLE_SECONDS = 300      # after a restart the reborn runner is bo
                                        # new runner not having stamped its first tick yet, NOT a
                                        # wedge — so it must not open a debugger episode. Ticks are
                                        # ~15s, so one settled tick lands far inside 5 min.
+
+# The wake grace (issue #491). The watchdog's launchd job fires every INTERVAL_SECONDS (the
+# {interval_seconds} templates/launchd.watchdog.plist is installed with), and a check can run long —
+# a debugger launch or a restart holds it for minutes, and launchd never overlaps two — so a gap of a
+# couple of intervals is ordinary. A gap of MORE than WAKE_GAP_INTERVALS intervals is the machine
+# asleep between two checks: 4 × 300 s is the runner's own WAKE_GAP_SECONDS, and the heartbeat bound
+# (20 min by default) cannot trip on less, so nothing shorter was ever a false page to begin with.
+INTERVAL_SECONDS = 300
+WAKE_GAP_INTERVALS = 4
 
 KILL_SWITCH_FILENAME = "WATCHDOG_OFF"  # state/WATCHDOG_OFF disables the whole path
 STATE_FILENAME = "watchdog.json"       # state/watchdog.json — episode + no-progress clocks
@@ -154,9 +173,13 @@ def new_state():
     # A separate field from disabled_observed on purpose — the two states journal different words
     # and must never inherit each other's "already said that", or an overnight stop followed by a
     # kill switch (or the reverse) would swallow the first record of the second state.
+    # last_run_at (issue #491): when the previous check ran — the watchdog's own clock, from which a
+    # gap reads as the machine having slept. None = no previous check on record (a first run, or a
+    # state an older engine wrote), which is no evidence of a gap. wake: the last wake seen (_wake).
     return {"episode": None, "no_progress_since": {}, "next_debugger": 1,
             "disabled_observed": None, "stopped_observed": None,
-            "resurrection": _new_resurrection(), "next_resurrection": 1}
+            "resurrection": _new_resurrection(), "next_resurrection": 1,
+            "last_run_at": None, "wake": None}
 
 
 def coerce_state(raw):
@@ -201,7 +224,20 @@ def coerce_state(raw):
     nr = raw.get("next_resurrection")
     if type(nr) is int and nr >= 1:
         st["next_resurrection"] = nr
+    if _real(raw.get("last_run_at")):
+        st["last_run_at"] = raw["last_run_at"]
+    wake = raw.get("wake")
+    if isinstance(wake, dict) and all(_real(wake.get(k)) for k in _WAKE_TIMES) \
+            and (wake.get("heartbeat") is None or _real(wake.get("heartbeat"))):
+        st["wake"] = {**{k: wake[k] for k in _WAKE_TIMES}, "heartbeat": wake.get("heartbeat"),
+                      "resumed": wake.get("resumed") is True, "carried": wake.get("carried") is True}
     return st
+
+
+def _real(v):
+    """A finite number that is not a bool — what every persisted clock must be (json round-trips
+    NaN and Infinity, and a comparison against either is silently always-False)."""
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
 
 
 def _wcfg(config):
@@ -295,6 +331,79 @@ def launchable_nums(parsed_issues, lane_state, config, closed_nums, territory_cl
                                     closed_nums, False, territory_claims=territory_claims)
     return sorted({sel["num"] for sel in selected
                    if type(sel.get("num")) is int and sel["num"] > 0})
+
+
+# The clocks a persisted wake must carry, all real numbers (coerce_state drops a wake missing one).
+_WAKE_TIMES = ("woke_at", "since", "slept_seconds", "grace_until")
+
+
+def _wrec(outcome, wake, **extra):
+    """A wake journal record — its own act (issue #491), not `watchdog`: nothing was flagged for
+    repair, and the dashboard renders every `watchdog` outcome as self-repair."""
+    return {"act": "watchdog_wake", "outcome": outcome, "woke_at": wake["woke_at"],
+            "slept_seconds": wake["slept_seconds"], **extra}
+
+
+def _wake(now, view, state, w):
+    """(wake, journal) for this check (issue #491) — the machine-slept reading of the watchdog's own
+    run clock, and the one claim that follows it. In this order:
+
+      * RESOLVE the last wake: a heartbeat that has ADVANCED past its value at that wake was stamped
+        by a tick completed after it, so the runner came back — journaled once, as `runner_resumed`,
+        or as `runner_restarted` when a new runner process is behind it: the watchdog attempted a
+        restart after the wake, or the live runner started after it (the owner, or launchd's
+        KeepAlive). A reborn process ticking is not the runner resuming. Advanced,
+        not merely fresh: after a short sleep the pre-sleep heartbeat can sit inside the staleness
+        bound. Freshness is NOT required, so a tick landed between two sleeps still resolves the
+        first one when the second wake's check reads it (fresh-agent review).
+      * DETECT a new wake: a check landing MORE than WAKE_GAP_INTERVALS × INTERVAL_SECONDS after the
+        previous one, recorded with the grace it opens (the runner's events.WAKE_GRACE_SECONDS, read
+        here at check time) and journaled `slept`. `since` is the last check that JUDGED the
+        heartbeat — the previous check, unless that check was itself inside the grace of a wake the
+        runner has not come back from, in which case that wake's `since` carries over (fresh-agent
+        review P1: wake, one excused check, the lid closes again — measured from the excused check,
+        the pre-sleep heartbeat would read as stale before the gap and page a runner about to tick).
+        ONCE per chain, never again (review round 2, P1): when every check lands past the wake gap —
+        a job installed at a long interval, or checks run by hand — every check is a wake whose
+        previous check sat in the last one's grace, and a carry that renewed itself would excuse a
+        dead runner forever. Carrying once bounds that to two intervals, and a check past any grace
+        judges the heartbeat and breaks the chain sooner. A check dated before the wake (a clock
+        stepped back) is not in its grace, so it breaks the chain too.
+    A runner that never comes back leaves the wake unresolved; its stale heartbeat, once the grace is
+    over, speaks through the episode and resurrection records exactly as before."""
+    wake, journal = state.get("wake"), []
+    last = state.get("last_run_at")
+    hb = view.get("heartbeat") if _real(view.get("heartbeat")) else None
+    if wake is not None and not wake["resumed"] and hb is not None \
+            and (wake["heartbeat"] is None or hb > wake["heartbeat"]):
+        attempts = (state.get("resurrection") or {}).get("attempts") or []
+        started = view.get("runner_started_at")
+        restarted = any(_real(t) and t >= wake["woke_at"] for t in attempts) \
+            or (_real(started) and started >= wake["woke_at"])
+        wake = dict(wake, resumed=True)
+        journal.append(_wrec("runner_restarted" if restarted else "runner_resumed", wake,
+                             heartbeat=hb))
+    if last is not None and now - last > WAKE_GAP_INTERVALS * INTERVAL_SECONDS:
+        carried = wake is not None and not wake["resumed"] and not wake["carried"] \
+            and wake["woke_at"] <= last < wake["grace_until"]
+        wake = {"woke_at": now, "since": wake["since"] if carried else last,
+                "slept_seconds": int(now - last),
+                "grace_until": now + events_lib.WAKE_GRACE_SECONDS, "heartbeat": hb,
+                "resumed": False, "carried": carried}
+        journal.append(_wrec("slept", wake, grace_until=wake["grace_until"]))
+    return wake, journal
+
+
+def _wake_excused(now, view, wake, w):
+    """Is this check's stale heartbeat the sleep's artifact (issue #491)? Only inside the wake's
+    grace, and only for a heartbeat the sleep could have made stale: one no older than the staleness
+    bound as of the last check BEFORE the gap. A heartbeat already stale then was a runner that had
+    stalled before the lid closed, and waking up does not make it any less stalled. A check dated
+    before the wake it would belong to (the clock stepped back) is not inside its grace either."""
+    if wake is None or not wake["woke_at"] <= now < wake["grace_until"]:
+        return False
+    hb = view.get("heartbeat")
+    return _real(hb) and hb >= wake["since"] - w["heartbeat_stale_seconds"]
 
 
 def _hb_fresh(now, heartbeat, stale_seconds):
@@ -457,7 +566,7 @@ def _without(sigs, details, drop):
     return [s for s, _ in kept], [d for _, d in kept]
 
 
-def _resurrection(now, view, w, sigs, details, new_state, demand=True):
+def _resurrection(now, view, w, sigs, details, new_state, demand=True, hb_excused=False):
     """The provably-gone-runner restart decision (issue #208), folded into the mechanical check.
     `demand` (issue #494) gates only the cap's TEXT; the restart, the cap and its journal record are
     decided exactly as before. A runner observed healthy again after a DELIVERED runner-down 🔴 gets
@@ -481,7 +590,11 @@ def _resurrection(now, view, w, sigs, details, new_state, demand=True):
         the settle window a still-stale heartbeat is a genuine wedge and the debugger path engages.
 
     Both required (the DoD): a fresh heartbeat with a dead pid is a runner that crashed seconds ago,
-    and we wait the heartbeat-stale bound (giving a human first crack) before stepping in."""
+    and we wait the heartbeat-stale bound (giving a human first crack) before stepping in.
+
+    `hb_excused` (issue #491): the heartbeat IS stale, but inside a wake grace — so it restarts
+    nothing and counts no attempt, and it is no evidence of health either: the dedup flags, the
+    booting memory and a delivered runner-down 🔴 all wait for a check that can actually say."""
     r = dict(new_state.get("resurrection") or _new_resurrection())
     r.setdefault("attempts", [])
     r.setdefault("capped_notified", False)
@@ -495,7 +608,7 @@ def _resurrection(now, view, w, sigs, details, new_state, demand=True):
     # A healthy runner (heartbeat fresh, pid alive) closes the down-streak: re-arm the dedup flags
     # so a genuinely NEW incident texts again. (Booting — stale hb, live pid — is NOT healthy, so
     # its heartbeat_stale keeps this from firing mid-recovery.)
-    if not hb_stale and not runner_dead:
+    if not hb_stale and not runner_dead and not hb_excused:
         r["capped_notified"] = False
         r["failure_notified"] = False
         r["capped_paged"] = False
@@ -584,7 +697,7 @@ def _resurrection(now, view, w, sigs, details, new_state, demand=True):
 
 def evaluate(now, config, view, state):
     """One mechanical check. Returns {"state", "journal", "notify", "launch", "resurrect",
-    "runner_down"}:
+    "runner_down", "wake_excused"}:
       state    the new state to persist (episode + no-progress clocks + id counter);
       journal  act:"watchdog" records for TRANSITIONS only (open/stand-down/launch outcomes
                live in after_launch; quiet waiting checks journal nothing);
@@ -599,17 +712,29 @@ def evaluate(now, config, view, state):
                dead). Reported EVERY check, unlike the escalation journal/notify, which dedup to
                once per capped streak — so a caller can stay honest ("the runner is DOWN") on
                checks that deliberately say nothing. False under the kill switch (path suppressed).
+      wake_excused  a stale heartbeat was held this check because the machine just woke (issue
+               #491) — so a caller's summary does not print "healthy" over it. The wake itself is
+               journaled (`act: "watchdog_wake"`) on every branch, the off switches included, and
+               every branch stamps state ▸ last_run_at: the watchdog ran, whatever it then did.
     The caller supplies `view` (every I/O fact, already read) so this stays a pure function.
     `view["demand"]` (issue #494) is the actions.work_demand reading: only an explicit False holds a
     🔴 back, so a view that could not say fails toward the page.
     """
     w = _wcfg(config)
-    demand = view.get("demand") is not False
     state = coerce_state(state)
+    wake, wake_journal = _wake(now, view, state, w)
+    res = _check(now, config, view, dict(state, last_run_at=now, wake=wake), w)
+    return dict(res, journal=wake_journal + res["journal"])
+
+
+def _check(now, config, view, state, w):
+    """evaluate()'s body, on a state whose run clock and wake are already this check's."""
+    demand = view.get("demand") is not False
     sigs, details, since = _signals(now, view, state, w)
 
     if view.get("kill_switch"):
-        # Observe + journal + change nothing else: no episode opens, no clock advances, no
+        # Observe + journal + change nothing else: no episode opens, no clock advances (bar the
+        # watchdog's own run clock, which evaluate() stamps on every branch — issue #491), no
         # launch, NO resurrection (WATCHDOG_OFF is the whole-path kill switch). The journal record
         # dedups on the OBSERVED signal set (review P1-2): a standing switch writes one line per
         # distinct observation, never one per check.
@@ -620,10 +745,12 @@ def evaluate(now, config, view, state):
         # between the switches journals the second state only once, ever.
         if sigs == state.get("disabled_observed"):
             return {"state": dict(state, stopped_observed=None), "notify": [], "launch": None,
-                    "journal": [], "resurrect": None, "runner_down": False}
+                    "journal": [], "resurrect": None, "runner_down": False,
+                    "wake_excused": False}
         return {"state": dict(state, disabled_observed=sigs, stopped_observed=None),
                 "notify": [], "launch": None,
-                "journal": [_rec("disabled", sigs)], "resurrect": None, "runner_down": False}
+                "journal": [_rec("disabled", sigs)], "resurrect": None, "runner_down": False,
+                "wake_excused": False}
 
     if view.get("stopped_by_owner") and not view.get("runner_live"):
         # The runner is down because `superlooper stop` put it down (issue #239). Same posture as
@@ -665,20 +792,27 @@ def evaluate(now, config, view, state):
                                         booting_since=None))
         if sigs == state.get("stopped_observed"):
             return {"state": rested, "notify": [], "launch": None, "journal": journal,
-                    "resurrect": None, "runner_down": False}
+                    "resurrect": None, "runner_down": False, "wake_excused": False}
         return {"state": dict(rested, stopped_observed=sigs), "notify": [], "launch": None,
                 "journal": journal + [_rec("runner_stopped", sigs)], "resurrect": None,
-                "runner_down": False}
+                "runner_down": False, "wake_excused": False}
 
     new_state = dict(state, no_progress_since=since, disabled_observed=None,
                      stopped_observed=None)
     journal, notify, launch = [], [], None
 
+    # The wake grace (issue #491) comes first of all: a heartbeat the machine's sleep made stale is
+    # not a signal this check — it opens no episode and it restarts no runner. Past the grace, or for
+    # a heartbeat already stale before the sleep, nothing here applies and the check reads as before.
+    excused = HEARTBEAT_STALE in sigs and _wake_excused(now, view, state.get("wake"), w)
+    if excused:
+        sigs, details = _without(sigs, details, HEARTBEAT_STALE)
+
     # Runner resurrection (issue #208) runs BEFORE the debugger-episode logic: it may reroute a
     # provably-gone runner's heartbeat_stale away from the episode (a corpse needs restarting, not
     # diagnosing) and emit a resurrect request or a loud escalation.
     sigs, details, resurrect, res_journal, res_notify, new_state, runner_down = _resurrection(
-        now, view, w, sigs, details, new_state, demand)
+        now, view, w, sigs, details, new_state, demand, hb_excused=excused)
     journal.extend(res_journal)
     notify.extend(res_notify)
     ep = state.get("episode")
@@ -696,7 +830,16 @@ def evaluate(now, config, view, state):
                 # (a long outage at a 5-min interval must not write a record per check).
                 new_state["episode"] = ep
                 return {"state": new_state, "journal": journal, "notify": notify,
-                        "launch": None, "resurrect": resurrect, "runner_down": runner_down}
+                        "launch": None, "resurrect": resurrect, "runner_down": runner_down,
+                        "wake_excused": excused}
+            if excused and HEARTBEAT_STALE in ep_signals:
+                # The same hold, for the heartbeat (issue #491): inside a wake grace it is not
+                # observable either — excused, not fresh — so an episode it opened is neither stood
+                # down nor greened on it. The first check that can see the heartbeat decides.
+                new_state["episode"] = ep
+                return {"state": new_state, "journal": journal, "notify": notify,
+                        "launch": None, "resurrect": resurrect, "runner_down": runner_down,
+                        "wake_excused": excused}
             # Self-recovery or owner intervention during (or after) the grace: stand down — the
             # journal keeps the record. The phone hears about it only to close a 🔴 it was actually
             # sent (issue #494)...
@@ -713,7 +856,7 @@ def evaluate(now, config, view, state):
                                          "episode_cleared"))
         new_state["episode"] = None
         return {"state": new_state, "journal": journal, "notify": notify, "launch": launch,
-                "resurrect": resurrect, "runner_down": runner_down}
+                "resurrect": resurrect, "runner_down": runner_down, "wake_excused": excused}
 
     opened = ep is None
     if opened:
@@ -765,7 +908,7 @@ def evaluate(now, config, view, state):
             new_state["next_debugger"] = n + 1
 
     return {"state": new_state, "journal": journal, "notify": notify, "launch": launch,
-            "resurrect": resurrect, "runner_down": runner_down}
+            "resurrect": resurrect, "runner_down": runner_down, "wake_excused": excused}
 
 
 def after_launch(now, config, state, launch, rc, demand=True):

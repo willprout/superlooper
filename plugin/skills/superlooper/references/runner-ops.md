@@ -769,7 +769,12 @@ easy to skip and expensive to get wrong — **`{path}`**.
 
 **Trips on** (owner standing rule, 2026-07-10):
 - `heartbeat_stale` — `state/runner.heartbeat` older than `watchdog.heartbeat_stale_minutes`
-  (default 20). An ABSENT heartbeat never trips: the loop never ran in this state home.
+  (default 20). An ABSENT heartbeat never trips: the loop never ran in this state home. A machine
+  that slept is not a runner that stalled (issue #491): a check landing more than 4 intervals of the
+  installed 300 s cadence after the previous one is a wake, journaled (`act: "watchdog_wake"`, and
+  the morning report says the machine slept and whether the runner resumed), and for the runner's
+  own post-wake grace (5 min) a heartbeat that went stale during the sleep opens no episode and
+  restarts nothing — one still stale after the grace is judged exactly as before.
 - `alert` — `state/ALERT` present (even unreadable: existence is the signal).
 - `no_progress` — work the SCHEDULER would launch RIGHT NOW exists (its own gh read, run through
   `scheduler.launchable` with the real lane state + territory claims, so every scheduler hold is
