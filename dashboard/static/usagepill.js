@@ -13,10 +13,10 @@
       .replace(/"/g, "&quot;");
   }
 
-  function windowHTML(label, pct, emptyTitle) {
+  function windowHTML(label, pct) {
     var head = '<span class="k">' + label + '</span>';
     if (pct === null || pct === undefined) {
-      return head + '<span class="usage-pct" title="' + esc(emptyTitle) + '">—</span>';
+      return head + '<span class="usage-pct" title="no figure reported for this window right now">—</span>';
     }
     var shown = Math.round(pct);
     return head +
@@ -30,9 +30,8 @@
       if (!u.known) {
         return '<span class="k" title="' + esc(u.status || "unknown") + '">usage ?</span>';
       }
-      return windowHTML("5h", u.five_hour_pct, "no five-hour window reported right now") +
-        '<span class="sep">·</span>' +
-        windowHTML("7d", u.seven_day_pct, "no seven-day figure");
+      return windowHTML("5h", u.five_hour_pct) + '<span class="sep">·</span>' +
+        windowHTML("7d", u.seven_day_pct);
     },
   };
 })();

@@ -385,6 +385,10 @@ def test_fetch_usage_with_no_usable_seven_day_or_an_unrecognised_body_stays_api_
                  {"five_hour": None, "seven_day": {"utilization": float("nan")}},
                  {"five_hour": None, "seven_day": {"utilization": float("inf")}},
                  {"five_hour": {"utilization": float("nan")}, "seven_day": _SEVEN},
+                 # fields but no `utilization`: a renamed figure, not an absent window
+                 {"five_hour": {"percent": 95, "resets_at": "2026-11-04T20:00:00Z"},
+                  "seven_day": _SEVEN},
+                 {"five_hour": {"resets_at": "2026-11-04T20:00:00Z"}, "seven_day": _SEVEN},
                  {"five_hour": "soon", "seven_day": _SEVEN},
                  {"five_hour": 0, "seven_day": _SEVEN},
                  {"five_hour": [], "seven_day": _SEVEN},

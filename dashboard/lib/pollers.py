@@ -276,9 +276,9 @@ def fetch_claude_usage(token_source=_keychain_token, http_get=_https_get_json):
     # Schema-drift defense: a 200 whose body renamed or omitted the seven-day window, or gave a
     # wrong-typed figure (a string "42", a bool) in either window, is NOT healthy, so it fails closed
     # to api_error with no stray number and the pill shows "?" honestly. The five-hour window is the
-    # one optional part (issue #533, the same rule as the engine's lib/usage.py): absent, null or
-    # empty is "no such window right now", while a five-hour that is present but unrecognisable is
-    # still drift.
+    # one optional part (issue #533, the same rule as the engine's lib/usage.py): absent, null, empty
+    # or an explicitly null figure is "no such window right now", while a five-hour that is present
+    # but unrecognisable is still drift, including fields with no `utilization` (a renamed figure).
     if not isinstance(data, dict):
         result["auth_status"] = "api_error"
         return result
@@ -286,7 +286,7 @@ def fetch_claude_usage(token_source=_keychain_token, http_get=_https_get_json):
     if fh is None:
         fh = {}
     if not isinstance(fh, dict) or not isinstance(sd, dict) or not _is_num(sd.get("utilization")) \
-            or not _usable_five_hour(fh.get("utilization")):
+            or (fh and "utilization" not in fh) or not _usable_five_hour(fh.get("utilization")):
         result["auth_status"] = "api_error"
         return result
     result["five_hour_pct"] = fh.get("utilization")

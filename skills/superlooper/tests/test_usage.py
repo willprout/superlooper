@@ -194,6 +194,10 @@ def test_both_windows_present_still_reports_both():
     {"five_hour": {"utilization": "12"}, "seven_day": _SEVEN},
     {"five_hour": {"utilization": True}, "seven_day": _SEVEN},
     {"five_hour": {"utilization": float("nan")}, "seven_day": _SEVEN},
+    # A window that has fields but no `utilization` renamed its figure. Reading this as "no window"
+    # would switch the five-hour ceiling off silently, with the real figure sitting right there.
+    {"five_hour": {"percent": 95, "resets_at": "2026-11-04T20:00:00Z"}, "seven_day": _SEVEN},
+    {"five_hour": {"resets_at": "2026-11-04T20:00:00Z"}, "seven_day": _SEVEN},
 ])
 def test_a_200_with_no_usable_seven_day_or_an_unrecognised_body_stays_api_error(body):
     # The schema-drift defense stays: only a real seven-day figure earns `ok`, and a five-hour

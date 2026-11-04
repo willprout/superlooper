@@ -58,7 +58,9 @@ def _usage_ok(usage):
     (and #24's systemic breaker catches a real collapse), is a better failure than a full stop with
     real usage low. This is DELIBERATELY not the refused≠empty / fail-open-on-wrong-typed defect
     class: decide sets fail_open on a typed, understood status past a measured grace — it is never
-    set for a meter that is FRESHLY reading, so the exhausted-read gate below is untouched (a FRESH
+    set for a meter that is FRESHLY reading (a 200 with wrong-typed figures is not one: usage.py
+    reads it as api_error, a typed status on the same bounded, alerting path as a renamed window),
+    so the exhausted-read gate below is untouched (a FRESH
     'ok' at/over the ceiling still launches nothing). NB: a LAST-known-over-ceiling read that then
     goes dark past the grace DOES fail open — by design; once the meter is dark we no longer trust
     that stale pct, and the owner's ruling is that launching beats a full stop (#24 backstops a real

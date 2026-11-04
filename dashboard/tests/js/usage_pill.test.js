@@ -50,6 +50,7 @@ test("no five-hour window: the seven-day figure shows and the five-hour is empty
   has(out, "24%", "the real seven-day figure shows");
   has(out, ">5h<", "the five-hour window keeps its slot");
   has(out, "—", "the five-hour figure is an empty dash");
+  has(out, 'title="no figure reported for this window right now"', "the dash explains itself");
   hasNot(out, "0%", "a missing figure must never read as 0%");
   hasNot(out, "?", "a healthy reading is not the unknown state");
 });

@@ -94,8 +94,14 @@ def _usage_windows(body):
     ``five_hour: null`` beside a good ``seven_day`` on a healthy account (and earlier episodes
     recovered by themselves, so it comes and goes). Requiring both read that as an unreadable meter:
     the runner failed open, held a usage_stale alert and texted about it, with real data in hand. So
-    an absent or null window, or one with no figure in it, is honest "no such window right now". A
-    window that is PRESENT but unrecognisable (a string, a list, a stringly figure) is still drift."""
+    an absent, null or empty window, or an explicitly null figure, is honest "no such window right
+    now". Anything else that is PRESENT but unrecognisable (a string, a list, a stringly figure) is
+    still drift, and so is a window with fields but no `utilization` key: that is a renamed figure,
+    and reading it as "no window" would switch the five-hour ceiling off silently.
+
+    A wrong-typed figure reads api_error here rather than `ok`, so it takes the dark-meter path: held
+    through the grace, then failing open WITH the usage_stale alert. As `ok` it would hold a fresh
+    clock that the scheduler refuses to launch on, which is a permanent stall with no alert."""
     if not isinstance(body, dict):
         return None
     five_hour, seven_day = body.get("five_hour"), body.get("seven_day")
@@ -104,6 +110,8 @@ def _usage_windows(body):
     if not isinstance(five_hour, dict) or not isinstance(seven_day, dict):
         return None
     if not _usable_pct(seven_day.get("utilization")):
+        return None
+    if five_hour and "utilization" not in five_hour:
         return None
     five_hour_pct = five_hour.get("utilization")
     if five_hour_pct is not None and not _usable_pct(five_hour_pct):
