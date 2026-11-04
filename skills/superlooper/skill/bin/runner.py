@@ -2067,6 +2067,37 @@ class Runner:
                 out[n[:-len(".json")]] = v
         return out
 
+    def _worktree_heads(self, st):
+        """{id: HEAD oid | None} for every running/frozen lane — the lane worktree's HEAD read by the
+        RUNNER itself (issue #515), so the #157 progress clock sees a commit within one tick instead
+        of waiting for the worker to rest. A Stop-hook stamp names HEAD only as of the last rest, and
+        a worker committing inside one long turn never rests: #513's three false parks (i893, i1013,
+        i1028) were workers committing and answering probes while the stamp still named their base.
+
+        The path is the runner's own (`_worktree`), not the stamp's `cwd`, so the read needs nothing
+        from the agent. gitops.lane_head takes no lock in the worker's worktree, is time-bounded, and
+        never reads an enclosing repo. Anything unreadable is None, which decide treats as "unknown",
+        never as movement — and a reader that raises is None too, never an exception in the tick."""
+        out = {}
+        issues = st.get("issues") if isinstance(st, dict) else None
+        if not isinstance(issues, dict):
+            return out
+        for iid, ist in issues.items():
+            if not isinstance(ist, dict) or ist.get("status") not in ("running", "frozen"):
+                continue
+            try:
+                out[iid] = gitops.lane_head(self._worktree(iid))
+            except Exception:
+                out[iid] = None
+        return out
+
+    def _lane_head(self, iid):
+        """One lane's worktree HEAD, never raising — the same read as _worktree_heads."""
+        try:
+            return gitops.lane_head(self._worktree(iid))
+        except Exception:
+            return None
+
     def _live_lock_ids(self):
         out = set()
         try:
@@ -2096,6 +2127,7 @@ class Runner:
             "exited": self._scan_dir("state", "exited"),
             "launch_stderr": self._scan_dir("state", "launch_stderr"),   # {id: tail} for #40 memos
             "status_clocks": self._status_clocks(),      # {id: parsed status.json} — the #157 progress clock
+            "worktree_heads": self._worktree_heads(st),  # {id: HEAD | None} — read by the runner (#515)
             "acks": self._scan_dir("state", "ack"),      # {id: raw ack text} — the worker's probe reply
             "awaiting": self._scan_dir("state", "awaiting"),   # {id: marker} — long background work flagged
             "exit_receipts": self._exit_receipts(),      # {id: newest mail-consumption ts} (#148/#215)
@@ -4256,13 +4288,22 @@ class Runner:
             # post-progress signature every 10 minutes and mask the very advance we watch for). A clock
             # that is absent this tick leaves the baseline None; the decide-side first-sight anchor
             # picks it up when a clock finally appears.
+            # The baseline reads the SAME clock decide does — the stamp with the worktree HEAD the
+            # runner reads itself (issue #515) — or the un-latch would later measure a worktree HEAD
+            # against a stale stamped one. Read before taking the state lock: git never runs under it.
+            live_head = self._lane_head(iid)
+            stamp = self._status_clocks().get(iid)
+
             def _anchor_frozen_baseline(st, i):
                 i["status"] = "frozen"
                 i["last_recover_at"] = now
                 if i.get("progress_sig") is None:
-                    sig = events_mod.progress_signature(self._status_clocks().get(iid))
+                    prior, prior_at = i.get("worktree_head"), i.get("worktree_head_at")
+                    clock = events_mod.progress_clock(stamp, live_head, prior, prior_at)
+                    sig = events_mod.progress_signature(clock)
                     if events_mod.usable_baseline(sig):   # only a readable-head sig; never poison None
                         i["progress_sig"] = sig
+                        self._remember_worktree_head(i, clock, prior, prior_at, now)
             self._update_issue(iid, fn=_anchor_frozen_baseline)
             if not self._has_session(iid):
                 self._mark_exited(iid, "frozen with no session recorded", now)
@@ -4368,6 +4409,28 @@ class Runner:
         i["probe_nonce"] = None
         i["probe_sent_at"] = None
         i["harvest_tried"] = False              # (#189) a new episode re-arms the one report rescue
+        i["worktree_head"] = None               # (#515) the last HEAD known for the lane worktree
+        i["worktree_head_at"] = None            # (#515) ...and when it was first known
+
+    @staticmethod
+    def _remember_worktree_head(i, a, prior, prior_at, now):
+        """Keep the last HEAD known for the lane worktree (issue #515) — the action's when it carries
+        a readable one, else what was already remembered — and WHEN it was first known: this
+        tick's `now` (its start) the first time that HEAD was seen. It answers "was this stamp
+        written after the runner learned that HEAD?" for events.progress_clock, and it is a LOWER
+        bound on the read — a re-read of the same HEAD is not stored, and the read itself happens
+        after the tick began — so the known residual is the one that docstring names: a stamp in
+        that gap can pass as newer on a later failed read, costing an episode reset, never a park.
+
+        It survives the reset of a NEW EPISODE inside one session (a report marker, a commit):
+        forgetting it there is what would let a stale stamp pass for a new commit on the next failed
+        read. A relaunch clears it with the rest of the episode (_reset_progress_clock); that is safe
+        because the relaunch clears `progress_sig` too, so the next read re-anchors from scratch."""
+        head = a.get("worktree_head")
+        if not events_mod._readable_head(head):
+            head = prior
+        i["worktree_head"] = head
+        i["worktree_head_at"] = prior_at if head == prior else now
 
     def _exec_progress_advance(self, a, now):
         """Anchor the progress clock. Re-stamps progress_since to now; when the signature ACTUALLY
@@ -4379,11 +4442,13 @@ class Runner:
         changed = {"v": False}
 
         def m(st, i):
+            prior, prior_at = i.get("worktree_head"), i.get("worktree_head_at")
             if i.get("progress_sig") != sig:
                 self._reset_progress_clock(i)              # new episode: zero the probe counters
                 changed["v"] = True
             i["progress_sig"] = sig
             i["progress_since"] = now
+            self._remember_worktree_head(i, a, prior, prior_at, now)   # (#515) measured at
         self._update_issue(iid, fn=m)
         if changed["v"]:
             _rm(os.path.join(self.state, "ack", iid))      # a new episode: last episode's ack is moot
@@ -4409,9 +4474,11 @@ class Runner:
         iid, sig = a["id"], a.get("sig")
 
         def m(st, i):
+            prior, prior_at = i.get("worktree_head"), i.get("worktree_head_at")
             self._reset_progress_clock(i)          # a fresh #157 episode (zero probe counters)...
             i["progress_sig"] = sig                # ...anchored at the advance we just measured
             i["progress_since"] = now
+            self._remember_worktree_head(i, a, prior, prior_at, now)   # (#515) measured at
             i["status"] = "running"
             i["last_recover_at"] = None            # a later re-freeze nudges fresh, not on a stale clock
             i["sensed_state"] = None               # a working lane: drop any frozen-era screen reading

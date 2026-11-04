@@ -269,6 +269,20 @@ and a green suite proves nothing. Fixed by #337 — the label is registered and 
 boot heals every repo adopted before it), and `tests/test_label_vocabulary.py` now reads the engine
 source and reddens CI whenever a label the engine applies is absent from LABELS.
 
+**2026-10-26 → 11-03 — the progress-stall ladder parks live, committing workers (eApp i893, i1013,
+i1028)** · *Classes 1, 4* · The #157 ladder's HEAD came only from the Stop-hook stamp, which is
+written when a worker *rests*. Each of these workers committed inside one long turn (background
+agents, a review cascade), so the stamp still named the branch's base commit; three probes were
+delivered and answered `WORKING` with a valid nonce, and the cap parked the lane anyway — i1028 with
+four commits in its worktree. A parked lane is never merged, so i1013's green PR needed a hand
+merge. Field record: #513. Fixed by #515 — the runner reads each running/frozen lane's worktree HEAD
+itself every tick (no lock taken, time-bounded, never an enclosing repo's HEAD), so a commit is
+progress within one tick for any lane that has a progress clock, whether or not the worker rests.
+An unreadable read keeps the last HEAD the runner knew and is never movement, and a stamp written
+after that read still counts. The park memo now says where its HEAD came from. The probe channel's
+false `send_failed` (#516) and the stale herdr detection override (#517) were split out of the same
+report.
+
 ---
 
 ## The owner's documented frustrations (recorded 2026-07-15, in his words where quoted)

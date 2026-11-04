@@ -2809,6 +2809,179 @@ def test_progress_stall_park_dossier_names_the_evidence():
     assert "min" in memo and ("i328" in memo or "progress" in memo)
 
 
+# ---- the runner reads the lane worktree's HEAD itself (issue #515) ----
+# #513: i893 / i1013 / i1028 were parked progress-stalled while committing. The ladder's clock was
+# the Stop-hook stamp, written only when the worker RESTS — and each of those workers committed
+# inside one long turn, so the stamp still named the branch's base commit at park time. The runner
+# now reads the lane worktree's HEAD every tick (`worktree_heads` in the disk view) and decide
+# overlays it on the stamp.
+
+def _i1028(**over):
+    """The i1028 park tick: clock stamped at X 31 min ago, three probes sent, each answered WORKING
+    with the live nonce — and the cap reached, so today's ladder parks here."""
+    d = dict(progress_sig=_sig(head="X"), progress_since=NOW - 1900, probe_attempts=3,
+             probe_nonce="n3", probe_sent_at=NOW - 400)
+    d.update(over)
+    return {"version": 1, "issues": {"i5": ist("running", **d)}}
+
+
+def test_i1028_a_commit_mid_turn_reanchors_instead_of_parking():
+    # THE #513 reproduction. Stamp still says X (no rest since), the worktree is at Y, the worker
+    # acked WORKING. A commit is progress: re-anchor at Y, journal it, never park.
+    out = decide(dsk=disk(issues_state=_i1028(), status_clocks={"i5": clock(head="X")},
+                          worktree_heads={"i5": "Y"}, acks={"i5": "WORKING n3"}),
+                 parsed_issues=[parsed(5, labels=("in-progress", "type:build"))])
+    assert only(out, "park") == [] and only(out, "probe") == []
+    adv = only(out, "progress_advance")
+    assert len(adv) == 1 and adv[0]["sig"] == _sig(head="Y")
+    assert adv[0]["worktree_head"] == "Y"              # the journaled record names the new HEAD
+
+
+def test_i1028_without_the_worktree_read_is_still_todays_park():
+    # Control: the same tick with no worktree read is exactly the pre-#515 outcome. Proves the
+    # test above turns on the worktree HEAD and nothing else.
+    out = decide(dsk=disk(issues_state=_i1028(), status_clocks={"i5": clock(head="X")},
+                          acks={"i5": "WORKING n3"}),
+                 parsed_issues=[parsed(5, labels=("in-progress", "type:build"))])
+    assert len(only(out, "park")) == 1 and only(out, "park")[0]["cause"] == "progress_stall"
+
+
+def test_a_committing_worker_is_never_parked_across_a_long_turn():
+    # The whole i1028 window driven tick by tick: the stamp never moves (one long turn), the worker
+    # commits every 20 min — slower than the 15-min stall window, so it IS probed — and answers
+    # every probe WORKING. Each commit ends the episode before the cap; it must never park.
+    ist5 = ist("running")
+    st = {"version": 1, "issues": {"i5": ist5}}
+    head, now, probes = 0, NOW, 0
+    for tick in range(24):                     # 2 hours of 5-minute ticks
+        if tick and tick % 4 == 0:
+            head += 1                          # a commit inside the turn: no Stop hook, no stamp
+        nonce = ist5.get("probe_nonce")
+        acks = {"i5": "WORKING %s" % nonce} if nonce else {}
+        out = decide(now=now, dsk=disk(issues_state=st, status_clocks={"i5": clock(head="BASE")},
+                                       worktree_heads={"i5": "C%d" % head}, acks=acks),
+                     parsed_issues=[parsed(5, labels=("in-progress", "type:build"))])
+        assert only(out, "park") == [], f"parked a committing worker at tick {tick}"
+        for a in only(out, "progress_advance"):
+            if ist5.get("progress_sig") != a["sig"]:
+                for k in ("probe_attempts", "probe_nonce", "probe_sent_at"):
+                    ist5.pop(k, None)          # mimic the executor's fresh-episode reset
+            ist5.update(progress_sig=a["sig"], progress_since=now,
+                        worktree_head=a.get("worktree_head"))
+        pr = only(out, "probe")
+        if pr:
+            probes += 1
+            _apply_probe(ist5, pr[0], now)
+        now += 300
+    assert probes >= 3                         # the WORKING-ack path really was exercised
+    assert ist5["progress_sig"] == _sig(head="C%d" % head)
+
+
+def test_a_worktree_head_that_does_not_move_still_parks_on_todays_schedule():
+    # The ladder is not softened: a readable worktree HEAD that genuinely stays put probes and parks
+    # exactly like a frozen stamp does, WORKING acks notwithstanding (the i328 shape).
+    def drive(worktree_heads):
+        ist5 = ist("running", progress_sig=_sig(head="H"), progress_since=NOW - 100000)
+        st = {"version": 1, "issues": {"i5": ist5}}
+        now, probes = NOW, 0
+        for _ in range(50):
+            nonce = ist5.get("probe_nonce")
+            acks = {"i5": "WORKING %s" % nonce} if nonce else {}
+            out = decide(now=now, dsk=disk(issues_state=st, status_clocks={"i5": clock(head="H")},
+                                           acks=acks, **worktree_heads),
+                         parsed_issues=[parsed(5, labels=("in-progress", "type:build"))])
+            assert only(out, "progress_advance") == []
+            if only(out, "park"):
+                return probes, now, only(out, "park")[0]
+            pr = only(out, "probe")
+            if pr:
+                probes += 1
+                _apply_probe(ist5, pr[0], now)
+            now += 300
+        raise AssertionError("never parked")
+    today = drive({})
+    with_read = drive({"worktree_heads": {"i5": "H"}})
+    assert with_read[:2] == today[:2]                  # same probe count, same park tick
+    assert with_read[2]["cause"] == "progress_stall" and "WORKING" in with_read[2]["memo"]
+
+
+def test_an_unreadable_worktree_head_is_never_movement():
+    # Last read Y (stored), the stamp is stale at X, and this tick's git read failed (None). Falling
+    # back to the stamp would read Y -> X as a commit and reset the episode; it must not.
+    st = {"version": 1, "issues": {"i5": ist("running", progress_sig=_sig(head="Y"),
+                                          progress_since=NOW - 1900, probe_attempts=3,
+                                          probe_nonce="n3", probe_sent_at=NOW - 400,
+                                          worktree_head="Y", worktree_head_at=NOW - 1900)}}
+    for unreadable in ({}, {"worktree_heads": {"i5": None}}, {"worktree_heads": {"i5": ""}},
+                       {"worktree_heads": "junk"}):
+        out = decide(dsk=disk(issues_state=st,
+                              status_clocks={"i5": clock(head="X", ts=NOW - 2000)},
+                              acks={"i5": "WORKING n3"}, **unreadable),
+                     parsed_issues=[parsed(5, labels=("in-progress", "type:build"))])
+        assert only(out, "progress_advance") == [], unreadable
+        parks = only(out, "park")                      # ...so the stalled lane parks as before
+        assert len(parks) == 1 and parks[0]["cause"] == "progress_stall", unreadable
+        memo = parks[0]["memo"]
+        assert "HEAD Y" in memo, unreadable            # the dossier names the HEAD it measured
+        assert "last HEAD the runner read" in memo, unreadable   # ...and where that HEAD came from
+
+
+def test_a_stamp_newer_than_the_last_worktree_read_still_counts_when_reads_break():
+    # Never worse than the pre-#515 clock: the runner read Y, then its reads started failing. The
+    # worker rested since and stamped Z — a later look at the same HEAD. That is progress.
+    st = {"version": 1, "issues": {"i5": ist("running", progress_sig=_sig(head="Y"),
+                                          progress_since=NOW - 1900, probe_attempts=3,
+                                          probe_nonce="n3", probe_sent_at=NOW - 400,
+                                          worktree_head="Y", worktree_head_at=NOW - 1900)}}
+    out = decide(dsk=disk(issues_state=st, status_clocks={"i5": clock(head="Z", ts=NOW - 60)},
+                          worktree_heads={"i5": None}, acks={"i5": "WORKING n3"}),
+                 parsed_issues=[parsed(5, labels=("in-progress", "type:build"))])
+    assert only(out, "park") == []
+    adv = only(out, "progress_advance")
+    assert len(adv) == 1 and adv[0]["sig"] == _sig(head="Z") and adv[0]["worktree_head"] == "Z"
+
+
+def test_the_park_memo_says_where_its_head_came_from():
+    # #513's forensics had to dig branch reflogs to learn the memo's HEAD was a stale stamp. The
+    # dossier now says which clock it read — and a lane whose worktree the runner could not read
+    # says so, which is the one place a silently inert read would otherwise hide.
+    def memo(worktree_heads):
+        st = {"version": 1, "issues": {"i5": ist("running", progress_sig=_sig(head="H"),
+                                              progress_since=NOW - 1900, probe_attempts=3,
+                                              probe_nonce="n3", probe_sent_at=NOW - 400)}}
+        out = decide(dsk=disk(issues_state=st, status_clocks={"i5": clock(head="H")},
+                              worktree_heads=worktree_heads),
+                     parsed_issues=[parsed(5, labels=("in-progress", "type:build"))])
+        return only(out, "park")[0]["memo"]
+    assert "read from the lane worktree" in memo({"i5": "H"})
+    unread = memo({"i5": None})
+    assert "worker's last rest" in unread and "could not read the lane worktree" in unread
+
+
+def test_a_frozen_lane_unlatches_on_a_worktree_commit():
+    # The #231 un-latch reads the same clock: a latched-frozen lane whose worktree moved past its
+    # baseline (no rest, so no new stamp) has demonstrably resumed.
+    st = {"version": 1, "issues": {"i5": ist("frozen", progress_sig=_sig(head="Y"),
+                                          last_recover_at=NOW - 601, worktree_head="Y")}}
+    out = decide(dsk=disk(issues_state=st, status_clocks={"i5": clock(head="X")},
+                          worktree_heads={"i5": "Z"}))
+    uf = only(out, "unlatch_frozen")
+    assert len(uf) == 1 and uf[0]["sig"] == _sig(head="Z") and uf[0]["evidence_class"] == "HEAD"
+    assert uf[0]["worktree_head"] == "Z"
+
+
+def test_a_frozen_lane_does_not_unlatch_on_a_stale_stamp_once_the_worktree_was_read():
+    # The un-latch is fail-closed on the same rule: baseline Y came from the worktree, the stamp is
+    # stale at X, and this tick's read failed. X is old news, not a resume.
+    st = {"version": 1, "issues": {"i5": ist("frozen", progress_sig=_sig(head="Y"),
+                                          last_recover_at=NOW - 601, worktree_head="Y",
+                                          worktree_head_at=NOW - 900)}}
+    out = decide(dsk=disk(issues_state=st, status_clocks={"i5": clock(head="X", ts=NOW - 1000)},
+                          worktree_heads={"i5": None}))
+    assert only(out, "unlatch_frozen") == []
+    assert len(only(out, "recover")) == 1              # still nudged as frozen
+
+
 # =========================== the gate, translated ===========================
 
 def _gating(status="gating", report=GOOD_REPORT, pv=None, issues_extra=None, **dover):

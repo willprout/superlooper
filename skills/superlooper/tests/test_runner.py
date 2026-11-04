@@ -1881,6 +1881,188 @@ def test_progress_stall_ladder_probes_then_parks_end_to_end(rig):
     assert any(m["kind"] == "comment" and "progress" in m["body"].lower() for m in mutations(rig))
 
 
+# ---- the runner reads the lane worktree's HEAD itself (issue #515) ----
+# #513's three false parks (i893, i1013, i1028): each worker committed inside ONE long turn, so the
+# Stop-hook stamp — the ladder's only HEAD until now — still named the branch's base commit when the
+# lane was parked. These drive real ticks over a REAL linked worktree at the runner's own lane path.
+
+def _stamp(rig, iid, head, cwd):
+    """The Stop hook's clock, as the worker's last REST left it."""
+    return _seed_clock(rig, iid, head=head, cwd=str(cwd), ts=NOW - 1900)
+
+
+def _commit_in(wt, name):
+    (wt / name).write_text(name + "\n")
+    _git_sh(wt, "add", name)
+    _git_sh(wt, "commit", "-m", "mid-turn " + name)     # no Stop hook fires: the stamp stays put
+    return _git_sh(wt, "rev-parse", "HEAD")
+
+
+def _answer_probe(rig, iid, state="WORKING"):
+    """What i1028 did: read the probe, write the nonce-valid ack, and keep working (no rest)."""
+    nonce = issue_state(rig, iid).get("probe_nonce")
+    if nonce:
+        (rig.home / "state" / "ack").mkdir(parents=True, exist_ok=True)
+        (rig.home / "state" / "ack" / iid).write_text(f"{state} {nonce}\n")
+
+
+def test_i1028_a_commit_made_mid_turn_reanchors_the_clock_within_one_tick(rig):
+    # The i1028 park tick, reproduced: stamped at X 31 min ago, three probes sent and answered
+    # WORKING, cap reached. Without #515 this tick parks. The worker committed Y in the worktree
+    # (no rest in between): that is progress, journaled with the new HEAD, and the lane runs on.
+    wt = _real_git_lane(rig, "i5", "sl/i5-x")
+    x = _git_sh(wt, "rev-parse", "HEAD")
+    _stamp(rig, "i5", x, wt)
+    seed_issue(rig, "i5", status="running", branch="sl/i5-x",
+               progress_sig=events.progress_signature({"head": x}), progress_since=NOW - 1900,
+               probe_attempts=3, probe_nonce="n3", probe_sent_at=NOW - 400)
+    (rig.home / "state" / "panes" / "i5").write_text("surf-uuid")
+    _answer_probe(rig, "i5")
+    y = _commit_in(wt, "abbd285.txt")
+    _activity(rig, "i5", NOW)
+
+    rig.r.tick(now=NOW)
+
+    st = issue_state(rig, "i5")
+    assert st["status"] == "running", "a committing worker was progress-stall parked (#513)"
+    assert st["progress_sig"] == events.progress_signature({"head": y})
+    assert st["worktree_head"] == y and (st.get("probe_attempts") or 0) == 0
+    adv = [j for j in _journal(rig) if j.get("act") == "progress_advance" and j.get("id") == "i5"]
+    assert adv and adv[-1]["worktree_head"] == y and adv[-1]["sig"].startswith(y + "|")
+    assert not [j for j in _journal(rig) if j.get("act") == "park"]
+    assert json.loads((rig.home / "state" / "status" / "i5.json").read_text())["head"] == x
+
+
+def test_a_worker_committing_through_one_long_turn_is_never_parked(rig):
+    # The whole i1028 window as real ticks: the stamp never moves, the worker commits every 20 min
+    # (so it IS probed — the stall window is 15) and answers every probe WORKING.
+    wt = _real_git_lane(rig, "i5", "sl/i5-x")
+    _stamp(rig, "i5", _git_sh(wt, "rev-parse", "HEAD"), wt)
+    seed_issue(rig, "i5", status="running", branch="sl/i5-x")
+    (rig.home / "state" / "panes" / "i5").write_text("surf-uuid")
+    now = NOW
+    for tick in range(24):                     # two hours of 5-minute ticks
+        if tick and tick % 4 == 0:
+            _commit_in(wt, f"c{tick}.txt")
+        _answer_probe(rig, "i5")
+        _activity(rig, "i5", now)
+        rig.r.tick(now=now)
+        assert issue_state(rig, "i5")["status"] == "running", f"parked at tick {tick}"
+        now += 300
+    assert len(_probe_calls(rig)) >= 3         # probed between commits, answered, never parked
+    assert issue_state(rig, "i5")["worktree_head"] == _git_sh(wt, "rev-parse", "HEAD")
+
+
+def test_a_worktree_whose_head_never_moves_still_parks(rig):
+    # The ladder is not softened: a readable worktree HEAD that stays put, a worker answering
+    # WORKING every time — it is probed to the cap and parked, the i328 shape.
+    wt = _real_git_lane(rig, "i5", "sl/i5-x")
+    head = _git_sh(wt, "rev-parse", "HEAD")
+    _stamp(rig, "i5", head, wt)
+    seed_issue(rig, "i5", status="running", branch="sl/i5-x")
+    (rig.home / "state" / "panes" / "i5").write_text("surf-uuid")
+    now, parked = NOW, None
+    for _ in range(20):
+        _answer_probe(rig, "i5")
+        _activity(rig, "i5", now)
+        rig.r.tick(now=now)
+        if issue_state(rig, "i5")["status"] in ("parked", "needs_william"):
+            parked = now
+            break
+        now += 300
+    assert parked is not None, "a lane whose worktree HEAD never moved was never parked"
+    assert 1 <= len(_probe_calls(rig)) <= 3
+    # today's schedule: anchor at the first tick, stall at 15 min, probes 5 min apart, park at the cap
+    assert parked - NOW == 900 + 3 * 300
+    assert issue_state(rig, "i5")["worktree_head"] == head     # the READ took part, not just the stamp
+    memo = [m for m in mutations(rig) if m["kind"] == "comment" and "progress-stall" in m["body"]]
+    assert memo and "read from the lane worktree" in memo[-1]["body"]
+
+
+def test_an_unreadable_worktree_head_never_counts_and_never_raises(rig, monkeypatch):
+    # Read Y once, then the read fails every way it can: git times out, the worktree is pruned, the
+    # reader itself raises. None of it is movement (the stale stamp X must not come back as a "new"
+    # head) and none of it reaches the tick.
+    wt = _real_git_lane(rig, "i5", "sl/i5-x")
+    x = _git_sh(wt, "rev-parse", "HEAD")
+    _stamp(rig, "i5", x, wt)
+    seed_issue(rig, "i5", status="running", branch="sl/i5-x")
+    (rig.home / "state" / "panes" / "i5").write_text("surf-uuid")
+    y = _commit_in(wt, "y.txt")
+    _activity(rig, "i5", NOW)
+    rig.r.tick(now=NOW)
+    assert issue_state(rig, "i5")["worktree_head"] == y
+    anchored = issue_state(rig, "i5")["progress_sig"]
+
+    def boom(_wt):
+        raise RuntimeError("reader blew up")
+    real = runner_mod.gitops._git
+    failures = [
+        lambda: monkeypatch.setattr(runner_mod.gitops, "_git",
+                                    lambda *a, **k: (124, "git rev-parse timed out after 5s")),
+        lambda: monkeypatch.setattr(runner_mod.gitops, "_git", real),
+        lambda: monkeypatch.setattr(runner_mod.gitops, "lane_head", boom),
+    ]
+    now = NOW
+    for i, fail in enumerate(failures):
+        fail()
+        if i == 1:
+            shutil.rmtree(_git_sh(wt, "rev-parse", "--absolute-git-dir"))   # a pruned worktree
+        now += 60
+        _activity(rig, "i5", now)
+        rig.r.tick(now=now)                                    # must not raise
+        assert (rig.home / "state" / "runner.heartbeat").read_text() == str(int(now))
+        st = issue_state(rig, "i5")
+        assert st["progress_sig"] == anchored and st["progress_since"] == NOW, i
+        assert st["worktree_head"] == y, i
+    advs = [j for j in _journal(rig) if j.get("act") == "progress_advance" and j.get("id") == "i5"]
+    assert len(advs) == 1                                      # the one real anchor, nothing since
+
+
+def test_the_frozen_baseline_is_anchored_from_the_worktree_head(rig):
+    # The #231 baseline (stamped at the first freeze of a lane with none) reads the same clock, so a
+    # later un-latch measures against the HEAD the worktree really had, not a stale stamp.
+    wt = _real_git_lane(rig, "i5", "sl/i5-x")
+    x = _git_sh(wt, "rev-parse", "HEAD")
+    _stamp(rig, "i5", x, wt)
+    y = _commit_in(wt, "y.txt")
+    seed_issue(rig, "i5", status="running", branch="sl/i5-x")           # no progress_sig yet
+    (rig.home / "state" / "panes" / "i5").write_text("surf-uuid")
+    rig.r._execute({"act": "recover", "id": "i5", "tier": "frozen"}, NOW)
+    st = issue_state(rig, "i5")
+    assert st["status"] == "frozen"
+    assert st["progress_sig"] == events.progress_signature({"head": y})
+    assert st["worktree_head"] == y and st["worktree_head_at"] == NOW
+
+
+def test_exec_progress_advance_remembers_the_worktree_head_and_relaunch_forgets_it(rig):
+    rig.r.tick(now=NOW)
+    seed_issue(rig, "i101", status="running", progress_sig="X|False|False",
+               progress_since=NOW - 50)
+    rig.r._execute({"act": "progress_advance", "id": "i101", "sig": "Y|False|False",
+                    "worktree_head": "Y"}, NOW)
+    st = issue_state(rig, "i101")
+    assert st["worktree_head"] == "Y" and st["worktree_head_at"] == NOW
+    # A new episode (the report marker flipped) with no worktree read this tick keeps the last HEAD
+    # the runner read: dropping it would let the stale stamp pass for a new commit next tick. Its
+    # time stays when that HEAD was first known (the bookkeeping rule pinned here; why that is a
+    # LOWER bound, and the residual it leaves, is in events.progress_clock's docstring).
+    rig.r._execute({"act": "progress_advance", "id": "i101", "sig": "Y|True|False"}, NOW + 5)
+    st = issue_state(rig, "i101")
+    assert st["worktree_head"] == "Y" and st["worktree_head_at"] == NOW
+    rig.r._execute({"act": "progress_advance", "id": "i101", "sig": "Y|True|False",
+                    "worktree_head": "Y"}, NOW + 6)              # a re-read of the same HEAD
+    assert issue_state(rig, "i101")["worktree_head_at"] == NOW
+    rig.r._execute({"act": "progress_advance", "id": "i101", "sig": "Z|True|False",
+                    "worktree_head": "Z"}, NOW + 7)
+    st = issue_state(rig, "i101")
+    assert st["worktree_head"] == "Z" and st["worktree_head_at"] == NOW + 7
+    out = rig.r._execute({"act": "recover", "id": "i101", "tier": "exited"}, NOW + 10)
+    assert out == "ok"
+    st = issue_state(rig, "i101")
+    assert st.get("worktree_head") is None and st.get("worktree_head_at") is None   # fresh episode
+
+
 def test_post_question_posts_durable_comment_releases_lane(rig):
     # #163: a worker's owner-decision question becomes a DURABLE GitHub comment, the live window is
     # closed, and the lane is released to awaiting_answer — the WIP worktree is preserved for reuse.

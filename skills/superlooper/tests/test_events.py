@@ -5,6 +5,8 @@ marker-EXISTENCE resolution test in particular is the P0 where frozen-recovery r
 finished sessions and deleted their reports. Rotation/ring/stall/ship cases are NOT ported:
 that machinery died with the standing orchestrator (enforcement by absence).
 """
+import json
+
 import events
 
 
@@ -531,6 +533,98 @@ def test_progress_evidence_is_fail_closed_on_unparseable_input():
         assert events.progress_evidence(bad, "A|False|False") == "progress clock advanced"
         assert events.progress_evidence("A|False|False", bad) == "progress clock advanced"
     assert events.progress_evidence("A|False|False", "A|False|False") == "progress clock advanced"
+
+
+# ---- the runner reads the lane worktree's HEAD itself (issue #515) ----
+# The Stop hook stamps HEAD only when the worker RESTS, so a worker committing inside one long turn
+# (background agents, a review cascade) looked frozen to the ladder and was parked mid-commit
+# (#513: i893, i1013, i1028). progress_clock overlays the HEAD the runner read from the lane's
+# worktree this tick onto the stamp; the stamp still owns the report/blocked markers.
+
+_STAMP = {"id": "i5", "ts": 100, "cwd": "/w", "head": "X", "dirty": False,
+          "report": False, "blocked": False}
+
+
+def test_progress_clock_takes_the_worktree_head_over_a_stale_stamp():
+    c = events.progress_clock(_STAMP, worktree_head="Y")
+    assert c["head"] == "Y" and c["worktree_head"] == "Y" and c["head_source"] == "worktree"
+    assert events.progress_signature(c) == "Y|False|False"
+    # this tick's read beats even a stamp written after the last remembered read
+    c2 = events.progress_clock(dict(_STAMP, ts=999), worktree_head="Y", last_worktree_head="W",
+                               last_worktree_head_at=1)
+    assert c2["head"] == "Y"
+    assert _STAMP["head"] == "X"                       # the stamp itself is never mutated
+
+
+def test_progress_clock_never_invents_a_clock_without_a_stamp():
+    # No stamp = no clock, whatever git says: the no-clock fallback (idle peek) stays as it is, so a
+    # worktree read alone never drags an unstamped lane onto the probe ladder.
+    for bad in (None, {}, [], "junk"):
+        assert events.progress_signature(events.progress_clock(bad, worktree_head="Y")) is None
+
+
+def test_an_unreadable_worktree_head_keeps_the_last_head_the_runner_read():
+    # A git timeout / pruned worktree reads as None. That must NEVER count as movement — and falling
+    # back to the stamp would (stamp X is stale, last read was Y: Y -> X is a false advance). So the
+    # last readable worktree HEAD stands until a read succeeds again.
+    for unreadable in (None, "", "None", 42):
+        c = events.progress_clock(_STAMP, worktree_head=unreadable, last_worktree_head="Y",
+                                  last_worktree_head_at=200)          # the stamp (ts 100) is older
+        assert c["head"] == "Y" and c["worktree_head"] == "Y", unreadable
+        assert c["head_source"] == "worktree_last", unreadable
+
+
+def test_a_lane_whose_worktree_was_never_read_keeps_the_stamped_head():
+    # Never read (no worktree at the runner's path, or git always failing): the stamp is the only
+    # HEAD there is — exactly the pre-#515 clock, so nothing regresses for such a lane.
+    for unreadable in (None, "", "None"):
+        c = events.progress_clock(_STAMP, worktree_head=unreadable, last_worktree_head=unreadable)
+        assert events.progress_signature(c) == events.progress_signature(_STAMP)
+        assert c["worktree_head"] is None and c["head_source"] == "stamp"
+
+
+def test_a_stamp_newer_than_the_last_worktree_read_wins_over_it():
+    # Read Y at t=200, then every read fails. The worker rests at t=300 and stamps Z: that stamp read
+    # HEAD AFTER the runner last did, so it is the newer evidence. Holding Y would hide real commits
+    # behind a broken read — worse than the pre-#515 clock, which would have seen Z.
+    newer = dict(_STAMP, head="Z", ts=300)
+    c = events.progress_clock(newer, worktree_head=None, last_worktree_head="Y",
+                              last_worktree_head_at=200)
+    assert c["head"] == "Z" and c["worktree_head"] == "Z" and c["head_source"] == "stamp_newer"
+    # ...but a stamp from BEFORE that read is the stale X the last read already superseded.
+    for at in (300, 301, None, "200", True, float("nan"), float("-inf")):
+        older = events.progress_clock(newer, worktree_head=None, last_worktree_head="Y",
+                                      last_worktree_head_at=at)
+        assert older["head"] == "Y" and older["head_source"] == "worktree_last", at
+    for ts in (float("inf"), float("nan")):              # json.loads yields both
+        odd = events.progress_clock(dict(newer, ts=ts), worktree_head=None,
+                                    last_worktree_head="Y", last_worktree_head_at=200)
+        assert odd["head"] == "Y", ts
+    # ...and an integer past float range (json.loads yields one from a corrupt stamp) must not raise
+    # into the tick — math.isfinite would OverflowError on it. It is a finite time, so it compares.
+    huge = json.loads('{"ts": 1%s}' % ("0" * 400))["ts"]
+    for kw in ({"ts": huge}, {}):
+        c = events.progress_clock(dict(newer, **kw), worktree_head=None, last_worktree_head="Y",
+                                  last_worktree_head_at=huge if not kw else 200)
+        assert c["head"] in ("Y", "Z")
+    # ...and a newer stamp whose own read failed carries no HEAD to prefer.
+    blind = events.progress_clock(dict(newer, head=None), worktree_head=None,
+                                  last_worktree_head="Y", last_worktree_head_at=200)
+    assert blind["head"] == "Y"
+
+
+def test_a_worker_written_worktree_head_key_is_never_taken_as_a_runner_read():
+    # The stamp is a file the worker's side writes. A `worktree_head` in it must not pose as the
+    # runner's own read and get remembered as one.
+    forged = dict(_STAMP, worktree_head="FORGED", head_source="worktree")
+    c = events.progress_clock(forged)
+    assert c["worktree_head"] is None and c["head_source"] == "stamp"
+
+
+def test_the_worktree_head_never_hides_a_stamped_marker():
+    c = events.progress_clock(dict(_STAMP, report=True, blocked=True), worktree_head="Y")
+    assert events.progress_signature(c) == "Y|True|True"
+    assert c["head_source"] == "worktree"
 
 
 def test_parse_ack_reads_a_valid_reply_only_when_the_nonce_matches():
