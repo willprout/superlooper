@@ -2045,8 +2045,8 @@ def test_exec_progress_advance_remembers_the_worktree_head_and_relaunch_forgets_
     assert st["worktree_head"] == "Y" and st["worktree_head_at"] == NOW
     # A new episode (the report marker flipped) with no worktree read this tick keeps the last HEAD
     # the runner read: dropping it would let the stale stamp pass for a new commit next tick. Its
-    # time is when that HEAD was first known, not this tick — a stamp written between the two is
-    # still newer evidence than the read.
+    # time stays when that HEAD was first known (the bookkeeping rule pinned here; why that is a
+    # LOWER bound, and the residual it leaves, is in events.progress_clock's docstring).
     rig.r._execute({"act": "progress_advance", "id": "i101", "sig": "Y|True|False"}, NOW + 5)
     st = issue_state(rig, "i101")
     assert st["worktree_head"] == "Y" and st["worktree_head_at"] == NOW

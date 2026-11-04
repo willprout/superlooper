@@ -4415,9 +4415,12 @@ class Runner:
     @staticmethod
     def _remember_worktree_head(i, a, prior, prior_at, now):
         """Keep the last HEAD known for the lane worktree (issue #515) — the action's when it carries
-        a readable one, else what was already remembered — and WHEN it was first known. The time
-        moves only when the HEAD does: it answers "was this stamp written after the runner learned
-        that HEAD?", and a re-read of the same HEAD teaches nothing newer than the first read did.
+        a readable one, else what was already remembered — and WHEN it was first known: this
+        tick's `now` (its start) the first time that HEAD was seen. It answers "was this stamp
+        written after the runner learned that HEAD?" for events.progress_clock, and it is a LOWER
+        bound on the read — a re-read of the same HEAD is not stored, and the read itself happens
+        after the tick began — so the known residual is the one that docstring names: a stamp in
+        that gap can pass as newer on a later failed read, costing an episode reset, never a park.
 
         It survives the reset of a NEW EPISODE inside one session (a report marker, a commit):
         forgetting it there is what would let a stale stamp pass for a new commit on the next failed

@@ -19,6 +19,7 @@ stall_*/ring-health alarms keyed on an LLM draining a queue, and the state/ship/
 inside its own tick, so GitHub state never needs a file relay between two processes.
 """
 import hashlib
+import math
 import os
 import re
 
@@ -116,7 +117,15 @@ def progress_clock(stamp, worktree_head=None, last_worktree_head=None,
          "worktree_last" — otherwise `last_worktree_head`, the last HEAD the runner knew. Falling
             back to the stamp here would be wrong: a stamp at X that the worktree had long since
             left for Y would read as Y -> X, a fresh "commit", and reset the episode on a failed
-            read. A missing or wrong-typed time proves nothing newer, so the remembered HEAD holds.
+            read. A missing, wrong-typed or non-finite time proves nothing newer, so the remembered
+            HEAD holds.
+         The time is a LOWER bound on when the runner read that HEAD: the tick's start, stamped the
+         first time the HEAD was seen (a re-read of the same HEAD is not stored). So a stamp written
+         in the gap — after the tick began but before the read, or between two reads of the same
+         HEAD — can still pass as newer on a later FAILED read. That needs a failed read plus a
+         stamp naming a HEAD the worktree no longer has (a commit landing mid-tick, or a rest taken
+         outside the lane worktree), and it errs one way only: an extra episode reset, never a
+         park (fresh-agent review round 2, P2 — left as a known residual, see PR #521).
       3. "stamp" — the stamp's own head, when the runner has never read the worktree (no worktree at
          its path). Exactly the pre-#515 clock. One honest cost: if the FIRST read only succeeds
          later and the stamp lagged the worktree, that first read reads as one movement (one
@@ -146,9 +155,11 @@ def progress_clock(stamp, worktree_head=None, last_worktree_head=None,
 
 
 def _later(a, b):
-    """Is time `a` strictly after time `b`? Both must be real numbers (a bool is not a time); anything
-    else is "not proven later" — the caller then keeps what it already knew."""
-    real = lambda v: isinstance(v, (int, float)) and not isinstance(v, bool)
+    """Is time `a` strictly after time `b`? Both must be finite real numbers (a bool is not a time,
+    and json.loads happily yields Infinity/NaN); anything else is "not proven later" — the caller
+    then keeps what it already knew."""
+    def real(v):
+        return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
     return real(a) and real(b) and a > b
 
 

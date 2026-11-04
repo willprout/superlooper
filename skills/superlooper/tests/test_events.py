@@ -590,10 +590,14 @@ def test_a_stamp_newer_than_the_last_worktree_read_wins_over_it():
                               last_worktree_head_at=200)
     assert c["head"] == "Z" and c["worktree_head"] == "Z" and c["head_source"] == "stamp_newer"
     # ...but a stamp from BEFORE that read is the stale X the last read already superseded.
-    for at in (300, 301, None, "200", True):
+    for at in (300, 301, None, "200", True, float("nan"), float("-inf")):
         older = events.progress_clock(newer, worktree_head=None, last_worktree_head="Y",
                                       last_worktree_head_at=at)
         assert older["head"] == "Y" and older["head_source"] == "worktree_last", at
+    for ts in (float("inf"), float("nan")):              # json.loads yields both
+        odd = events.progress_clock(dict(newer, ts=ts), worktree_head=None,
+                                    last_worktree_head="Y", last_worktree_head_at=200)
+        assert odd["head"] == "Y", ts
     # ...and a newer stamp whose own read failed carries no HEAD to prefer.
     blind = events.progress_clock(dict(newer, head=None), worktree_head=None,
                                   last_worktree_head="Y", last_worktree_head_at=200)
