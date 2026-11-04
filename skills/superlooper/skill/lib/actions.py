@@ -940,8 +940,9 @@ def _lane_clock(iid, ist, status_clocks, worktree_heads):
     one that succeeded (`worktree_head` in the issue state). Every reader of the clock in decide goes
     through here, so the ladder, the #231 un-latch and their baselines can never compare a worktree
     HEAD against a stamped one. The rules themselves live in events.progress_clock."""
-    last = ist.get("worktree_head") if isinstance(ist, dict) else None
-    return events_mod.progress_clock(status_clocks.get(iid), worktree_heads.get(iid), last)
+    ist = ist if isinstance(ist, dict) else {}
+    return events_mod.progress_clock(status_clocks.get(iid), worktree_heads.get(iid),
+                                     ist.get("worktree_head"), ist.get("worktree_head_at"))
 
 
 def _with_worktree_head(action, clock):
@@ -961,6 +962,16 @@ def _progress_stall_memo(iid, clock, stall_secs, attempts, ack_state):
     wrong-typed inputs (never raise into a park)."""
     head = clock.get("head") if isinstance(clock, dict) else None
     head_s = head[:12] if isinstance(head, str) and head else "unknown"
+    # WHERE that HEAD came from (issue #515). #513's forensics had to line branch reflogs up against
+    # Stop-hook stamps to learn the memo's HEAD was a stale stamp; and a lane whose worktree the
+    # runner cannot read at all would otherwise be silently back on the stamp-only clock.
+    source = {
+        "worktree": ", read from the lane worktree",
+        "worktree_last": ", the last HEAD the runner read from the lane worktree (this tick's read "
+                         "failed)",
+        "stamp_newer": ", from the worker's last rest (newer than the runner's last worktree read)",
+        "stamp": ", from the worker's last rest — the runner could not read the lane worktree",
+    }.get(clock.get("head_source") if isinstance(clock, dict) else None, "")
     mins = int(stall_secs // 60) if isinstance(stall_secs, (int, float)) else 0
     n = attempts if type(attempts) is int and attempts >= 0 else 0
     said = {
@@ -970,8 +981,9 @@ def _progress_stall_memo(iid, clock, stall_secs, attempts, ack_state):
         "STUCK": "the worker acked STUCK and asked for help",
     }.get(ack_state, "the worker never answered a probe with a valid ack")
     return (f"{iid}: progress-stall park (issue #157). No new commit/marker/HEAD change for "
-            f"~{mins} min (HEAD {head_s}) across {n} probe(s) — {said}. The lane took turns without "
-            f"progressing, so it was escalated instead of nudged forever (the i328 infinite loop).")
+            f"~{mins} min (HEAD {head_s}{source}) across {n} probe(s) — {said}. The lane took "
+            f"turns without progressing, so it was escalated instead of nudged forever (the i328 "
+            f"infinite loop).")
 
 
 def _captured_addendum(ev):

@@ -94,7 +94,8 @@ def _readable_head(h):
     return isinstance(h, str) and h not in ("", "None")
 
 
-def progress_clock(stamp, worktree_head=None, last_worktree_head=None):
+def progress_clock(stamp, worktree_head=None, last_worktree_head=None,
+                   last_worktree_head_at=None):
     """The progress clock as the RUNNER measures it (issue #515): the Stop hook's stamp, with its HEAD
     replaced by the lane worktree's HEAD the runner read for itself.
 
@@ -102,30 +103,53 @@ def progress_clock(stamp, worktree_head=None, last_worktree_head=None):
     (background agents, a review cascade) takes no rest, so the stamp went on naming the branch's
     base commit while the commits piled up — and the #157 ladder parked three live, committing,
     probe-answering workers that way (#513: i893, i1013, i1028). A commit is progress the moment it
-    lands; the runner reading the worktree each tick sees it within one tick, for any agent.
+    lands; the runner reading the worktree each tick sees it within one tick.
 
-    The HEAD, in order of preference:
-      1. `worktree_head`, the runner's read THIS tick, when it names a commit;
-      2. `last_worktree_head`, the last read that did — when this tick's failed (a git timeout, a
-         pruned or missing worktree). An unreadable read is "unknown", never movement, and falling
-         back to the stamp instead would be: a stamp at X that the worktree had long since left for
-         Y would read as Y -> X, a fresh "commit", and reset the episode on a failed read;
-      3. the stamp's own head, when the worktree has never been read (no worktree at the runner's
-         path) — exactly the pre-#515 clock, so such a lane loses nothing.
+    The HEAD, in order of preference (`head_source` names which one was used):
+      1. "worktree" — `worktree_head`, the runner's read THIS tick, when it names a commit.
+      2. When this tick's read failed (a git timeout, a pruned or missing worktree) — an unreadable
+         read is "unknown", never movement:
+         "stamp_newer" — the stamp's head, if the stamp was written AFTER the runner last learned
+            its remembered HEAD (`stamp["ts"] > last_worktree_head_at`). That stamp looked at the
+            same HEAD later than the runner did, so it is the newer evidence; holding the old read
+            instead would hide real commits behind a broken read — worse than the pre-#515 clock.
+         "worktree_last" — otherwise `last_worktree_head`, the last HEAD the runner knew. Falling
+            back to the stamp here would be wrong: a stamp at X that the worktree had long since
+            left for Y would read as Y -> X, a fresh "commit", and reset the episode on a failed
+            read. A missing or wrong-typed time proves nothing newer, so the remembered HEAD holds.
+      3. "stamp" — the stamp's own head, when the runner has never read the worktree (no worktree at
+         its path). Exactly the pre-#515 clock. One honest cost: if the FIRST read only succeeds
+         later and the stamp lagged the worktree, that first read reads as one movement (one
+         episode reset, never a park) — the same one-off every in-flight lane takes on upgrade.
 
     The report/blocked markers stay the stamp's. With no stamp there is no clock at all, whatever
     git says: the lane keeps its no-clock fallback rather than being dragged onto the ladder by a
-    read alone. The result carries `worktree_head` (cases 1 and 2) so decide can hand the executor
-    the value to remember. Pure, never raises, never mutates `stamp`."""
+    read alone. The result carries `worktree_head` — the HEAD to remember (cases 1 and 2), None in
+    case 3 — and any `worktree_head`/`head_source` the stamp itself carried is dropped: the stamp is
+    a file the worker's side writes, and nothing in it may pose as the runner's own read. Pure,
+    never raises, never mutates `stamp`."""
     if not isinstance(stamp, dict) or not stamp:
         return stamp
+    clock = {k: v for k, v in stamp.items() if k not in ("worktree_head", "head_source")}
     if _readable_head(worktree_head):
-        head = worktree_head
+        head, source = worktree_head, "worktree"
     elif _readable_head(last_worktree_head):
-        head = last_worktree_head
+        if _readable_head(stamp.get("head")) and _later(stamp.get("ts"), last_worktree_head_at):
+            head, source = stamp["head"], "stamp_newer"
+        else:
+            head, source = last_worktree_head, "worktree_last"
     else:
-        return stamp
-    return dict(stamp, head=head, worktree_head=head)
+        clock.update(worktree_head=None, head_source="stamp")
+        return clock
+    clock.update(head=head, worktree_head=head, head_source=source)
+    return clock
+
+
+def _later(a, b):
+    """Is time `a` strictly after time `b`? Both must be real numbers (a bool is not a time); anything
+    else is "not proven later" — the caller then keeps what it already knew."""
+    real = lambda v: isinstance(v, (int, float)) and not isinstance(v, bool)
+    return real(a) and real(b) and a > b
 
 
 def usable_baseline(sig):

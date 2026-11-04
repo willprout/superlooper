@@ -4298,12 +4298,12 @@ class Runner:
                 i["status"] = "frozen"
                 i["last_recover_at"] = now
                 if i.get("progress_sig") is None:
-                    clock = events_mod.progress_clock(stamp, live_head, i.get("worktree_head"))
+                    prior, prior_at = i.get("worktree_head"), i.get("worktree_head_at")
+                    clock = events_mod.progress_clock(stamp, live_head, prior, prior_at)
                     sig = events_mod.progress_signature(clock)
                     if events_mod.usable_baseline(sig):   # only a readable-head sig; never poison None
                         i["progress_sig"] = sig
-                        if isinstance(clock, dict) and clock.get("worktree_head") is not None:
-                            i["worktree_head"] = clock["worktree_head"]
+                        self._remember_worktree_head(i, clock, prior, prior_at, now)
             self._update_issue(iid, fn=_anchor_frozen_baseline)
             if not self._has_session(iid):
                 self._mark_exited(iid, "frozen with no session recorded", now)
@@ -4409,16 +4409,25 @@ class Runner:
         i["probe_nonce"] = None
         i["probe_sent_at"] = None
         i["harvest_tried"] = False              # (#189) a new episode re-arms the one report rescue
-        i["worktree_head"] = None               # (#515) the last worktree HEAD the runner read
+        i["worktree_head"] = None               # (#515) the last HEAD known for the lane worktree
+        i["worktree_head_at"] = None            # (#515) ...and when it was first known
 
     @staticmethod
-    def _remember_worktree_head(i, a, prior):
-        """Keep the last worktree HEAD the runner read (issue #515): the action's, when it carries a
-        readable one, else what was already remembered. Survives an in-episode reset on purpose — it
-        is a fact about the worktree, not about the episode — because forgetting it is what would let
-        a stale stamp pass for a new commit on the next failed read."""
+    def _remember_worktree_head(i, a, prior, prior_at, now):
+        """Keep the last HEAD known for the lane worktree (issue #515) — the action's when it carries
+        a readable one, else what was already remembered — and WHEN it was first known. The time
+        moves only when the HEAD does: it answers "was this stamp written after the runner learned
+        that HEAD?", and a re-read of the same HEAD teaches nothing newer than the first read did.
+
+        It survives the reset of a NEW EPISODE inside one session (a report marker, a commit):
+        forgetting it there is what would let a stale stamp pass for a new commit on the next failed
+        read. A relaunch clears it with the rest of the episode (_reset_progress_clock); that is safe
+        because the relaunch clears `progress_sig` too, so the next read re-anchors from scratch."""
         head = a.get("worktree_head")
-        i["worktree_head"] = head if events_mod._readable_head(head) else prior
+        if not events_mod._readable_head(head):
+            head = prior
+        i["worktree_head"] = head
+        i["worktree_head_at"] = prior_at if head == prior else now
 
     def _exec_progress_advance(self, a, now):
         """Anchor the progress clock. Re-stamps progress_since to now; when the signature ACTUALLY
@@ -4430,13 +4439,13 @@ class Runner:
         changed = {"v": False}
 
         def m(st, i):
-            prior = i.get("worktree_head")
+            prior, prior_at = i.get("worktree_head"), i.get("worktree_head_at")
             if i.get("progress_sig") != sig:
                 self._reset_progress_clock(i)              # new episode: zero the probe counters
                 changed["v"] = True
             i["progress_sig"] = sig
             i["progress_since"] = now
-            self._remember_worktree_head(i, a, prior)      # (#515) the HEAD this was measured at
+            self._remember_worktree_head(i, a, prior, prior_at, now)   # (#515) measured at
         self._update_issue(iid, fn=m)
         if changed["v"]:
             _rm(os.path.join(self.state, "ack", iid))      # a new episode: last episode's ack is moot
@@ -4462,11 +4471,11 @@ class Runner:
         iid, sig = a["id"], a.get("sig")
 
         def m(st, i):
-            prior = i.get("worktree_head")
+            prior, prior_at = i.get("worktree_head"), i.get("worktree_head_at")
             self._reset_progress_clock(i)          # a fresh #157 episode (zero probe counters)...
             i["progress_sig"] = sig                # ...anchored at the advance we just measured
             i["progress_since"] = now
-            self._remember_worktree_head(i, a, prior)   # (#515) the HEAD it was measured at
+            self._remember_worktree_head(i, a, prior, prior_at, now)   # (#515) measured at
             i["status"] = "running"
             i["last_recover_at"] = None            # a later re-freeze nudges fresh, not on a stale clock
             i["sensed_state"] = None               # a working lane: drop any frozen-era screen reading

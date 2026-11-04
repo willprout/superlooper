@@ -22,16 +22,20 @@ LANE_HEAD_TIMEOUT = 5
 _OID_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
 # A FULL object id as `rev-parse` prints one: sha-1 (40) or sha-256 (64), lowercase.
 _FULL_OID_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+# Variables that pick a repository WITHOUT discovery. Inherited by the runner, any of them would make
+# lane_head answer about that repository instead of the lane directory it was asked about.
+_REPO_SELECTING_ENV = ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE",
+                       "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+                       "GIT_NAMESPACE", "GIT_PREFIX", "GIT_DISCOVERY_ACROSS_FILESYSTEM")
 
 
 def _git(cwd, *args, timeout=GIT_TIMEOUT, env=None):
-    """Run `git -C <cwd> <args>`. Returns (rc, combined output). Never raises: timeout, missing
-    binary, or any OSError becomes a nonzero rc with the message as output (fail closed). `env`
-    adds variables on top of the inherited environment."""
+    """Run `git -C <cwd> <args>`. Returns (rc, combined output: stdout, then stderr). Never raises:
+    timeout, missing binary, or any OSError becomes a nonzero rc with the message as output (fail
+    closed). `env`, when given, is the COMPLETE environment for git (default: inherited)."""
     try:
         r = subprocess.run(["git", "-C", os.fspath(cwd), *args],
-                           capture_output=True, text=True, timeout=timeout,
-                           env={**os.environ, **env} if env else None)
+                           capture_output=True, text=True, timeout=timeout, env=env)
         return (r.returncode, (r.stdout or "") + (r.stderr or ""))
     except subprocess.TimeoutExpired:
         return (124, f"git {' '.join(args)} timed out after {timeout}s")
@@ -119,10 +123,14 @@ def lane_head(worktree, timeout=LANE_HEAD_TIMEOUT):
         lane directory with no git of its own (or a stray, invalid `.git`) inside some other checkout
         would answer with THAT checkout's HEAD — a false "commit" the moment it differs. A `.git`
         entry must exist in the directory itself, and GIT_CEILING_DIRECTORIES stops discovery at its
-        parent. A pruned worktree (its gitdir gone) then fails outright.
+        parent. A pruned worktree (its gitdir gone) then fails outright. An inherited GIT_DIR (or
+        any of _REPO_SELECTING_ENV) would skip discovery altogether, so those are dropped.
       * BOUNDED. LANE_HEAD_TIMEOUT seconds, and the answer must be a full object id; a timeout, a
-        missing git, an unborn branch or any stray output is None. The caller reads None as
-        "unknown", never as movement (events.progress_clock)."""
+        missing git, an unborn branch or a non-oid answer is None. The caller reads None as
+        "unknown", never as movement (events.progress_clock).
+      * NOT INERT. The answer is git's first STDOUT line, as the Stop hook's own read takes it:
+        stderr chatter (GIT_TRACE, a config warning) must not turn every read into None — a read
+        that silently never works is a fix that shipped dead with a green suite."""
     try:
         p = os.fspath(worktree)
         if not os.path.lexists(os.path.join(p, ".git")):
@@ -130,10 +138,12 @@ def lane_head(worktree, timeout=LANE_HEAD_TIMEOUT):
         ceiling = os.path.dirname(os.path.realpath(p))
     except (OSError, TypeError, ValueError):
         return None
+    env = {k: v for k, v in os.environ.items() if k not in _REPO_SELECTING_ENV}
+    env.update(GIT_OPTIONAL_LOCKS="0", GIT_CEILING_DIRECTORIES=ceiling)
     rc, out = _git(p, "--no-optional-locks", "rev-parse", "--verify", "--quiet", "HEAD^{commit}",
-                   timeout=timeout,
-                   env={"GIT_OPTIONAL_LOCKS": "0", "GIT_CEILING_DIRECTORIES": ceiling})
-    oid = (out or "").strip()
+                   timeout=timeout, env=env)
+    lines = (out or "").splitlines()      # stdout comes first in _git's combined output
+    oid = lines[0].strip() if lines else ""
     return oid if rc == 0 and _FULL_OID_RE.match(oid) else None
 
 

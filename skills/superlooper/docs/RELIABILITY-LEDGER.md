@@ -277,8 +277,9 @@ delivered and answered `WORKING` with a valid nonce, and the cap parked the lane
 four commits in its worktree. A parked lane is never merged, so i1013's green PR needed a hand
 merge. Field record: #513. Fixed by #515 — the runner reads each running/frozen lane's worktree HEAD
 itself every tick (no lock taken, time-bounded, never an enclosing repo's HEAD), so a commit is
-progress within one tick for any agent; an unreadable read keeps the last HEAD it did read and is
-never movement. The probe channel's false `send_failed` (#516) and the stale herdr detection
+progress within one tick for any lane that has a progress clock, whether or not the worker rests; an
+unreadable read keeps the last HEAD the runner knew and is never movement, and a stamp written after
+that read still counts. The park memo now says where its HEAD came from. The probe channel's false `send_failed` (#516) and the stale herdr detection
 override (#517) were split out of the same report.
 
 ---

@@ -392,6 +392,32 @@ def test_lane_head_never_reads_an_enclosing_repo(repos):
     assert gitops.lane_head(stray) is None
 
 
+def test_lane_head_reads_past_stray_stderr(repos, tmp_path, monkeypatch):
+    # The answer is git's stdout line. A runner environment that makes git chatter on stderr
+    # (GIT_TRACE, a config warning) must not turn every read into None — that is a read that ships
+    # inert while the suite stays green.
+    lane = tmp_path / "worktrees" / "i2"
+    assert gitops.worktree_add(repos["wt"], lane, "sl/i2-y", "origin/main") is True
+    expected = _sh(lane, "rev-parse", "HEAD")
+    monkeypatch.setenv("GIT_TRACE", "1")
+    assert gitops.lane_head(lane) == expected
+
+
+def test_lane_head_ignores_an_inherited_git_dir(repos, tmp_path, monkeypatch):
+    # GIT_DIR / GIT_WORK_TREE in the runner's environment would skip discovery altogether and answer
+    # with whatever repo they name. The read is about THIS directory, so they are dropped.
+    lane = tmp_path / "worktrees" / "i2"
+    assert gitops.worktree_add(repos["wt"], lane, "sl/i2-y", "origin/main") is True
+    _init_identity(lane)
+    _commit_file(lane, "lane.txt", "x\n", "the lane moves on")
+    expected = _sh(lane, "rev-parse", "HEAD")
+    other = repos["dev"]
+    assert _sh(other, "rev-parse", "HEAD") != expected
+    monkeypatch.setenv("GIT_DIR", str(other / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(other))
+    assert gitops.lane_head(lane) == expected
+
+
 def test_lane_head_is_none_when_git_times_out_or_is_missing(repos, tmp_path, monkeypatch):
     lane = tmp_path / "worktrees" / "i2"
     assert gitops.worktree_add(repos["wt"], lane, "sl/i2-y", "origin/main") is True

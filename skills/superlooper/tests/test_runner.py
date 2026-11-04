@@ -1957,7 +1957,8 @@ def test_a_worktree_whose_head_never_moves_still_parks(rig):
     # The ladder is not softened: a readable worktree HEAD that stays put, a worker answering
     # WORKING every time — it is probed to the cap and parked, the i328 shape.
     wt = _real_git_lane(rig, "i5", "sl/i5-x")
-    _stamp(rig, "i5", _git_sh(wt, "rev-parse", "HEAD"), wt)
+    head = _git_sh(wt, "rev-parse", "HEAD")
+    _stamp(rig, "i5", head, wt)
     seed_issue(rig, "i5", status="running", branch="sl/i5-x")
     (rig.home / "state" / "panes" / "i5").write_text("surf-uuid")
     now, parked = NOW, None
@@ -1973,6 +1974,9 @@ def test_a_worktree_whose_head_never_moves_still_parks(rig):
     assert 1 <= len(_probe_calls(rig)) <= 3
     # today's schedule: anchor at the first tick, stall at 15 min, probes 5 min apart, park at the cap
     assert parked - NOW == 900 + 3 * 300
+    assert issue_state(rig, "i5")["worktree_head"] == head     # the READ took part, not just the stamp
+    memo = [m for m in mutations(rig) if m["kind"] == "comment" and "progress-stall" in m["body"]]
+    assert memo and "read from the lane worktree" in memo[-1]["body"]
 
 
 def test_an_unreadable_worktree_head_never_counts_and_never_raises(rig, monkeypatch):
@@ -2028,7 +2032,7 @@ def test_the_frozen_baseline_is_anchored_from_the_worktree_head(rig):
     st = issue_state(rig, "i5")
     assert st["status"] == "frozen"
     assert st["progress_sig"] == events.progress_signature({"head": y})
-    assert st["worktree_head"] == y
+    assert st["worktree_head"] == y and st["worktree_head_at"] == NOW
 
 
 def test_exec_progress_advance_remembers_the_worktree_head_and_relaunch_forgets_it(rig):
@@ -2037,14 +2041,26 @@ def test_exec_progress_advance_remembers_the_worktree_head_and_relaunch_forgets_
                progress_since=NOW - 50)
     rig.r._execute({"act": "progress_advance", "id": "i101", "sig": "Y|False|False",
                     "worktree_head": "Y"}, NOW)
-    assert issue_state(rig, "i101")["worktree_head"] == "Y"
+    st = issue_state(rig, "i101")
+    assert st["worktree_head"] == "Y" and st["worktree_head_at"] == NOW
     # A new episode (the report marker flipped) with no worktree read this tick keeps the last HEAD
-    # the runner read: dropping it would let the stale stamp pass for a new commit next tick.
+    # the runner read: dropping it would let the stale stamp pass for a new commit next tick. Its
+    # time is when that HEAD was first known, not this tick — a stamp written between the two is
+    # still newer evidence than the read.
     rig.r._execute({"act": "progress_advance", "id": "i101", "sig": "Y|True|False"}, NOW + 5)
-    assert issue_state(rig, "i101")["worktree_head"] == "Y"
+    st = issue_state(rig, "i101")
+    assert st["worktree_head"] == "Y" and st["worktree_head_at"] == NOW
+    rig.r._execute({"act": "progress_advance", "id": "i101", "sig": "Y|True|False",
+                    "worktree_head": "Y"}, NOW + 6)              # a re-read of the same HEAD
+    assert issue_state(rig, "i101")["worktree_head_at"] == NOW
+    rig.r._execute({"act": "progress_advance", "id": "i101", "sig": "Z|True|False",
+                    "worktree_head": "Z"}, NOW + 7)
+    st = issue_state(rig, "i101")
+    assert st["worktree_head"] == "Z" and st["worktree_head_at"] == NOW + 7
     out = rig.r._execute({"act": "recover", "id": "i101", "tier": "exited"}, NOW + 10)
     assert out == "ok"
-    assert issue_state(rig, "i101").get("worktree_head") is None   # a relaunch is a fresh episode
+    st = issue_state(rig, "i101")
+    assert st.get("worktree_head") is None and st.get("worktree_head_at") is None   # fresh episode
 
 
 def test_post_question_posts_durable_comment_releases_lane(rig):
