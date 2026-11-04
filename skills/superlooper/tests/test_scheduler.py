@@ -486,13 +486,15 @@ def test_restore_green_draws_on_the_build_pool_and_never_borrows_the_investigati
                                       territory_claims=lanes)) == [1]
 
 
-def test_restore_green_takes_only_one_free_lane_even_when_more_are_free():
-    # One fix, one lane: the exemption never multiplies a candidate.
-    q = [_restore_green(1)]
+def test_restore_green_spends_only_the_free_lane_it_finds_never_one_more():
+    # The per-candidate capacity check runs BEFORE the exemption. `lanes: 2`, one running lane, and
+    # TWO exempt fixes (one freeze can file several fingerprints): the first takes the one free lane,
+    # the second is lane-bound — never a third lane, and never an affinity hold to narrate.
+    q = [_restore_green(1), _restore_green(2)]
     lanes = [{"id": "i9", "type": "build", "touches": ["frontend"]}]
-    out = scheduler.launchable(q, lanes, _cfg(lanes=4, affinity="hard"), OK, set(), True,
-                               territory_claims=lanes)
-    assert _nums(out) == [1]
+    cfg = _cfg(lanes=2, affinity="hard")
+    assert _nums(scheduler.launchable(q, lanes, cfg, OK, set(), True, territory_claims=lanes)) == [1]
+    assert _holds(q, lanes, cfg, OK, set(), True, territory_claims=lanes) == []
 
 
 def test_restore_green_ignores_a_lane_launching_this_same_tick_while_frozen():

@@ -2192,6 +2192,45 @@ def test_restore_green_hold_behind_a_finished_claim_says_so_and_when_it_releases
     _assert_no_narrowing_advice(reason)
 
 
+def _fix_running_view():
+    lane = [{"id": "i1044", "touches": ["*"], "type": "diagnose-and-fix"}]
+    issues = {"i1044": ist("running", declared_touches=["*"], type="diagnose-and-fix")}
+    fix_live = parsed(1044, labels=("in-progress", "type:diagnose-and-fix",
+                                    "auto-approved:nightly-red", "expedite", "source:qa"),
+                      touches=("*",))
+    return lane, issues, fix_live
+
+
+def test_a_candidate_held_behind_the_inflight_fix_is_not_told_to_narrow_anything():
+    # The other side of #518's misdirection: during a freeze every merge-producing candidate waits
+    # behind the running fix's `*`. Its hold must not call that a missing declaration or invite
+    # narrowing either side — no declaration would let it co-schedule with a wildcard.
+    lane, issues, fix_live = _fix_running_view()
+    for frozen in (True, False):
+        d = _frozen_disk(issues_state={"version": 1, "issues": dict(issues)}) if frozen \
+            else disk(issues_state={"version": 1, "issues": dict(issues)})
+        out = decide(config=cfg(lanes=3), parsed_issues=[fix_live, parsed(5)], lane_state=lane,
+                     dsk=d, gh_view=ghv(dev_checks=list(RED if frozen else GREEN)))
+        assert only(out, "launch") == [], frozen
+        wh = only(out, "wildcard_hold")
+        assert len(wh) == 1 and wh[0]["id"] == "i5" and wh[0]["blocker"] == "i1044", frozen
+        reason = wh[0]["reason"]
+        assert "restore-green fix" in reason and "touches: *" in reason, reason
+        assert "releases" in reason or "waits until" in reason, reason
+        _assert_no_narrowing_advice(reason)
+
+
+def test_a_blocker_missing_from_the_view_falls_back_to_the_generic_prose():
+    # The blocker's standing-rule label is read from this tick's GitHub view; with no readable
+    # entry nothing can vouch for it, so the hold keeps the generic #36 wording (prose only — the
+    # hold itself is decided by the scheduler either way).
+    lane, issues, _ = _fix_running_view()
+    out = decide(config=cfg(lanes=3), parsed_issues=[parsed(5)], lane_state=lane,
+                 dsk=disk(issues_state={"version": 1, "issues": issues}))
+    wh = only(out, "wildcard_hold")
+    assert len(wh) == 1 and "restore-green" not in wh[0]["reason"]
+
+
 def test_an_ordinary_wildcard_hold_keeps_its_original_prose():
     # Every other candidate's hold reads exactly as before — only the restore-green fix's changed.
     lane = [{"id": "i9", "touches": ["frontend"], "type": "build"}]

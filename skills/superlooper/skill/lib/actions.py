@@ -1499,11 +1499,11 @@ def _restore_green_hold_reason(h):
     if h.get("blocker_kind") == "claim":
         what = (f"finished lane {blocker}'s PR is waiting at the merge gate and still holds its "
                 "territory claim (it occupies no lane); that claim releases when the PR merges, "
-                f"or when {blocker} is parked or requeued")
+                f"or when {blocker} is parked, requeued or waiting on an owner answer")
     else:
         what = (f"running lane {blocker} overlaps it; that territory releases when {blocker}'s PR "
-                f"merges, or when {blocker} is parked or requeued (a finished lane keeps its claim "
-                "while its PR waits at the gate)")
+                f"merges, or when {blocker} is parked, requeued or waiting on an owner answer (a "
+                "finished lane keeps its claim while its PR waits at the gate)")
     why = ("Merges are not frozen, so ordinary anti-affinity applies: the restore-green exemption "
            "is freeze-only, and the moment merges freeze this fix stops waiting on any lane or "
            "claim (issues #294, #519).")
@@ -1520,6 +1520,14 @@ def _wildcard_hold_reason(h):
     if h.get("restore_green"):
         return _restore_green_hold_reason(h)
     blocker = h.get("blocker_id")
+    if h.get("blocker_restore_green"):
+        # issue #519: held BEHIND the in-flight restore-green fix. Its `*` overlaps every lane by
+        # design, so no declaration on either side would let this co-schedule — narrowing advice
+        # here is the same misdirection #518 recorded, reached from the other side.
+        return (f"launch held: in-flight lane {blocker} is the restore-green fix, whose `touches: *` "
+                "is engine-written on purpose (its scope is unknown until diagnosed) and overlaps "
+                "every lane under hard affinity — so this waits until that fix's PR merges or it "
+                "parks. Leave the declarations as they are.")
     if h.get("self_wildcard") and h.get("blocker_wildcard"):
         why = (f"it and in-flight lane {blocker} both declare no `touches:` (wildcard '*'), which "
                "overlaps every lane under hard affinity")
@@ -3827,6 +3835,13 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
             if hid in selected_ids or (hist.get("wildcard_hold_journaled")
                                        and hist.get("wildcard_hold_generation") == hold_generation):
                 continue
+            # issue #519: is the BLOCKER the standing-rule fix? Read from its LIVE labels in this
+            # tick's GitHub view (loopstate carries none) — absent from the view reads False, which
+            # only costs the generic prose, never a hold decision.
+            bp = parsed_by_id.get(h.get("blocker_id")) if isinstance(h.get("blocker_id"), str) \
+                else None
+            h = dict(h, blocker_restore_green=isinstance(bp, dict)
+                     and gate.restore_green(bp.get("labels")))
             out.append({"act": "wildcard_hold", "id": hid, "num": h.get("num"),
                         "blocker": h.get("blocker_id"), "blocker_kind": h.get("blocker_kind"),
                         "generation": hold_generation,

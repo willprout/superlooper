@@ -189,8 +189,13 @@ def _freeze_exempt_launch(candidate, frozen):
 
     Why overlapping a live lane is safe here: lanes build in separate worktrees, so there are never
     two writers in one tree; and the gate's overlap step (touch_verdict) holds the OTHER lane's merge
-    while this fix is in flight — #518 shows it: i1031's PR held "diff overlaps in-flight lane i1044"
-    and merged after the fix. Worst case is a rebase, and a rebase beats a mainline held red.
+    while this fix is in flight — #518 shows it: i1031's PR held behind in-flight i1044 and merged
+    after the fix. The cost is a rebase, and a rebase beats a mainline held red.
+
+    What this does NOT bound: the fix's OWN merge. That same overlap step holds the fix's PR behind
+    any lane still in flight when it finishes, if the fix's diff overlaps that lane's declared
+    touches or maps to `*`, and it runs before the freeze step the fix crosses. A lane that stays
+    stuck can therefore still hold the mainline red one stage later — owner decision filed as #522.
 
     Why `frozen` gates it: the whole justification is a mainline that cannot release territory. On a
     green mainline claims release on their own within a tick or two, and a fix issue that outlived
