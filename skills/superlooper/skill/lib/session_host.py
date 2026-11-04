@@ -19,10 +19,13 @@ each is named where it is enforced so a later reader can tell doctrine from para
   prompts typed their text, dropped the submission, and returned ``agent_prompted`` rc=0 in under a
   second. And rc is not evidence in either direction — even a settled ``--wait`` rc=0 means
   "queued" — so delivery is proven transcript-side, through an injected oracle, or the send raises.
-  WHICH failure it raises matters as much as that it raises: a host that REFUSED the call is a
-  channel fault (``HostError``, retry it), while a call the host accepted and the oracle could not
-  confirm is ``DeliveryUnproven`` (something was typed). Conflating them makes a caller spend a
-  one-shot nudge on a message the host never carried.
+  WHICH failure it raises matters as much as that it raises: a host that refused the call BEFORE
+  typing anything is a channel fault (``HostError``, retry it), while a call the host accepted and
+  the oracle could not confirm is ``DeliveryUnproven`` (something was typed) — and so is a refusal
+  the host only gives after submission, or on either side of it (issue #516: herdr's
+  ``timeout: timed out waiting for agent status`` arrives with the prompt already in the pane).
+  Conflating them either way is a lie: one spends a one-shot nudge on a message the host never
+  carried, the other tells an operator a delivered prompt never arrived.
   A post-revive first prompt stalls even with ``--wait`` (5/5), so a REVIVED send chases
   ``send-keys enter``; that chaser stays until the pinned-build retest (#302) says otherwise.
   A revived send must also carry the re-orientation preamble (#298) — a revived session remembers
@@ -148,6 +151,46 @@ _GONE_CODES = re.compile(r"not[_ ]?found|no[_ ]?such|does[_ ]?not[_ ]?exist")
 _WORKSPACE_GONE_CODES = re.compile(
     r"workspace[_ ](?:not[_ ]?found|does[_ ]?not[_ ]?exist)|no[_ ]?such[_ ]workspace")
 
+# Which `agent prompt --wait` refusals prove NOTHING WAS TYPED (issue #516) — the only ones `send`
+# may report as a channel fault. Read from the pinned herdr v0.8.0 (346411fa), not inferred from
+# the wording. Its `--wait` contract (src/cli/spec.rs, `agent prompt` after_help): "When submission
+# starts from a non-working state, --wait first requires an observed state change within 5000ms;
+# otherwise it returns agent_prompt_stalled. A shorter --timeout returns timeout instead. It then
+# matches idle, done, or blocked ... Without --timeout, the settled-state wait is indefinite." Both
+# of those waits run AFTER submission. The order in the source (src/api/wait.rs `prompt_agent`):
+#
+#   1. CLI side (src/cli.rs `send_request`): connect and check the protocol, then send the request.
+#   2. Server: the fence (our carried patch) answers an unauthenticated caller before dispatch.
+#   3. `agent_get` on the target — its error is returned as is (the target was never written to).
+#   4. The app's `handle_agent_prompt` (src/app/api/agents.rs): it resolves the target, checks it
+#      is a ready agent, then WRITES the text to the pane (`try_send_bytes`) and schedules Enter
+#      300ms later. Every refusal it gives comes before that write — except one `agent_not_found`
+#      after it, guarded by the same lookups that passed a moment earlier in the same synchronous
+#      handler, and so unreachable in practice.
+#   5. Only after the app ACCEPTED the prompt: the identity re-check (`agent_not_running`), the
+#      5000ms effect wait (`agent_prompt_stalled`; plain `timeout` when --timeout <= 5000), and the
+#      settled-state wait (`timeout`: "timed out waiting for agent status"). A busy worker that stays
+#      `working` past our --timeout produces that last one with the prompt already in the pane —
+#      #513's six probes, which were enqueued in ~3s and answered with a nonce-valid ack.
+#
+# So the codes below are refused at steps 1-4 and NOWHERE ELSE. Everything else — the step-5 codes,
+# `server_unavailable` and `internal_error` (step 3's lookup can return them before the write, and
+# the lookups in step 5's waits can return them after it), a code this list does not know, and a
+# call that ended without the host's envelope at all — cannot prove non-delivery, so `send` reports
+# it as DeliveryUnproven. A code joins this set only against herdr's source, never by its wording.
+_REFUSED_BEFORE_SUBMISSION = frozenset({
+    "unauthorized",            # the fence (vendor/herdr patch): refused before dispatch
+    "server_not_running",      # src/cli.rs: no server at the socket, the request was never sent
+    "protocol_mismatch",       # src/cli.rs `ensure_server_protocol_compatible`: checked before send
+    "agent_not_found",         # step 3 / step 4's target resolution; inside the waits herdr
+                               # reports a vanished agent as `agent_not_running` instead
+                               # (`agent_wait_probe_error`), so this code never means "after"
+    "agent_target_ambiguous",  # step 4: the target named more than one agent
+    "agent_not_ready",         # step 4: not a ready agent, or no longer the pane's foreground
+    "empty_agent_prompt",      # step 4: refused before anything else
+    "agent_prompt_failed",     # step 4: the write itself failed — no byte reached the pane
+})
+
 # --------------------------------------------------------------------------- the fence (#305)
 # Token auth on the host's control socket, carried as a patch against the pinned release
 # (vendor/herdr/). The patch is what ENFORCES it — inside the host process, where a worker cannot
@@ -239,6 +282,8 @@ _SESSION_NAME_RE = re.compile(r"\A[A-Za-z0-9._-]{1,64}\Z")
 _MAX_REPLY_BYTES = 4 * 1024 * 1024
 
 _DEFAULT_BINARY = "herdr"
+_RC_NO_ANSWER = 124                # the probe killed a call at its bound: it may have done anything
+_RC_COULD_NOT_RUN = 127            # the probe could not execute the binary: it did nothing at all
 _CALL_SECONDS = 20                 # a control call that hangs is a dead host, not a slow one
 _PROMPT_TIMEOUT_MS = 120000        # the host's own documented prompt wait
 _START_TIMEOUT_MS = 30000          # its documented agent-start default, named rather than implied
@@ -475,9 +520,11 @@ class Probe:
         except subprocess.TimeoutExpired:
             # 124 like the shell's timeout(1), and like stack_doctor's probe: a host that does not
             # answer is a host we know nothing through, which every caller here reads as UNKNOWN.
-            return subprocess.CompletedProcess(argv, 124, "", "no answer within %ss" % timeout)
+            return subprocess.CompletedProcess(argv, _RC_NO_ANSWER, "",
+                                               "no answer within %ss" % timeout)
         except (OSError, ValueError):
-            return subprocess.CompletedProcess(argv, 127, "", "could not run %s" % (argv[:1],))
+            return subprocess.CompletedProcess(argv, _RC_COULD_NOT_RUN, "",
+                                               "could not run %s" % (argv[:1],))
 
     def pid_alive(self, pid):
         """Is this pid a RUNNING process?
@@ -619,6 +666,23 @@ def _is_gone(reply):
         return False
     code = (reply.error or "").split(":", 1)[0].strip().lower()
     return bool(_GONE_CODES.search(code))
+
+
+def _refused_before_submission(reply):
+    """Did this refusal of `agent prompt --wait` happen before anything was typed? (issue #516)
+
+    Only a POSITIVE answer counts. The host SPOKE with a code `_REFUSED_BEFORE_SUBMISSION` lists,
+    or the binary never ran at all (the probe's `_RC_COULD_NOT_RUN`: nothing executed, so nothing
+    was typed). A call that ran and ended without the host's envelope — killed at our own bound
+    (`_RC_NO_ANSWER`), or answered with something that is not one — may have died anywhere,
+    including after the write, so it does not prove non-delivery.
+    """
+    if reply.ok:
+        return False
+    if not reply.spoke:
+        return reply.rc == _RC_COULD_NOT_RUN
+    code = (reply.error or "").split(":", 1)[0].strip().lower()
+    return code in _REFUSED_BEFORE_SUBMISSION
 
 
 def _workspace_is_gone(reply):
@@ -1178,19 +1242,36 @@ class SessionHost:
                 name, argv, ms, delivery, mark, reply, landed,
                 recorded=session.shell_pid if isinstance(session, Session) else None)
         if landed is not True and not reply.ok:
-            # THE HOST REFUSED THE CALL — an unresolvable name, a timeout, a missing binary, or its
-            # own `agent_prompt_stalled`. That is a CHANNEL fault and it must not wear the delivery
-            # oracle's costume: `DeliveryUnproven` says "we typed and could not confirm it", and a
+            # THE HOST REFUSED THE CALL, and WHEN it refused decides what that means (issue #516;
+            # the herdr contract is laid out at `_REFUSED_BEFORE_SUBMISSION`).
+            #
+            # Refused BEFORE anything was typed — an unresolvable name, a fenced socket, a pane that
+            # is not a ready agent, a binary that never ran: a CHANNEL fault, and it must not wear the
+            # delivery oracle's costume. `DeliveryUnproven` says "it may be in the pane", and a
             # caller with a one-shot key (the gate's single handback) spends that key and then parks
             # the lane with a memo blaming a worker for ignoring a message the host never carried.
             # A refused call is exactly what a caller should RETRY, so it raises the base error.
             #
-            # Ordered before the revive chaser deliberately: chasing Enter into a pane whose prompt
-            # call was refused presses Enter for no reason, and a stray Enter SELECTS.
-            raise HostError("[%s] the host refused the prompt (rc=%s%s) — nothing was carried to "
-                            "the session, so this is a channel fault rather than an unproven "
-                            "delivery" % (name, reply.rc,
-                                          "; " + reply.error if reply.error else ""))
+            # Refused AFTER the text was written — herdr's own `timeout` ("timed out waiting for
+            # agent status") and `agent_prompt_stalled`, raised only by the waits that follow
+            # submission — or by anything that cannot be placed: that is the opposite mistake. It
+            # used to raise the base error too, and #513's field record has six probes journaled
+            # "nothing was carried to the session" that the worker had queued within ~3s and
+            # answered with a nonce-valid ack. A refusal that does not prove non-delivery is an
+            # unproven delivery, and a caller must not re-submit it blindly.
+            #
+            # Both are raised before the revive chaser, deliberately: chasing Enter into a pane whose
+            # prompt was refused before typing presses Enter for no reason, and #516 renamed the
+            # post-submission verdict without adding a keystroke. A stray Enter SELECTS.
+            refusal = "rc=%s%s" % (reply.rc, "; " + reply.error if reply.error else "")
+            if _refused_before_submission(reply):
+                raise HostError("[%s] the host refused the prompt before typing it (%s) — nothing "
+                                "was carried to the session, so this is a channel fault rather "
+                                "than an unproven delivery" % (name, refusal))
+            raise DeliveryUnproven(
+                "[%s] the host refused the prompt in a way that does not prove it was never typed "
+                "(%s) — herdr raises this after submission, or on either side of it, so the prompt "
+                "may have been delivered, and nothing proved that it was" % (name, refusal))
         chased = False
         if landed is not True and (revived or restored):
             # 5/5 in the spikes: a post-revive first prompt lands in the composer unsubmitted even

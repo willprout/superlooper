@@ -49,6 +49,19 @@ STUB_HOST = textwrap.dedent("""\
         emit({"process_info": {"shell_pid": int(os.environ["STUB_SHELL_PID"])}})
     if (group, verb) == ("agent", "prompt"):
         text = rest[1]
+        refusal = os.environ.get("STUB_PROMPT_REFUSAL")
+        if refusal:
+            code, message = refusal.split("|", 1)
+            if os.environ.get("STUB_PROMPT_QUEUED"):
+                # A busy session QUEUES a mid-turn prompt: Claude writes a queue-operation record,
+                # not a `user` entry, until the turn drains it (#513's field record).
+                with open(os.environ["STUB_TRANSCRIPT"], "a") as f:
+                    f.write(json.dumps({"type": "queue-operation", "operation": "enqueue",
+                                        "content": text}) + "\\n")
+            # herdr's CLI prints a refusal envelope on stderr and exits 1 (src/cli.rs print_response).
+            sys.stderr.write(json.dumps({"id": "stub", "error": {"code": code,
+                                                                  "message": message}}) + "\\n")
+            sys.exit(1)
         if os.environ.get("STUB_DROP_SUBMISSION"):
             # rc=0 with nothing submitted: the measured false green (6/6 in the spikes). The text
             # sits in the composer, so it never reaches the transcript.
@@ -186,6 +199,31 @@ def test_a_dropped_submission_is_refused_however_cheerful_the_rc(tmp_path):
     # typed" would re-submit into a live worker on every tick of an unbounded retry.
     assert r.returncode == 7, f"an unproven send must be rc=7, got {r.returncode}: {r.stderr}"
     assert "state=unproven" in r.stderr
+
+
+def test_a_prompt_herdr_timed_out_on_after_queueing_it_is_unproven_not_failed(tmp_path):
+    """#516, driven through the real script. #513's six probes: the worker was busy, so the prompt
+    was queued mid-turn, and herdr's settled-state wait ran out — `timeout: timed out waiting for
+    agent status`, which herdr only raises after submission. That is rc=7 ("possibly delivered"),
+    never rc=1's "nothing was delivered and the session never saw the message"."""
+    rig = _setup(tmp_path)
+    r = _run(*rig, over={"STUB_PROMPT_REFUSAL": "timeout|timed out waiting for agent status",
+                         "STUB_PROMPT_QUEUED": "1"})
+    assert r.returncode == 7, f"a post-submission refusal must be rc=7, got {r.returncode}: {r.stderr}"
+    assert "state=unproven" in r.stderr
+    assert "timed out waiting for agent status" in r.stderr, "herdr's own words ride out"
+    assert "nothing was carried" not in r.stderr
+    assert '"queue-operation"' in rig[3].read_text(), "the prompt really was queued in the session"
+
+
+def test_a_prompt_herdr_refused_before_typing_is_still_a_failed_send(tmp_path):
+    # The other half: `agent_not_ready` is returned by herdr's prompt handler before it writes a
+    # byte to the pane, so this is the channel fault rc=1 always meant.
+    rig = _setup(tmp_path)
+    r = _run(*rig, over={"STUB_PROMPT_REFUSAL":
+                         "agent_not_ready|agent i1 is no longer the pane foreground process"})
+    assert r.returncode == 1, f"a pre-submission refusal must stay rc=1, got {r.returncode}: {r.stderr}"
+    assert "state=send_failed" in r.stderr and "nothing was carried" in r.stderr
 
 
 # ------------------------------------------------------------------ the refusals

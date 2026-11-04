@@ -36,8 +36,10 @@ incident, and collapsing any two of them is how the loop forgets which one it is
 EXIT CODES (load-bearing — the runner branches on these):
   0 = SENT, and PROVEN delivered. Note "delivered" is still not "a turn was taken": mid-generation
       input is queued, and the runner confirms real progress through activity/report, as before.
-  1 = FAILED. The host refused the send, the id cannot address an agent, or this agent has no
-      delivery oracle at all — a channel fault, not the session's.
+  1 = FAILED. The host refused the send BEFORE typing it, the id cannot address an agent, or this
+      agent has no delivery oracle at all — a channel fault, not the session's. Nothing was typed.
+      (A host refusal that does not prove that — herdr's post-submission `timeout` and
+      `agent_prompt_stalled` among them — is 7, not 1: issue #516.)
   3 = DEFERRED. NOTHING WAS TYPED and the session may be perfectly healthy: the host could not
       vouch for the pane, its advisory says the agent is waiting on a person, or the session has
       written no record this can judge it from. Caller retries later.
@@ -52,10 +54,11 @@ EXIT CODES (load-bearing — the runner branches on these):
       was typed. This is a LIVE, working session — surface it, never escalate it.
 
   7 = SUBMITTED BUT UNPROVEN. The prompt WAS handed to the host — the wrapper submits and only then
-      consults the oracle — and nothing could confirm it arrived. Distinct from 3 for one concrete
-      reason: 3 promises nothing was typed, and a caller whose retry is unbounded (the gate's one
-      nudge per cause) would otherwise re-SUBMIT a real prompt into a live worker every tick,
-      forever. A caller that spends a one-shot key must spend it here.
+      consults the oracle — and nothing could confirm it arrived; or the host refused it in a way
+      that does not prove it was never typed (issue #516), so it may be in the pane. Distinct from
+      3 for one concrete reason: 3 promises nothing was typed, and a caller whose retry is unbounded
+      (the gate's one nudge per cause) would otherwise re-SUBMIT a real prompt into a live worker
+      every tick, forever. A caller that spends a one-shot key must spend it here.
 
 5 and 6 are refusals exactly like 3; they differ only in telling the caller WHY, which is the whole
 point. The old single "deferred" made a dead-auth session, a session asking a question and a
@@ -90,6 +93,8 @@ SENT, FAILED, DEFERRED, DEAD, LOGGED_OUT, AT_DIALOG, UNPROVEN = 0, 1, 3, 4, 5, 6
 #
 # 30s for the prompt is generous for a doorbell: the host's own documented behaviour is to refuse
 # with `agent_prompt_stalled` if a non-working pane shows no lifecycle change within five seconds.
+# A worker that stays `working` past the 30s gets `timeout: timed out waiting for agent status`
+# instead. Both come AFTER the prompt was typed (issue #516), so both read as rc=7, not rc=1.
 CALL_SECONDS = 10
 PROMPT_TIMEOUT_MS = 30000
 
@@ -239,10 +244,12 @@ def nudge(run_root, iid, message, agent="claude", env=None, edges=None):
         host.send(session, message, delivery=oracle)
     except session_host.DeliveryUnproven as e:
         # NOT a plain defer: `send` submits the prompt and consults the oracle afterwards, so this
-        # branch means "it was typed and nothing confirmed it". Telling a caller otherwise is how an
+        # branch means "it was (or may have been) typed and nothing confirmed it" — including a host
+        # refusal herdr only gives after submission (#516). Telling a caller otherwise is how an
         # unbounded retry turns into re-submitting a real prompt into a live worker every tick.
         return Outcome(UNPROVEN, "unproven", detail=_bound(str(e)))
     except session_host.HostError as e:
+        # Only a refusal the wrapper could PROVE came before anything was typed reaches here (#516).
         return Outcome(FAILED, "send_failed", detail=_bound(str(e)))
     return Outcome(SENT, "idle")
 
@@ -264,8 +271,8 @@ def evidence_line(iid, outcome):
 _WHY = {
     FAILED: "the message could not be sent",
     DEFERRED: "deferring — nothing was typed",
-    UNPROVEN: "the prompt was submitted and nothing confirmed it arrived — caller must not re-send "
-              "blindly",
+    UNPROVEN: "the prompt was (or may have been) submitted and nothing confirmed it arrived — "
+              "caller must not re-send blindly",
     DEAD: "the session is DEAD (the agent process is gone) — not typing; caller must restart",
     LOGGED_OUT: "session auth is DEAD in-session — not typing; caller must alert the owner",
     AT_DIALOG: "session is asking a question in-window — not typing; live, not stuck",

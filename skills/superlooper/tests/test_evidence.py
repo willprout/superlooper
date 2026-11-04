@@ -188,6 +188,21 @@ def test_a_failed_send_is_not_a_refusal():
     assert evidence.build("nudge", rc=1, captured="[nudge] send failed")["reason"] == "send_failed"
 
 
+def test_only_send_failed_may_say_the_session_never_saw_the_message():
+    """#516: an operator reads `detail` to decide whether to hunt for a dead channel. rc=1 is now
+    ONLY a refusal the host gave before typing; a post-submission refusal (herdr's `timeout: timed
+    out waiting for agent status`) is rc=7, and its text must not claim a non-delivery — #513's six
+    probes were queued and acked while the journal said the session never saw them."""
+    failed = evidence.build("nudge", rc=1, captured="[nudge] i5 state=send_failed")
+    unproven = evidence.build("nudge", rc=7, captured=(
+        "[nudge] i5 state=unproven — the host refused the prompt in a way that does not prove "
+        "it was never typed (rc=1; timeout: timed out waiting for agent status)"))
+    assert failed["reason"] == "send_failed" and "before typing" in failed["detail"]
+    assert unproven["reason"] == "send_unproven"
+    assert "never saw" not in unproven["detail"] and "nothing was delivered" not in unproven["detail"]
+    assert "timed out waiting for agent status" in unproven["captured"]
+
+
 # ---------------------------------------------------------------- the park memo
 
 def test_the_park_memo_names_the_captured_diagnostic():
