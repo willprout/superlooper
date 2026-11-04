@@ -5,6 +5,8 @@ marker-EXISTENCE resolution test in particular is the P0 where frozen-recovery r
 finished sessions and deleted their reports. Rotation/ring/stall/ship cases are NOT ported:
 that machinery died with the standing orchestrator (enforcement by absence).
 """
+import json
+
 import events
 
 
@@ -598,6 +600,13 @@ def test_a_stamp_newer_than_the_last_worktree_read_wins_over_it():
         odd = events.progress_clock(dict(newer, ts=ts), worktree_head=None,
                                     last_worktree_head="Y", last_worktree_head_at=200)
         assert odd["head"] == "Y", ts
+    # ...and an integer past float range (json.loads yields one from a corrupt stamp) must not raise
+    # into the tick — math.isfinite would OverflowError on it. It is a finite time, so it compares.
+    huge = json.loads('{"ts": 1%s}' % ("0" * 400))["ts"]
+    for kw in ({"ts": huge}, {}):
+        c = events.progress_clock(dict(newer, **kw), worktree_head=None, last_worktree_head="Y",
+                                  last_worktree_head_at=huge if not kw else 200)
+        assert c["head"] in ("Y", "Z")
     # ...and a newer stamp whose own read failed carries no HEAD to prefer.
     blind = events.progress_clock(dict(newer, head=None), worktree_head=None,
                                   last_worktree_head="Y", last_worktree_head_at=200)

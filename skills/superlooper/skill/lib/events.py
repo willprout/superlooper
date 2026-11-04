@@ -157,9 +157,11 @@ def progress_clock(stamp, worktree_head=None, last_worktree_head=None,
 def _later(a, b):
     """Is time `a` strictly after time `b`? Both must be finite real numbers (a bool is not a time,
     and json.loads happily yields Infinity/NaN); anything else is "not proven later" — the caller
-    then keeps what it already knew."""
+    then keeps what it already knew. An int is always finite and is never handed to math.isfinite,
+    which would raise OverflowError on one past float range (a corrupt stamp's `ts`) — and a raise
+    here escapes decide into the tick."""
     def real(v):
-        return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+        return type(v) is int or (type(v) is float and math.isfinite(v))
     return real(a) and real(b) and a > b
 
 
