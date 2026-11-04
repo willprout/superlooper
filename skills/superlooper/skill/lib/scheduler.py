@@ -12,11 +12,12 @@ Three gates, in order:
   3. ANTI-AFFINITY: under hard affinity, a merge-producing issue whose declared touch-areas
      overlap a merge-producing running lane, held territory claim, or one already selected this
      tick is HELD.
-     Investigations do not produce PRs or merges, so they are exempt in both directions. The
-     standing-rule restore-green fix is exempt from FINISHED-but-unmerged territory claims only
-     (issue #294 — those claims cannot release while the mainline it exists to fix is frozen);
-     running lanes still hold it. Under soft affinity the overlap is allowed and flagged
-     (symmetrically) for the journal.
+     Investigations do not produce PRs or merges, so they are exempt in both directions. While
+     merges are FROZEN, the standing-rule restore-green fix is exempt from all of it — finished-
+     but-unmerged territory claims (issue #294: they cannot release while the mainline it exists to
+     fix is frozen) AND running lanes (issue #519: a running lane stuck where nobody is watching
+     need not end either). On a green mainline it is held like anything else. Under soft affinity
+     the overlap is allowed and flagged (symmetrically) for the journal.
 
 Eligibility itself (agent-ready, valid type, blocked-by closed) lives in issues.eligible.
 `launch_ok` welds that to the usage rule as the ONE gate every path that starts or restarts a
@@ -157,38 +158,49 @@ def _merge_affinity_subject(itype):
 
 def _restore_green(parsed):
     """Is this the standing-rule restore-green fix (spec §4.4)? Delegates to gate.restore_green so
-    the LAUNCH exemption here (#294) and the gate's FREEZE exemption (#295) read the same fact the
+    the LAUNCH exemption here (#294/#519) and the gate's FREEZE exemption (#295) read the same fact the
     same way — two exemptions that disagreed about which issue is the standing-rule fix would put
     the loop right back in a half-escaped deadlock."""
     return gate.restore_green(parsed.get("labels"))
 
 
-def _claim_exempt(candidate, blocker_id, finished_claim_ids, frozen):
-    """Issue #294 — the red-mainline deadlock. A territory claim outlives its lane through
-    gating/holding and releases only on MERGE; a red mainline FREEZES merges, so those claims
-    accumulate and never release. The restore-green fix declares `touches: *` (its scope is
-    genuinely unknown — whatever broke the check), which overlaps every one of them, so in exactly
-    the situation the fix exists to escape it was blocked by the very PRs that were blocked by it.
+def _freeze_exempt_launch(candidate, frozen):
+    """Issues #294 + #519 — while merges are FROZEN, the standing-rule restore-green fix ignores
+    every occupied territory: finished-but-unmerged claims, running lanes, and lanes launching this
+    same tick. It still needs a free lane (the caller checks capacity first), and it still occupies
+    `*` once selected, so everything after it is held exactly as before.
 
-    This buys the fix a LAUNCH — the first half of the escape. Its PR then crosses the freeze at
-    gate_decision step 4, which since issue #295 exempts exactly this issue, so a dev-check freeze
-    now lifts itself: filed -> launched (here) -> built -> merged -> dev greens -> unfreeze.
+    #294 — the red-mainline deadlock. A territory claim outlives its lane through gating/holding and
+    releases only on MERGE; a red mainline FREEZES merges, so those claims accumulate and never
+    release. The fix declares `touches: *` (its scope is genuinely unknown — whatever broke the
+    check), which overlaps every one of them, so it was blocked by the very PRs that were blocked by
+    it. That exemption buys the fix a LAUNCH, the first half of the escape; its PR then crosses the
+    freeze at gate_decision step 4 (issue #295), so a dev-check freeze lifts itself: filed ->
+    launched (here) -> built -> merged -> dev greens -> unfreeze.
 
-    So a restore-green candidate ignores FINISHED-but-unmerged territory WHILE MERGES ARE FROZEN.
-    Both halves are the deadlock's own shape and neither is decoration:
-      * frozen — the whole justification is that the claims cannot release. On a green mainline
-        they release on their own within a tick or two, and the bypass would just buy an avoidable
-        overlap for a fix issue that outlived its breakage.
-      * finished-only — a RUNNING lane still holds it. Not because a claim-holding lane is
-        necessarily idle (the gate nudges one to repin a review or chase a check, and it then
-        pushes), but because a running lane always ENDS — sessions have caps — while a claim under
-        a freeze has no such clock. Worst case the fix's diff overlaps a held PR's; the gate's own
-        overlap step holds that merge until the fix lands, and lanes get separate worktrees, so the
-        cost is a rebase, never two writers in one tree. A rebase beats a deadlock.
+    #519 — RUNNING lanes too. #294 left them blocking on the premise "a running lane always ENDS —
+    sessions have caps". #518 refuted it: eApp lane i1031 sat on a startup dialog the recovery
+    ladder could not clear, ended only when a human pressed Escape, and the fix waited 32 minutes
+    behind it with a lane free. Owner ruling (#518 option a): ALL running lanes, not a sensed-stuck
+    subset — that subset would lean on the same session-state sensing that misread i1031 (and the
+    workers in #513). A lane launching this same tick is a running lane by the time the tick's
+    actions land, so it stands aside the same way; holding the fix one tick behind it would only
+    delay the identical launch.
 
-    `finished_claim_ids` is claims MINUS running lanes deliberately: territory_claims_from()
-    covers in-flight statuses too, so a running issue appears in both lists under one id."""
-    return bool(frozen) and blocker_id in finished_claim_ids and _restore_green(candidate)
+    Why overlapping a live lane is safe here: lanes build in separate worktrees, so there are never
+    two writers in one tree; and the gate's overlap step (touch_verdict) holds the OTHER lane's merge
+    while this fix is in flight — #518 shows it: i1031's PR held behind in-flight i1044 and merged
+    after the fix. The cost is a rebase, and a rebase beats a mainline held red.
+
+    What this does NOT bound: the fix's OWN merge. That same overlap step holds the fix's PR behind
+    any lane still in flight when it finishes, if the fix's diff overlaps that lane's declared
+    touches or maps to `*`, and it runs before the freeze step the fix crosses. A lane that stays
+    stuck can therefore still hold the mainline red one stage later — owner decision filed as #522.
+
+    Why `frozen` gates it: the whole justification is a mainline that cannot release territory. On a
+    green mainline claims release on their own within a tick or two, and a fix issue that outlived
+    its breakage has no reason to jump an overlapping lane."""
+    return bool(frozen) and _restore_green(candidate)
 
 
 def _anti_affinity_blocks(candidate, occupied, affinity):
@@ -279,17 +291,17 @@ def _plan(parsed_issues, lane_state, config, usage, closed_nums, frozen, territo
     claims_in = _occupied_from(territory_claims or [])
     running_ids = {lane.get("id") for lane in lanes_in}
     claimed_ids = {claim.get("id") for claim in claims_in}
-    # occupied entries keep their id so a hold can NAME the lane/claim that blocked it.
-    lane_occupied = [{"id": lane.get("id"), "touches": lane.get("touches", []), "type": lane.get("type")}
-                     for lane in lanes_in]
+    # occupied entries keep their id so a hold can NAME the lane/claim that blocked it, and their
+    # KIND so the journal can say when it releases (issue #519): "lane" = a running lane (or one
+    # selected earlier this tick — running once the tick lands); "claim" = FINISHED-but-unmerged
+    # territory. territory_claims_from() covers in-flight statuses too, so a running issue appears in
+    # BOTH lists under one id; it is a lane, never a finished claim.
+    lane_occupied = [{"id": lane.get("id"), "touches": lane.get("touches", []), "type": lane.get("type"),
+                      "kind": "lane"} for lane in lanes_in]
     claim_occupied = [{"id": claim.get("id"), "touches": claim.get("touches", []),
-                       "type": claim.get("type")} for claim in claims_in]
-    # FINISHED-but-unmerged territory: the claims that are not also live lanes (issue #294).
-    # An id-less entry is DROPPED, never carried as None — a malformed claim would otherwise put
-    # None in here and make every other id-less occupied entry (a running lane, a same-tick
-    # selection) read as exempt territory.
-    finished_claim_ids = {cid for cid in claimed_ids
-                          if cid is not None and cid not in running_ids}
+                       "type": claim.get("type"),
+                       "kind": "lane" if claim.get("id") in running_ids else "claim"}
+                      for claim in claims_in]
 
     # The fresh path asks launch_ok — the SAME function every restart path asks (issue #150) — and
     # not a private re-implementation of half of it. The usage half is already settled by the
@@ -312,16 +324,16 @@ def _plan(parsed_issues, lane_state, config, usage, closed_nums, frozen, territo
             # this candidate's pool cap is binding (a build pool full does NOT block investigations,
             # and vice versa) -> lane-bound, NOT an affinity hold, so it carries no wildcard mystery.
             continue
-        blocker = next((ot for ot in occupied
-                        if _anti_affinity_blocks(p, ot, affinity)
-                        and not _claim_exempt(p, ot.get("id"), finished_claim_ids, frozen)), None)
+        blocker = None if _freeze_exempt_launch(p, frozen) else \
+            next((ot for ot in occupied if _anti_affinity_blocks(p, ot, affinity)), None)
         if blocker is not None:
             holds.append({"p": p, "blocker": blocker})                # affinity conflict -> held this tick
             continue
         selected.append(p)
         selected_ids.add(p.get("id"))
         free[pool] -= 1
-        occupied.append({"id": p.get("id"), "touches": p["touches"], "type": p.get("type")})
+        occupied.append({"id": p.get("id"), "touches": p["touches"], "type": p.get("type"),
+                         "kind": "lane"})
     return selected, holds
 
 
@@ -332,9 +344,9 @@ def launchable(parsed_issues, lane_state, config, usage, closed_nums, frozen,
     `lane_state` is the list of currently OCCUPIED lanes, each {"id", "touches", "type"?}. Each
     `territory_claims` entry has the same shape, but consumes no lane slot; it only participates
     in anti-affinity. Both MUST be derived from the SAME issues_state snapshot (lane_state_from /
-    territory_claims_from of one load, which is what every caller does): the restore-green
-    exemption tells finished claims from running ones by subtracting the lane ids, so claims from a
-    newer snapshot than `lane_state` could read a live lane as finished territory.
+    territory_claims_from of one load, which is what every caller does): a hold's blocker KIND
+    (running lane vs finished claim, issue #519) is told apart by subtracting the lane ids, so
+    claims from a newer snapshot than `lane_state` could name a live lane as finished territory.
     parsed issue may carry a "requeue_front" flag (merged in by the runner from loopstate; default
     False).
     `soft_overlap` (soft affinity only) is True when this launch shares an area with ANY OTHER
@@ -371,7 +383,14 @@ def launch_holds(parsed_issues, lane_state, config, usage, closed_nums, frozen,
         {"id", "num", "blocker_id", "self_wildcard": bool, "blocker_wildcard": bool}
     Empty when usage fails closed, no lane is free (lane-bound, not affinity-bound), or under soft
     affinity (nothing blocks). The runner journals these once per episode so 'why is only one lane
-    busy' is answerable from the journal."""
+    busy' is answerable from the journal.
+
+    Issue #519 adds two fields so a restore-green fix's hold can be told truthfully: "restore_green"
+    (the candidate is the standing-rule fix — whose `touches: *` the engine wrote on purpose, so the
+    prose must never advise narrowing it) and "blocker_kind" ("lane" = a running lane, or one
+    launching ahead of it this tick; "claim" = finished-but-unmerged territory). Such a hold only
+    ever arises on an UNFROZEN mainline — while merges are frozen the fix is exempt (see
+    _freeze_exempt_launch)."""
     _, holds = _plan(parsed_issues, lane_state, config, usage, closed_nums, frozen, territory_claims)
     out = []
     for h in holds:
@@ -381,5 +400,7 @@ def launch_holds(parsed_issues, lane_state, config, usage, closed_nums, frozen,
         if not (self_wc or blocker_wc):
             continue                                                  # named-vs-named: not a wildcard
         out.append({"id": p.get("id"), "num": p.get("num"), "blocker_id": blocker.get("id"),
-                    "self_wildcard": self_wc, "blocker_wildcard": blocker_wc})
+                    "self_wildcard": self_wc, "blocker_wildcard": blocker_wc,
+                    "restore_green": _restore_green(p),
+                    "blocker_kind": blocker.get("kind", "lane")})
     return out

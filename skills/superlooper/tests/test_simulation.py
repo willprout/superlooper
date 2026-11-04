@@ -1935,6 +1935,63 @@ def test_restore_green_launches_past_a_finished_lane_holding_territory(sim_facto
     assert sim.loop_issue("i900").get("status") == "holding"
 
 
+def test_restore_green_launches_past_a_stuck_running_lane_the_518_case(sim_factory):
+    # Issue #519, replaying #518 (eApp, 2026-11-03) through the real runner: `lanes: 2`, hard
+    # affinity, ONE running lane that will not end on its own (i1031 sat on a startup dialog — here,
+    # a worker parked on a sync file), merges frozen, the fix filed with `touches: *`. Before #519 the
+    # fix was held behind that lane with the second lane free until a human intervened. Now it takes
+    # the free lane; the stuck lane's PR, once it finishes, is held by the gate's overlap step behind
+    # the in-flight fix; the fix merges across its own freeze; dev greens; the other PR follows.
+    sim = sim_factory(lanes=2, affinity="hard",
+                      areas={"routes": ["src/routes/*"], "ui": ["src/ui/*"]})
+    sim.edit_gh_state(lambda st: st.update(ci_greens_on_merge=True))
+    stuck = sim.tmp / "release-stuck-lane"
+    n1 = sim.add_issue(title="Running lane that will not end on its own", touches="routes, ui",
+                       scenario={"scenario": "happy", "wait_for": str(stuck),
+                                 "edit": {"file": "src/routes/page.txt", "append": "routes\n"}})
+    s1 = "i%d" % n1
+    sim.tick()
+    assert sim.loop_issue(s1).get("status") == "running"
+
+    sim.edit_gh_state(lambda st: st["branch_checks"].update(main=[dict(c) for c in RED_CI]))
+    sim.tick()
+    assert (sim.frozen_marker() or {}).get("source") == "dev-check", sim.frozen_marker()
+    assert len(_fix_map(sim)) == 1, _fix_map(sim)
+    fix_num = list(_fix_map(sim).values())[0]
+    fix_id = "i%d" % fix_num
+    assert "touches: *" in sim.issue(fix_num)["body"], "the filer keeps declaring the wildcard"
+    fix_release = sim.tmp / "release-fix"
+    sim.set_scenario(fix_id, {"scenario": "happy", "wait_for": str(fix_release)})
+
+    # the fix takes the free lane while the stuck lane is STILL running — no human, no edit
+    assert sim.tick_until(lambda: sim.loop_issue(fix_id).get("status") == "running", ticks=6), \
+        [(r.get("act"), r.get("id"), r.get("outcome")) for r in sim.journal()]
+    assert sim.loop_issue(s1).get("status") == "running"
+    assert len(sim.surfaces()) == 2, "two lanes busy, never a third"
+    assert not [r for r in sim.journal("wildcard_hold") if r.get("id") == fix_id]
+    launched = [r for r in sim.journal("launch") if r.get("id") == fix_id and r.get("outcome") == "ok"]
+    assert launched and launched[0].get("touches") == ["*"], launched
+    assert "touches: *" in sim.issue(fix_num)["body"], "nobody narrowed the engine's declaration"
+
+    # the stuck lane finally finishes: the gate HOLDS its PR behind the in-flight fix
+    stuck.write_text("go")
+    assert sim.tick_until(lambda: sim.loop_issue(s1).get("status") == "holding", ticks=10), \
+        [(r.get("act"), r.get("id"), r.get("outcome")) for r in sim.journal()]
+    holds = [r for r in sim.journal("hold") if r.get("id") == s1]
+    assert holds and holds[0].get("overlap_lane") == fix_id, holds
+    assert not sim.mutations("merge_pr"), "nothing merges while the fix is in flight"
+
+    # the fix finishes, crosses its own freeze, greens dev; the held PR merges after it
+    fix_release.write_text("go")
+    assert sim.tick_until(lambda: sim.loop_issue(s1).get("status") == "merged", ticks=30), \
+        [(r.get("act"), r.get("id"), r.get("outcome")) for r in sim.journal()]
+    merges = [r for r in sim.journal("merge") if r.get("outcome") == "ok"]
+    assert [r["id"] for r in merges] == [fix_id, s1], merges
+    assert merges[0].get("freeze_exempt") is True
+    assert sim.frozen_marker() is None
+    assert [r for r in sim.journal("unfreeze") if r.get("outcome") == "ok"]
+
+
 def test_a_dev_check_freeze_lifts_itself_with_no_human_and_no_external_flip(sim_factory):
     # issue #295 — the last rung of the autonomous ladder. #294 restored the FILING and the LAUNCH
     # of the standing-rule fix; its PR was then held by gate step 4 like every other merge, so a

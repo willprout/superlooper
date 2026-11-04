@@ -88,7 +88,10 @@ busy lane. That used to be silent; now the loop **says so in the journal** — o
 wildcard suppresses a launch, and on the merge side when a `*`-mapped diff holds behind an in-flight
 lane. So if you set `lanes` high and see only one lane working, `grep wildcard_hold` (and the
 wildcard-flagged `hold` records) in `journal.jsonl` will name the no-touches issue causing it. The
-fix is to declare narrower `touches:` and add `areas` globs that cover your files.
+fix is to declare narrower `touches:` and add `areas` globs that cover your files — except on the
+auto-filed restore-green issue (`auto-approved:nightly-red`), whose `touches: *` the engine writes
+on purpose: leave it alone (see that label below for why its launch is never stuck behind a
+freeze).
 
 **Reserved investigation lanes.** A plain integer `lanes` serializes *everything* at 1 (including
 investigations, which open no PR and can't cause a merge conflict) and parallelizes *everything* at
@@ -306,10 +309,16 @@ rest are workflow state the runner and William drive.
   the runner, on a red dev check) files to restore a red mainline. This is a distinct label
   precisely because `agent-ready` is William's word and a standing rule must carry its own. It also
   buys exactly two exemptions, which together are what lets a red mainline recover with nobody
-  watching. **At launch:** a restore-green fix declares `touches: *` and is allowed past
-  **finished-but-unmerged territory claims** while merges are frozen, because a red mainline freezes
-  merges and those claims would otherwise pile up forever and block the very fix that would release
-  them. Running lanes still hold it — those drain on their own. **At the merge gate:** its PR — and
+  watching. **At launch:** a restore-green fix declares `touches: *` and, while merges are frozen,
+  is allowed past **finished-but-unmerged territory claims** — a red mainline freezes merges, so
+  those claims would otherwise pile up forever and block the very fix that would release them — and
+  past **running lanes** too, because a running lane stuck where nobody is watching (a startup
+  dialog, say) does not end on its own (issue #519). It still needs a free lane, and once running
+  its `*` holds every other candidate as usual; an overlapping lane that finishes meanwhile has its
+  PR held by the gate's overlap step until the fix resolves. That same step still holds the fix's
+  own PR behind an overlapping lane that is in flight when the fix finishes, so a lane that stays
+  stuck can still delay the merge (open: #522). On a green mainline it is held like any other
+  issue. **At the merge gate:** its PR — and
   only its PR — may merge while a **dev-check** freeze stands, because that freeze lifts only when
   the dev branch greens and only this merge can green it; without the exemption the loop built,
   reviewed and opened a perfect fix PR and then held it forever waiting for you to merge it by hand.

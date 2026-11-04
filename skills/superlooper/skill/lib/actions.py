@@ -1488,10 +1488,46 @@ def _launch_gate_reason(p, closed_nums, usage, config=None, closed_read_ok=True)
     return "the launch gate refused this start (no single condition named)"
 
 
+def _restore_green_hold_reason(h):
+    """Prose for a hold on the standing-rule restore-green fix (issue #519). The generic #36 prose
+    below told the operator the fix "declares no `touches:`" and to "declare a narrower `touches:`"
+    — in #518 that read as a freeze deadlock and the operator hand-narrowed a wildcard the engine
+    wrote on purpose (_fix_issue). This says what the blocker IS, when it releases, and why the
+    exemption did not apply. The scheduler exempts the fix from every lane and claim while merges
+    are frozen, so a hold reaching here means the mainline is NOT frozen."""
+    blocker = h.get("blocker_id")
+    if h.get("blocker_kind") == "claim":
+        what = (f"finished lane {blocker}'s PR is waiting at the merge gate and still holds its "
+                "territory claim (it occupies no lane); that claim releases when the PR merges, "
+                f"or when {blocker} is parked, requeued or waiting on an owner answer")
+    else:
+        what = (f"running lane {blocker} overlaps it; that territory releases when {blocker}'s PR "
+                f"merges, or when {blocker} is parked, requeued or waiting on an owner answer (a "
+                "finished lane keeps its claim while its PR waits at the gate)")
+    why = ("Merges are not frozen, so ordinary anti-affinity applies: the restore-green exemption "
+           "is freeze-only, and the moment merges freeze this fix stops waiting on any lane or "
+           "claim (issues #294, #519).")
+    if h.get("self_wildcard"):
+        why += (" Its `touches: *` is engine-written on purpose (a restore-green fix's scope is "
+                "unknown until diagnosed); leave it as declared.")
+    return f"launch held: this is the restore-green fix and {what}. {why}"
+
+
 def _wildcard_hold_reason(h):
     """Prose for a wildcard launch-suppression (issue #36): why this approved issue could not
-    co-schedule and the lane serialized. Names which side is the no-touches wildcard."""
+    co-schedule and the lane serialized. Names which side is the no-touches wildcard. The
+    restore-green fix gets its own prose (issue #519) — see _restore_green_hold_reason."""
+    if h.get("restore_green"):
+        return _restore_green_hold_reason(h)
     blocker = h.get("blocker_id")
+    if h.get("blocker_restore_green"):
+        # issue #519: held BEHIND the in-flight restore-green fix. Its `*` overlaps every lane by
+        # design, so no declaration on either side would let this co-schedule — narrowing advice
+        # here is the same misdirection #518 recorded, reached from the other side.
+        return (f"launch held: in-flight lane {blocker} is the restore-green fix, whose `touches: *` "
+                "is engine-written on purpose (its scope is unknown until diagnosed) and overlaps "
+                "every lane under hard affinity — so this waits until that fix's PR merges or it "
+                "parks. Leave the declarations as they are.")
     if h.get("self_wildcard") and h.get("blocker_wildcard"):
         why = (f"it and in-flight lane {blocker} both declare no `touches:` (wildcard '*'), which "
                "overlaps every lane under hard affinity")
@@ -1754,12 +1790,14 @@ def _fix_issue(dev_branch, name, conclusion, fingerprint, operator="the owner"):
         # `touches: *` — a restore-green fix has genuinely unknown scope (whatever broke the check),
         # so the wildcard is the honest declaration. It also satisfies touches_required (issue #36:
         # an EMPTY touches would be refused at launch, deadlocking auto-restore-green since this
-        # issue is auto-approved and the mainline is frozen until it lands). '*' serializes under
-        # hard affinity — correct for an expedited fix while merges are frozen anyway, and it is
-        # SAFE to declare only because the scheduler exempts this issue from finished-but-unmerged
-        # territory claims (issue #294). Without that exemption the wildcard was terminal: a frozen
-        # mainline ACCUMULATES holding claims that release only on merge, so there was never a
-        # clear moment to serialize into and the fix was blocked by the PRs it would have freed.
+        # issue is auto-approved and the mainline is frozen until it lands). '*' serializes every
+        # OTHER candidate behind it under hard affinity — correct for an expedited fix while merges
+        # are frozen anyway. It is SAFE to declare only because, while merges are frozen, the
+        # scheduler exempts this issue from every occupied territory: finished-but-unmerged claims
+        # (issue #294 — a frozen mainline ACCUMULATES holding claims that release only on merge, so
+        # without it there was never a clear moment to serialize into) and running lanes (issue
+        # #519 — a running lane stuck at a dialog nobody watches does not end on its own). Keep the
+        # wildcard: the owner declined deriving a narrow scope from the failing check (#518).
         f"touches: *\n"
     )
     return {"act": "file_fix_issue", "fingerprint": fingerprint, "title": title, "body": body,
@@ -3797,8 +3835,16 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
             if hid in selected_ids or (hist.get("wildcard_hold_journaled")
                                        and hist.get("wildcard_hold_generation") == hold_generation):
                 continue
+            # issue #519: is the BLOCKER the standing-rule fix? Read from its LIVE labels in this
+            # tick's GitHub view (loopstate carries none) — absent from the view reads False, which
+            # only costs the generic prose, never a hold decision.
+            bp = parsed_by_id.get(h.get("blocker_id")) if isinstance(h.get("blocker_id"), str) \
+                else None
+            h = dict(h, blocker_restore_green=isinstance(bp, dict)
+                     and gate.restore_green(bp.get("labels")))
             out.append({"act": "wildcard_hold", "id": hid, "num": h.get("num"),
-                        "blocker": h.get("blocker_id"), "generation": hold_generation,
+                        "blocker": h.get("blocker_id"), "blocker_kind": h.get("blocker_kind"),
+                        "generation": hold_generation,
                         "reason": _wildcard_hold_reason(h)})
         # Foreseeable-referee launch hold (issue #165): an approved issue whose declared touches
         # resolve to a referee path is withheld by launch_ok unless pre-authorized — so it never

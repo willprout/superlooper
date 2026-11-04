@@ -803,7 +803,17 @@ approval; a building lane during a merge freeze is lanes-busy (frozen-but-buildi
 idle state); **a finished PR gate-waiting on CI (or holding through a merge freeze) holds a
 territory claim** that occupies no lane but keeps overlapping eligible work behind it — the
 no-progress view runs through `scheduler.launchable`, so that held work is not counted as
-launchable (issue #92); a usage meter that successfully READS exhausted is the fail-closed hold
+launchable (issue #92). **The one exception is the restore-green fix** (`auto-approved:nightly-red`):
+while merges are frozen it ignores every territory claim AND every running lane (issues #294,
+#519), so its LAUNCH waits only for a free lane. Its `touches: *` is engine-written on purpose;
+never narrow it to get it launched. A finished PR whose lane overlapped it then holds at the gate
+("in-flight lane iN declares `touches: *` (unknown scope) … holding until it resolves") and merges
+after the fix lands — that is the gate's overlap step working, not a deadlock. The fix's OWN PR is
+still held by that same step behind any lane in flight when it finishes whose declared touches its
+diff overlaps (or behind every in-flight lane, if its diff maps to `*`), so a lane that stays stuck
+can still hold the mainline red at the merge — an open owner decision (#522). On a green mainline
+the fix is held like any other issue, and its `wildcard_hold` journal line says whether a running
+lane or a finished claim holds it and what releases it. A usage meter that successfully READS exhausted is the fail-closed hold
 working (a DARK meter never suppresses — the #46/#76 asymmetry, so a Keychain-less launchd context
 cannot neuter the detector). When the no-progress view is UNOBSERVABLE this check (gh unreachable —
 a probe blip OR a refused list read), the clocks FREEZE and an open no_progress episode is HELD,
