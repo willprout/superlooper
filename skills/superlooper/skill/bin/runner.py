@@ -4340,6 +4340,25 @@ class Runner:
         m = cls._AUTH_VARIANT_RE.search(getattr(rc, "stderr_tail", "") or "")
         return m.group(1) if m else None
 
+    @staticmethod
+    def _host_blocked(iid, rc):
+        """Did nudge-pane defer because the SESSION HOST reports this agent `blocked` — waiting on a
+        person (issue #520)? rc=3 has several causes (the host could not vouch, no record yet, the
+        host's `blocked`), and only the evidence line says which: `[nudge] <id> state=advisory_blocked`,
+        the FIRST line lib/nudge.py writes. Anchored on a line START and on THIS lane's id, so the
+        token quoted inside an evidence detail, or another lane's line, reads as no block. Plain int
+        rc (a stub that captured nothing) fails to "not blocked" — today's reading, never a worse one.
+
+        Read off stderr rather than given an exit code of its own on purpose: rc=3's promise — nothing
+        was typed, retry later — is exactly right for every caller, and the gate's one-nudge-per-cause
+        path branches on the code. Only this reader needs the WHY, the same way `_auth_variant` reads
+        which banner rc=5 saw."""
+        if rc != 3:
+            return False
+        tail = getattr(rc, "stderr_tail", "") or ""
+        return re.search(r"(?m)^\[nudge\] %s state=advisory_blocked\b" % re.escape(iid),
+                         tail) is not None
+
     def _record_sensed(self, iid, rc, now, tier=None):
         """Turn a nudge-pane rc into the lane's honest sensed state (issue #151). Shared by BOTH
         liveness tiers so their reading of the same rc can never drift apart.
@@ -4369,14 +4388,28 @@ class Runner:
         session itself never produces a variant-less logged_out (the classifiers and
         auth_death_variant read the same table), so None means the CHANNEL lost it: a stubbed plain-int rc that
         captured nothing, or a stderr tail that did not survive. Either way the lane is still
-        auth-dead and still held; only the wording degrades."""
+        auth-dead and still held; only the wording degrades.
+
+        `host_blocked` (issue #520) is the third reading, and the one that is NOT an exit code: an
+        rc=3 deferral whose evidence line says the SESSION HOST reports the agent `blocked` — a
+        dialog or prompt waiting on a person (see `_host_blocked`). Before it, that refusal cleared
+        the reading like any other rc=3, so no bound ever started and the lane deferred every 10
+        minutes in silence (#518's i1031 on a welcome dialog; i589, 6.5 hours on a permission
+        prompt). It gets at_dialog's treatment downstream — re-sensed, never parked, a bounded
+        ALERT — and the same episode rule: the clock starts at the first blocked reading, holds
+        while the host keeps saying it, and any other reading ends it."""
         sensed = {5: "logged_out", 6: "at_dialog"}.get(rc)
+        if sensed is None and self._host_blocked(iid, rc):
+            sensed = "host_blocked"
         auth = self._auth_variant(rc) if sensed == "logged_out" else None
 
         def m(st, i):
             if i.get("sensed_state") != sensed:
                 i["sensed_state"] = sensed
                 i["sensed_since"] = now if sensed else None
+            # (#520) When the standing reading was last TAKEN — every look, unlike sensed_since. decide
+            # re-reads a host_blocked lane on this clock wherever no liveness tier would.
+            i["sensed_at"] = now if sensed else None
             # Tracked SEPARATELY from sensed_since on purpose: a banner that changes wording mid-
             # episode (the owner fixes the key, the session falls back to a dead login) is the same
             # unbroken auth-death episode, so the clock the alert bound measures must not restart.
@@ -4394,6 +4427,9 @@ class Runner:
         if sensed == "at_dialog":
             return self._failed("nudge", rc, "session is asking something in-window — leaving it alone",
                                 tier=tier)
+        if sensed == "host_blocked":
+            return self._failed("nudge", rc, "the session host reports it waiting on a person — "
+                                             "nothing typed, leaving it alone", tier=tier)
         return self._failed("nudge", rc, f"nudge rc={rc}", tier=tier)
 
     # --- the progress-stall probe ladder's executors (issue #157) ---
@@ -4483,6 +4519,7 @@ class Runner:
             i["last_recover_at"] = None            # a later re-freeze nudges fresh, not on a stale clock
             i["sensed_state"] = None               # a working lane: drop any frozen-era screen reading
             i["sensed_since"] = None
+            i["sensed_at"] = None                  # (#520) the reading's last look goes with it
             i["sensed_auth"] = None                # (#174) the variant has exactly sensed_state's life
         self._update_issue(iid, fn=m)
         _rm(os.path.join(self.state, "ack", iid))  # the fresh episode: any old probe ack is moot
@@ -4570,12 +4607,27 @@ class Runner:
         if rc == 4:
             self._mark_exited(iid, "dead pane found by progress-stall probe", now)
             return self._failed("nudge", rc, "dead pane — marked exited for relaunch", tier="progress")
+        if self._host_blocked(iid, rc):
+            # (#520) Refund the attempt counted above. Counting before the send is how a failing
+            # probe walks toward the park instead of looping — but a probe the host refused as
+            # `blocked` never reached a worker that could answer it, so counting it would park the
+            # lane FOR being blocked. The send stamp stays, so the re-sense keeps the ladder's
+            # cadence; the bounded host_blocked ALERT, not the park, is the escalation.
+            self._update_issue(iid, fn=lambda st, i: self._probe_refund(i))
         return self._record_sensed(iid, rc, now, tier="progress")
 
     def _probe_bump(self, i, nonce, now):
         self._bump(i, "probe_attempts")
         i["probe_nonce"] = nonce
         i["probe_sent_at"] = now
+
+    @staticmethod
+    def _probe_refund(i):
+        """Undo `_probe_bump`'s count (issue #520) — never below zero, and never on a counter that
+        is not an int: a corrupt counter is decide's to park on (fail closed), not this to repair."""
+        v = i.get("probe_attempts")
+        if type(v) is int and v > 0:
+            i["probe_attempts"] = v - 1
 
     # --- the gate's executors ---
 

@@ -7442,6 +7442,245 @@ def test_the_sensed_stamp_measures_the_episode_not_the_last_look(rig):
     assert ist["sensed_state"] is None and ist["sensed_since"] is None
 
 
+# ---- issue #520: a lane the SESSION HOST reports `blocked` ----
+# #518's i1031 sat on a Claude Code welcome dialog from launch; the frozen tier's recovers came back
+# rc=3 `pane_deferred` ("the host reports this agent 'blocked'"), _record_sensed read rc=3 as no
+# reading at all, so the session_at_dialog bound never started and nothing ever alerted.
+
+def _nudge_refusal(tmp_path, iid="i5", advisory="blocked", records=()):
+    """The refusal nudge-pane REALLY prints, produced by the real nudge.main against a staged host —
+    so these tests read the producer's own format and cannot drift from it."""
+    import io
+    import nudge
+    import panes
+    import session_host
+
+    run_root = tmp_path / ("nudge-%s-%s" % (iid, advisory))
+    panes.record(str(run_root / "state"), iid,
+                 session_host.Session(name=iid, workspace="w1", pane="w1:p1"))
+
+    class Host:
+        def state(self, session, hooks=None):
+            return session_host.HostState(name=iid, liveness=session_host.ALIVE,
+                                          advisory=advisory, detail="staged")
+
+        def send(self, *a, **k):
+            raise AssertionError("a refused session must never be sent to")
+
+    edges = nudge.Edges(host=lambda: Host(), oracle=lambda *a, **k: None,
+                        records=lambda *a, **k: list(records))
+    err = io.StringIO()
+    rc = nudge.main([iid, "ring"], env={"SL_RUN_ROOT": str(run_root)}, out=err, edges=edges)
+    assert rc == nudge.DEFERRED, err.getvalue()
+    return runner_mod.ScriptRC(rc, err.getvalue())
+
+
+def _seed_live_lane(rig, iid="i5", **fields):
+    seed_issue(rig, iid, status="running", **fields)
+    (rig.home / "state" / "panes" / iid).write_text("surf-uuid")
+    (rig.home / "state" / ("worker.%s.lock" % iid)).write_text(f"{os.getpid()}\n")
+
+
+def test_a_host_blocked_refusal_is_recorded_as_its_own_sensed_state(rig, tmp_path):
+    _seed_live_lane(rig)
+    refusal = _nudge_refusal(tmp_path)
+    assert "state=advisory_blocked" in refusal.stderr_tail      # the producer's token, as printed
+    rig.rc_queue.append(refusal)
+    out = rig.r._execute({"act": "recover", "id": "i5", "tier": "frozen"}, NOW)
+    assert "waiting on a person" in out
+    ist = issue_state(rig, "i5")
+    assert ist["sensed_state"] == "host_blocked" and ist["sensed_since"] == NOW
+    # never walked toward a relaunch: blocked is not dead
+    assert not (rig.home / "state" / "exited" / "i5").exists()
+    assert ist["status"] == "frozen"
+
+
+def test_only_this_lanes_host_blocked_deferral_counts_as_a_host_block(rig, tmp_path):
+    """rc=3 has several causes and only one of them is the host saying `blocked`. A plain int (a stub
+    that captured nothing), another rc=3 verdict, a line naming ANOTHER lane, the token quoted
+    mid-line, or the token on another rc must all leave the reading empty — a wrong host_blocked
+    would page the owner about a lane that is fine."""
+    not_a_block = [
+        3,
+        _nudge_refusal(tmp_path, advisory=None),                    # state=no_record
+        runner_mod.ScriptRC(3, "[nudge] i5 state=unknown — deferring — nothing was typed\n"),
+        runner_mod.ScriptRC(3, "[nudge] i6 state=advisory_blocked — deferring — nothing was typed\n"),
+        runner_mod.ScriptRC(3, "[nudge] i5 state=unknown — deferring\n[nudge] i5 evidence:\n"
+                               "the host said: [nudge] i5 state=advisory_blocked\n"),
+        runner_mod.ScriptRC(1, "[nudge] i5 state=advisory_blocked — deferring\n"),
+    ]
+    for rc in not_a_block:
+        _seed_live_lane(rig, sensed_state=None, sensed_since=None)
+        rig.rc_queue.append(rc)
+        rig.r._execute({"act": "recover", "id": "i5", "tier": "frozen"}, NOW)
+        assert issue_state(rig, "i5")["sensed_state"] is None, repr(getattr(rc, "stderr_tail", rc))
+
+
+def test_the_host_blocked_episode_clock_starts_once_and_ends_on_a_non_blocked_reading(rig, tmp_path):
+    """The DoD's clock: it starts at the FIRST blocked reading and does not restart on each re-sense
+    (the recover re-fires every 10 min, which would hold the 30-min bound off forever); any
+    non-blocked reading ends the episode, and a later block is a new one."""
+    _seed_live_lane(rig)
+    blocked = _nudge_refusal(tmp_path)
+    for t in (NOW, NOW + 600, NOW + 1200):
+        rig.rc_queue.append(blocked)
+        rig.r._execute({"act": "recover", "id": "i5", "tier": "frozen"}, t)
+        ist = issue_state(rig, "i5")
+        assert ist["sensed_state"] == "host_blocked" and ist["sensed_since"] == NOW, t
+
+    rig.rc_queue.append(_nudge_refusal(tmp_path, advisory=None))    # the host no longer says blocked
+    rig.r._execute({"act": "recover", "id": "i5", "tier": "frozen"}, NOW + 1800)
+    ist = issue_state(rig, "i5")
+    assert ist["sensed_state"] is None and ist["sensed_since"] is None
+
+    rig.rc_queue.append(blocked)                                    # blocked again: a NEW episode
+    rig.r._execute({"act": "recover", "id": "i5", "tier": "frozen"}, NOW + 2400)
+    assert issue_state(rig, "i5")["sensed_since"] == NOW + 2400
+
+    rig.rc_queue.append(0)                                          # delivered: the prompt is gone
+    rig.r._execute({"act": "recover", "id": "i5", "tier": "frozen"}, NOW + 3000)
+    ist = issue_state(rig, "i5")
+    assert ist["sensed_state"] is None and ist["sensed_since"] is None
+
+
+def test_a_probe_the_host_refused_as_blocked_is_not_counted_toward_the_park(rig, tmp_path):
+    """The #157 ladder counts a probe BEFORE sending it, so a failing probe walks toward the park
+    rather than looping. A probe the host refused as `blocked` never reached a worker that could
+    answer it — counting it would park the lane FOR being blocked. Refunded; the send stamp stays,
+    so the re-sense keeps the ladder's cadence. Any other deferral still counts."""
+    _seed_live_lane(rig, probe_attempts=2)
+    rig.rc_queue.append(_nudge_refusal(tmp_path))
+    rig.r._execute({"act": "probe", "id": "i5", "num": 5, "attempt": 3}, NOW)
+    ist = issue_state(rig, "i5")
+    assert ist["probe_attempts"] == 2
+    assert ist["probe_sent_at"] == NOW
+    assert ist["sensed_state"] == "host_blocked"
+
+    _seed_live_lane(rig, probe_attempts=2, sensed_state=None, sensed_since=None)
+    rig.rc_queue.append(_nudge_refusal(tmp_path, advisory=None))
+    rig.r._execute({"act": "probe", "id": "i5", "num": 5, "attempt": 3}, NOW + 300)
+    assert issue_state(rig, "i5")["probe_attempts"] == 3, "an ordinary deferral still counts"
+
+
+def test_i1031_a_host_blocked_lane_alerts_past_the_bound_and_clears_when_the_host_lets_go(
+        rig, tmp_path):
+    """#518, reproduced through the runner's own ticks. A lane whose session sits on a prompt the
+    host reports `blocked`: the frozen tier re-senses it every 10 minutes, nudge-pane refuses every
+    time, and nothing types, parks or relaunches. Once the block has lasted the dialog bound, a
+    bounded ALERT names the lane; once the host stops saying blocked, the ALERT clears itself."""
+    _seed_live_lane(rig, num=5)
+    _activity(rig, "i5", NOW)                    # its last sign of life; it sat on the prompt after
+    refusal = _nudge_refusal(tmp_path)
+    host = {"blocked": True}
+
+    def run_script(args, env=None, timeout=None):
+        rig.calls.append({"args": [str(x) for x in args], "env": dict(env or {})})
+        if str(args[0]).endswith("nudge-pane.sh"):
+            return refusal if host["blocked"] else 0
+        return 0
+    rig.r._run_script = run_script
+
+    alert_path = rig.home / "state" / "ALERT"
+
+    def reasons():
+        return json.loads(alert_path.read_text()).get("reasons") if alert_path.exists() else []
+
+    def nudges():
+        return [c for c in rig.calls if c["args"][0].endswith("nudge-pane.sh")]
+
+    # Tick at the runner's real spacing scale (300s, under the wake-gap read). The first look is the
+    # idle peek (8 min of quiet), long before the frozen tier (45 min).
+    t = NOW
+    while issue_state(rig, "i5").get("sensed_state") != "host_blocked":
+        assert t < NOW + runner_mod.events_mod.FREEZE_SECONDS, "the block was never sensed"
+        rig.r.tick(now=t)
+        t += 300
+    began = issue_state(rig, "i5")["sensed_since"]
+    assert began == t - 300
+
+    # Quiet until the bound, then the ALERT. Re-read all the while (the idle peek fires once per
+    # idle episode, so this is the #520 re-read, then the frozen tier's), and the episode clock never
+    # restarted on any of those looks.
+    looks = len(nudges())
+    while t < began + actions.AT_DIALOG_ALERT_SECONDS:
+        rig.r.tick(now=t)
+        assert "session_host_blocked:i5" not in reasons(), "alerted before the bound"
+        t += 300
+    rig.r.tick(now=t)
+    assert len(nudges()) - looks >= actions.AT_DIALOG_ALERT_SECONDS // actions.RECOVER_RETRY_SECONDS
+    ist = issue_state(rig, "i5")
+    assert ist["sensed_since"] == began and ist["sensed_at"] == t
+    assert reasons() == ["session_host_blocked:i5"]
+    pages = [r for r in journal.read(rig.home) if r.get("act") == "notify" and r.get("tier") == "down"]
+    assert pages, "the ALERT must reach the owner, not only the disk"
+
+    # Hold it there well past the freeze too: never parked, never relaunched, still re-read.
+    for _ in range(6):
+        t += 300
+        rig.r.tick(now=t)
+    assert reasons() == ["session_host_blocked:i5"]
+    ist = issue_state(rig, "i5")
+    assert ist["status"] in ("running", "frozen"), "never parked for being blocked"
+    assert ist["sensed_since"] == began
+    assert not (rig.home / "state" / "exited" / "i5").exists(), "never relaunched for being blocked"
+    assert not [c for c in rig.calls if "launch" in os.path.basename(c["args"][0])]
+    assert not [m for m in mutations(rig) if "parked" in json.dumps(m)]
+
+    # The prompt is cleared: the next look delivers, the reading ends, and the ALERT clears itself.
+    host["blocked"] = False
+    deadline = t + 2 * actions.RECOVER_RETRY_SECONDS
+    while "session_host_blocked:i5" in reasons():
+        t += 300
+        assert t <= deadline, "the ALERT outlived the block"
+        rig.r.tick(now=t)
+    assert issue_state(rig, "i5")["sensed_state"] is None
+
+
+def test_a_person_clearing_the_prompt_early_ends_the_reading_before_any_alert(rig, tmp_path):
+    """The hole the re-read closes. A lane read as blocked by the one-shot idle peek, then unblocked
+    by a person who is now watching it work — fresh activity, no progress clock yet (a worker that
+    runs its issue in one long turn never rests). No idle/frozen/probe tier would ever look again,
+    so the stale reading would raise a 🔴 for a working lane at the bound. The re-read ends it."""
+    _seed_live_lane(rig, num=5)
+    _activity(rig, "i5", NOW)
+    refusal = _nudge_refusal(tmp_path)
+    host = {"blocked": True}
+
+    def run_script(args, env=None, timeout=None):
+        rig.calls.append({"args": [str(x) for x in args], "env": dict(env or {})})
+        if str(args[0]).endswith("nudge-pane.sh"):
+            return refusal if host["blocked"] else 0
+        return 0
+    rig.r._run_script = run_script
+
+    t = NOW
+    while issue_state(rig, "i5").get("sensed_state") != "host_blocked":
+        assert t < NOW + 1200
+        rig.r.tick(now=t)
+        t += 300
+    host["blocked"] = False                      # a person clears the prompt; the worker resumes
+    for _ in range(int(actions.AT_DIALOG_ALERT_SECONDS // 300) + 2):
+        _activity(rig, "i5", t)                  # working: fresh activity, never idle or frozen
+        rig.r.tick(now=t)
+        t += 300
+    assert issue_state(rig, "i5")["sensed_state"] is None
+    assert not (rig.home / "state" / "ALERT").exists(), "a working lane must not raise the ALERT"
+
+
+def test_every_reading_stamps_when_it_was_taken(rig, tmp_path):
+    """`sensed_at` is the LAST look (decide re-reads on it); `sensed_since` stays the episode's first."""
+    _seed_live_lane(rig)
+    blocked = _nudge_refusal(tmp_path)
+    for t in (NOW, NOW + 600):
+        rig.rc_queue.append(blocked)
+        rig.r._execute({"act": "recover", "id": "i5", "tier": "idle"}, t)
+        ist = issue_state(rig, "i5")
+        assert ist["sensed_since"] == NOW and ist["sensed_at"] == t
+    rig.rc_queue.append(0)
+    rig.r._execute({"act": "recover", "id": "i5", "tier": "idle"}, NOW + 1200)
+    assert issue_state(rig, "i5")["sensed_at"] is None
+
+
 def test_record_pr_stamps_the_pr_number_durably(rig):
     """#155: the reconcile's durable half. i328's symptom was reported as the runner "carrying
     pr: null" — this is that loopstate field, and until now nothing ever wrote it. It is what

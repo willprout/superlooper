@@ -654,6 +654,7 @@ not its reasons yet. The headline for each reason code:
 | `auth_dead` | Claude auth dead |
 | `session_logged_out:<i>[:<banner>]` | `<i>` session auth dead (`<banner>`) |
 | `session_at_dialog:<i>` | `<i>` waiting at its own dialog |
+| `session_host_blocked:<i>` | `<i>` waiting on a person, the host reports |
 | `park_label_stuck:<i>` | `<i>` hand-back label not landing |
 | `launch_runaway:<i>` | `<i>` relaunching past its cap |
 | `update_errors:<i>` | `<i>` branch update failing |
