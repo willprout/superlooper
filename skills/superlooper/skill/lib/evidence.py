@@ -149,10 +149,14 @@ _LAUNCH_RC = {
 }
 
 _NUDGE_RC = {
+    # 1 and 7 split a session-host refusal by WHEN it happened (issue #516): only a refusal the host
+    # gives before typing anything is 1. One it gives after submission — herdr's `timeout: timed
+    # out waiting for agent status` and `agent_prompt_stalled` — or on either side of it is 7, so
+    # this text may say "the session never saw the message" and 7's may not.
     1: ("send_failed",
-        "the message could not be sent at all: the session host refused it, the lane id cannot "
-        "address an agent, or this agent has no delivery oracle — a channel fault, not the "
-        "session's, so nothing was delivered and the session never saw the message"),
+        "the message could not be sent at all: the session host refused it before typing it, the "
+        "lane id cannot address an agent, or this agent has no delivery oracle — a channel fault, "
+        "not the session's, so nothing was delivered and the session never saw the message"),
     3: ("pane_deferred",
         "NOTHING WAS TYPED and the session may be perfectly healthy: the host could not vouch for "
         "the pane, it reports the agent waiting on a person, or the session has written no record "
@@ -168,10 +172,12 @@ _NUDGE_RC = {
         "the session is ALIVE and asking its own question in-window, waiting on an answer — going "
         "quiet to wait is not a fault, and parking it would kill a working lane"),
     7: ("send_unproven",
-        "the prompt WAS submitted to the session host and nothing could confirm it arrived — rc is "
-        "never delivery evidence, so the runner refuses to claim one. Distinct from a deferral "
-        "because something really was typed: a caller with a one-shot key must spend it rather "
-        "than re-submit into a live worker every tick"),
+        "the prompt WAS submitted to the session host, or the host refused it in a way that does "
+        "not prove it was never typed (it gives that refusal after submission), and nothing could "
+        "confirm it arrived — rc is never delivery evidence, so the runner refuses to claim one "
+        "either way. The session may well have it. Distinct from a deferral because something may "
+        "really have been typed: a caller with a one-shot key must spend it rather than "
+        "re-submit into a live worker every tick"),
     124: ("nudge_timeout", "the nudge script never returned within the runner's timeout"),
     127: ("nudge_script_unrunnable",
           "the nudge script could not be executed at all (missing, or not executable)"),

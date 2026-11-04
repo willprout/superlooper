@@ -436,15 +436,153 @@ def test_a_host_that_REFUSED_the_prompt_is_a_channel_fault_not_an_unproven_deliv
     assert "refused" in str(e.value)
 
 
-def test_a_refused_prompt_is_never_chased_with_enter():
-    # The chaser exists for a prompt that landed in the composer unsubmitted. Pressing Enter into a
-    # pane whose prompt call the host REFUSED presses Enter for no reason — and a stray Enter into
-    # a pane showing a selection dialog SELECTS an item.
-    fake = _healthy({("agent", "prompt"):
-                     (1, "", _err("agent_prompt_stalled", "no lifecycle change in five seconds"))})
+@pytest.mark.parametrize("code", ["agent_prompt_stalled", "agent_not_ready"])
+def test_a_refused_prompt_is_never_chased_with_enter(code):
+    # The chaser exists for a prompt that landed in the composer unsubmitted. A refusal raises
+    # BEFORE it in both of #516's classes: a pre-submission refusal (agent_not_ready) typed nothing,
+    # so an Enter there is pressed for no reason; a post-submission one (agent_prompt_stalled) is
+    # reported, not repaired — #516 changed the verdict's NAME and added no keystroke. A stray
+    # Enter into a pane showing a selection dialog SELECTS an item.
+    fake = _healthy({("agent", "prompt"): (1, "", _err(code, "staged refusal"))})
     with pytest.raises(session_host.HostError):
         _host(fake).send(_session(), _preamble(), delivery=FakeDelivery(False), revived=True)
     assert ("agent", "send-keys") not in fake.verbs(), fake.verbs()
+
+
+# ---- which refusals prove nothing was typed (issue #516) ------------------------------------
+#
+# Every refusal herdr can give `agent prompt --wait`, by the herdr v0.8.0 source that decides it
+# (src/api/wait.rs `prompt_agent`; src/app/api/agents.rs `handle_agent_prompt`). The wrapper used
+# to call EVERY refusal a channel fault — "nothing was carried to the session" — and #513's field
+# record has six probes journaled exactly that which the worker transcripts show were enqueued in
+# ~3s and answered with a nonce-valid ack. Their refusal was `timeout: timed out waiting for agent
+# status`, which herdr can only produce from the wait that runs AFTER the prompt was typed.
+
+# Refused before a byte reached the pane: a channel fault, nothing was carried (`send_failed`).
+_BEFORE_SUBMISSION = [
+    ("unauthorized", "unauthorized: this socket requires a token"),           # the fence, pre-dispatch
+    ("server_not_running", "no herdr server is running at /tmp/herdr.sock"),  # CLI never connected
+    ("protocol_mismatch", "client protocol 3 is newer than server protocol 2"),  # CLI's own guard
+    ("agent_not_found", "agent target i304 not found"),                       # pre-prompt lookup
+    ("agent_not_ready", "agent i304 is no longer the pane foreground process"),
+    ("empty_agent_prompt", "agent prompt must not be empty"),
+    ("agent_prompt_failed", "channel closed"),                                # the write itself failed
+]
+
+# Raised only after submission, or by a path that runs on both sides of it: possibly delivered, so
+# nothing may claim it was not (`send_unproven`).
+_AFTER_OR_EITHER_SIDE = [
+    ("timeout", "timed out waiting for agent status"),                        # #513's exact text
+    ("agent_prompt_stalled", "agent prompt produced no observed state change within 5000 ms; "
+                             "status is unknown and state_change_seq remained 7"),
+    ("agent_not_running", "agent is no longer running in the target pane"),
+    ("server_unavailable", "timed out waiting for app response after 5000 ms"),  # either side
+    ("internal_error", "failed to decode agent response"),                    # either side
+    # Either side too (fresh-agent review): the waits' own `agent_get` passes every code but
+    # not-found through unchanged (`agent_wait_probe_error`), so a duplicate name appearing
+    # mid-wait refuses with this AFTER the write.
+    ("agent_target_ambiguous", "agent target i304 is ambiguous"),
+    ("a_code_herdr_has_not_shipped_yet", "something new"),                    # unknown: not proof
+]
+
+
+@pytest.mark.parametrize("code,message", _BEFORE_SUBMISSION)
+def test_a_refusal_herdr_raises_before_typing_is_a_channel_fault(code, message):
+    fake = _healthy({("agent", "prompt"): (1, "", _err(code, message))})
+    with pytest.raises(session_host.HostError) as caught:
+        _host(fake).send(_session(), "do the thing", delivery=FakeDelivery(False))
+    assert not isinstance(caught.value, session_host.DeliveryUnproven), (
+        "%s is refused before anything is typed — calling it possibly-delivered would spend a "
+        "caller's one-shot nudge on a message the host never carried" % code)
+    assert "nothing was carried" in str(caught.value)
+    assert code in str(caught.value), "the host's own words ride in the memo"
+
+
+@pytest.mark.parametrize("code,message", _AFTER_OR_EITHER_SIDE)
+def test_a_refusal_that_cannot_prove_non_delivery_is_an_unproven_delivery(code, message):
+    fake = _healthy({("agent", "prompt"): (1, "", _err(code, message))})
+    with pytest.raises(session_host.DeliveryUnproven) as caught:
+        _host(fake).send(_session(), "do the thing", delivery=FakeDelivery(False))
+    memo = str(caught.value)
+    assert "nothing was carried" not in memo, (
+        "%s does not prove non-delivery — the memo must not claim it: %s" % (code, memo))
+    assert "%s: %s" % (code, message) in memo, "the host's own words ride in the memo"
+    assert ("agent", "send-keys") not in fake.verbs(), "and no Enter is pressed to 'fix' it"
+
+
+def test_the_513_refusal_reads_as_possibly_delivered():
+    # The field record itself: rc=1 on stderr, herdr's exact envelope, and a transcript where the
+    # oracle found no `user` entry (a mid-turn prompt is QUEUED first). Before #516 this read
+    # "nothing was carried to the session".
+    fake = _healthy({("agent", "prompt"):
+                     (1, "", _err("timeout", "timed out waiting for agent status"))})
+    with pytest.raises(session_host.DeliveryUnproven) as caught:
+        _host(fake).send(_session(), "[superlooper] PROGRESS PROBE", delivery=FakeDelivery(False))
+    assert "may have been delivered" in str(caught.value)
+
+
+def test_the_before_submission_codes_are_exactly_the_ones_the_source_was_read_for():
+    # The allow-list is the decision. Adding a code to it claims herdr refuses with it before
+    # typing, so it is a change somebody argues for against herdr's source — never a side effect.
+    assert session_host._REFUSED_BEFORE_SUBMISSION == frozenset(c for c, _ in _BEFORE_SUBMISSION)
+
+
+# The exact bytes the pinned CLI printed for a tokenless `agent prompt --wait` against a FENCED
+# throwaway host (captured for #516; reports/i305.md measured the same shape on the fleet). Not the
+# JSON envelope: the CLI pings the server before sending any request, and a refused ping comes back
+# through `main` as Rust Debug text, rc=1.
+_FENCED_PING_REFUSAL = (
+    'Error: Custom { kind: Other, error: ErrorResponse(ErrorResponse { id: "api-client:status", '
+    'error: ErrorBody { code: "unauthorized", message: "unauthorized: this socket requires a '
+    'token" } }) }\n')
+
+
+def test_a_fenced_socket_that_refused_the_clis_own_ping_carried_nothing():
+    # Fresh-agent review, P2: the allow-list's `unauthorized` never fires for this command, because
+    # the fence refuses the CLI's pre-request ping and that refusal is not an envelope. Read as
+    # "possibly delivered", a fleet whose token went missing would spend every one-shot nudge on a
+    # prompt herdr never typed.
+    fake = _healthy({("agent", "prompt"): (1, "", _FENCED_PING_REFUSAL)})
+    with pytest.raises(session_host.HostError) as caught:
+        _host(fake).send(_session(), "do the thing", delivery=FakeDelivery(False))
+    assert not isinstance(caught.value, session_host.DeliveryUnproven)
+    assert "unauthorized" in str(caught.value)
+
+
+def test_only_the_ping_refusal_counts_among_debug_text_errors():
+    # The ping is the one request the CLI sends BEFORE the prompt, so only its refusal proves
+    # nothing was typed. The same Debug shape naming any other request proves nothing.
+    other = _FENCED_PING_REFUSAL.replace("api-client:status", "cli:agent:prompt")
+    fake = _healthy({("agent", "prompt"): (1, "", other)})
+    with pytest.raises(session_host.DeliveryUnproven):
+        _host(fake).send(_session(), "do the thing", delivery=FakeDelivery(False))
+
+
+def test_a_host_binary_that_never_ran_carried_nothing():
+    # The wrapper's own refusals, which the host never spoke. A binary that could not be EXECUTED
+    # typed nothing at all.
+    fake = _healthy({("agent", "prompt"): (127, "", "could not run ['herdr']")})
+    with pytest.raises(session_host.HostError) as caught:
+        _host(fake).send(_session(), "do the thing", delivery=FakeDelivery(False))
+    assert not isinstance(caught.value, session_host.DeliveryUnproven)
+
+
+@pytest.mark.parametrize("rc,stderr", [
+    (124, "no answer within 40.0s"),      # killed mid-call: the prompt may already be in the pane
+    (1, "Error: Broken pipe (os error 32)"),  # an answer that is not the host's envelope
+])
+def test_a_host_call_that_ended_without_a_verdict_is_an_unproven_delivery(rc, stderr):
+    fake = _healthy({("agent", "prompt"): (rc, "", stderr)})
+    with pytest.raises(session_host.DeliveryUnproven):
+        _host(fake).send(_session(), "do the thing", delivery=FakeDelivery(False))
+
+
+def test_a_post_submission_refusal_still_yields_to_a_landed_transcript():
+    # The oracle decides first, in both directions: herdr timing out its settled-state wait on a
+    # worker that stays busy is not evidence against a prompt the transcript shows arrived.
+    fake = _healthy({("agent", "prompt"):
+                     (1, "", _err("timeout", "timed out waiting for agent status"))})
+    assert _host(fake).send(_session(), "do the thing", delivery=FakeDelivery(True)).delivered
 
 
 def test_an_oracle_that_cannot_answer_is_not_a_delivery():

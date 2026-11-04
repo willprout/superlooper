@@ -7475,6 +7475,84 @@ def _nudge_refusal(tmp_path, iid="i5", advisory="blocked", records=()):
     return runner_mod.ScriptRC(rc, err.getvalue())
 
 
+def _nudge_through_the_wrapper(tmp_path, code, message, iid="i5"):
+    """What nudge-pane REALLY prints when the session host refuses `agent prompt --wait` with
+    `code: message` (issue #516) — the real nudge.main over the REAL SessionHost.send, with only
+    herdr's process edge staged. So the runner reads the classification the wrapper actually made,
+    not a hand-written rc."""
+    import io
+    import subprocess as sp
+    import nudge
+    import panes
+    import session_host
+
+    run_root = tmp_path / ("nudge-%s-%s" % (iid, code))
+    panes.record(str(run_root / "state"), iid,
+                 session_host.Session(name=iid, workspace="w1", pane="w1:p1"))
+    envelope = json.dumps({"id": "cli:agent:prompt", "error": {"code": code, "message": message}})
+
+    class Herdr(session_host.Probe):
+        def run(self, argv, timeout=None):
+            assert list(argv[1:3]) == ["agent", "prompt"], argv
+            return sp.CompletedProcess(argv, 1, "", envelope)   # herdr: envelope on stderr, rc=1
+
+    class Host:
+        def __init__(self):
+            self.real = session_host.SessionHost(probe=Herdr(), binary="/nonexistent/herdr")
+
+        def state(self, session, hooks=None):
+            return session_host.HostState(name=iid, liveness=session_host.ALIVE,
+                                          advisory="working", detail="staged")
+
+        def send(self, session, text, **kw):
+            return self.real.send(session, text, **kw)
+
+    class Queued:
+        """The transcript holds only a queue-operation record — no `user` entry yet."""
+        def mark(self):
+            return {}
+
+        def landed(self, mark):
+            return False
+
+    first_turn = [{"type": "user", "message": {"role": "user", "content": "your brief"}}]
+    edges = nudge.Edges(host=lambda: Host(), oracle=lambda *a, **k: Queued(),
+                        records=lambda *a, **k: list(first_turn))
+    err = io.StringIO()
+    rc = nudge.main([iid, "[superlooper] PROGRESS PROBE"], env={"SL_RUN_ROOT": str(run_root)},
+                    out=err, edges=edges)
+    return runner_mod.ScriptRC(rc, err.getvalue())
+
+
+def test_a_probe_herdr_timed_out_after_submitting_is_journaled_unproven_and_still_counted(
+        rig, tmp_path):
+    """#513's six probes, through the whole chain: herdr's `timeout: timed out waiting for agent
+    status` comes only from the wait that runs AFTER the prompt was typed, so the journal must read
+    `send_unproven`, never `send_failed`'s "nothing was delivered and the session never saw the
+    message". The ladder is untouched: the attempt was counted before the send either way."""
+    _seed_live_lane(rig, probe_attempts=1)
+    refusal = _nudge_through_the_wrapper(tmp_path, "timeout", "timed out waiting for agent status")
+    assert int(refusal) == 7, refusal.stderr_tail
+    rig.rc_queue.append(refusal)
+    out = rig.r._execute({"act": "probe", "id": "i5", "num": 5, "attempt": 2}, NOW)
+    assert out.evidence["reason"] == "send_unproven", out.evidence
+    assert "timed out waiting for agent status" in out.evidence["captured"]
+    assert "nothing was carried" not in out.evidence["captured"]
+    ist = issue_state(rig, "i5")
+    assert ist["probe_attempts"] == 2 and ist["probe_sent_at"] == NOW
+
+
+def test_a_probe_herdr_refused_before_typing_is_still_journaled_send_failed(rig, tmp_path):
+    _seed_live_lane(rig, probe_attempts=1)
+    refusal = _nudge_through_the_wrapper(tmp_path, "agent_not_ready",
+                                         "agent i5 is no longer the pane foreground process")
+    assert int(refusal) == 1, refusal.stderr_tail
+    rig.rc_queue.append(refusal)
+    out = rig.r._execute({"act": "probe", "id": "i5", "num": 5, "attempt": 2}, NOW)
+    assert out.evidence["reason"] == "send_failed", out.evidence
+    assert issue_state(rig, "i5")["probe_attempts"] == 2
+
+
 def _seed_live_lane(rig, iid="i5", **fields):
     seed_issue(rig, iid, status="running", **fields)
     (rig.home / "state" / "panes" / iid).write_text("surf-uuid")
