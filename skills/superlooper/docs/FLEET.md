@@ -227,7 +227,10 @@ nothing else did, which is exactly the fallback case. A local override **replace
 shadows, so the snapshot's version is recorded in the file and this block **warns** (never fails)
 when the host's manifest has moved past it: the host's state is advisory by our own doctrine (plan
 §5.2) and gates nothing, so a stale snapshot costs detection quality, not correctness. Re-run
-`--install` to refresh it.
+`--install` to refresh it. Because nothing routine runs this command, the same warning, in the same
+words, is also `doctor --stack`'s `host screen override` line and a line in the morning report
+while it stands (issue #517) — on 2026-10-27 a snapshot two manifest versions behind had frozen out
+the host's fix for the agent's new busy spinner for weeks, with only this block saying so.
 
 **`claude binary`** — the launch stack's own pin (issue #303), reused here because this issue's
 amendment makes a green line the **cmux-independence assertion**: a fleet machine whose first

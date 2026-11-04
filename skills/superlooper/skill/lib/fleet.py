@@ -468,6 +468,102 @@ def override_source_version(text):
     return found.group(1) if found else None
 
 
+def stale_override_warning(path, snapshot, live):
+    """The ONE wording of "this override is older than the manifest the host now caches".
+
+    Every surface that carries it — `superlooper fleet`'s `screen fallback` block, `doctor --stack`,
+    the morning report (issue #517) — renders this string, so the three cannot drift into saying
+    different things about one file. It names both versions and the remedy, and says it is advisory:
+    the owner's posture (2026-08-05 triage) is that drift stays warn-only.
+    """
+    return ("%s is installed but snapshotted from manifest %s while the host now has %s — a local "
+            "override SHADOWS the auto-updating one, so its detection rules are frozen at the "
+            "snapshot. Re-run `superlooper fleet --install` to refresh it (advisory only: the "
+            "host's state gates nothing here)" % (path, snapshot, live))
+
+
+# What `override_drift` can answer. Plain strings because the morning report receives the reading
+# as a dict and must not import this module to compare against it (report.py stays pure).
+OVERRIDE_ABSENT = "absent"      # no local override: nothing shadows the host's own manifest
+OVERRIDE_CURRENT = "current"    # snapshotted from the very version the host caches
+OVERRIDE_STALE = "stale"        # snapshotted from another (in practice, older) version than the host caches
+OVERRIDE_UNKNOWN = "unknown"    # an override is there, but the two versions cannot be compared
+
+
+def override_drift(probe, agent=DEFAULT_AGENT):
+    """Is this machine's local screen-detection override older than the manifest the host caches?
+
+    Issue #517. On 2026-10-27 (#513) the override `fleet --install` had written was a snapshot of
+    manifest 2026.08.04.1 while the host cached 2026.10.11.1, which carried the vendor's fix for the
+    agent's new busy spinner. The whole-file override shadowed that fix, so every busy worker read
+    `unknown` and probes failed for weeks — while `superlooper fleet` warned about exactly this, on
+    a command nothing routine runs. This is that same reading, shaped for the surfaces the owner
+    does read: `doctor --stack` (`stack_doctor.check_host_screen_override`) and the morning report.
+
+    Returns ``{"status", "path", "snapshot", "live", "warning", "reason"}`` — `status` one of the
+    OVERRIDE_* strings above; `warning` the `stale_override_warning` text when (and only when) it is
+    stale; `reason` a plain clause saying WHY when it is unknown, else None.
+
+    Judged only for an ACTIVE override — one carrying our catch-all as a rule that can fire, the
+    same test `check_screen_fallback` applies (fresh-agent review). A file the host refuses to parse
+    shadows nothing, and calling it stale here while `superlooper fleet` reports it as no override
+    at all would be two surfaces disagreeing about one file; it reads UNKNOWN, and the fleet judge
+    is where it is named.
+
+    Machine-level and agent-fixed by default: the fleet overrides its default agent's manifest
+    (DEFAULT_AGENT, the agent the loop launches), which is also what `superlooper fleet` judges when
+    it is not told otherwise — so the report's line and the fleet block describe the same file.
+
+    The host's directories are resolved from the PROBE's environment, the host's own way (XDG
+    first, then HOME), never from this process's — so an injected probe cannot read the operator's
+    real host config. Read-only: herdr's files are read and never written. Never raises: a caller
+    is a report or a doctor, and a damaged file must cost a line, never the surface.
+    """
+    out = {"status": OVERRIDE_UNKNOWN, "path": None, "snapshot": None, "live": None,
+           "warning": None, "reason": "the override could not be read"}
+    # Contained BROADLY on purpose, and only here: every caller is a report or a doctor, the line
+    # this feeds is advisory, and an advisory line must never be the reason the morning report did
+    # not render. Anything unexpected reads as UNKNOWN — never as absent, never as current.
+    try:
+        env = dict(getattr(probe, "env", None) or {})
+        if getattr(probe, "home", None):
+            env.setdefault("HOME", probe.home)
+        path = out["path"] = override_path(session_host.config_dir(env), agent)
+        text = probe.read_text(path)
+        if text is None:
+            # `read_text` answers None for absent AND unreadable; only the first is "nothing here".
+            if not probe.exists(path):
+                out.update(status=OVERRIDE_ABSENT, reason=None)
+            return out
+        if not has_catchall_rule(text):
+            out["reason"] = ("it is not an active superlooper override (it does not parse, or its "
+                             "catch-all rule is gone) — `superlooper fleet` judges that file")
+            return out
+        out["snapshot"] = override_source_version(text)
+        if not out["snapshot"]:
+            out["reason"] = "it records no snapshot version to compare"
+            return out
+        cached = session_host.remote_manifest_path(session_host.state_dir(env), agent)
+        cached_text = probe.read_text(cached)
+        out["live"] = manifest_version(cached_text)
+        if not out["live"]:
+            if cached_text is None and not probe.exists(cached):
+                out["reason"] = ("the host has no cached manifest at %s to compare its snapshot "
+                                 "%s against" % (cached, out["snapshot"]))
+            else:
+                out["reason"] = ("the host's cached manifest at %s declares no version, or "
+                                 "could not be read" % cached)
+            return out
+    except Exception:                                   # noqa: BLE001 — see the comment above
+        return out
+    out["reason"] = None
+    if out["snapshot"] == out["live"]:
+        out["status"] = OVERRIDE_CURRENT
+    else:
+        out["status"] = OVERRIDE_STALE
+        out["warning"] = stale_override_warning(out["path"], out["snapshot"], out["live"])
+    return out
+
 # --------------------------------------------------------------------------------- the login item
 
 def render_server_plist(*, binary, session, token_file, log_dir, path):
@@ -1244,13 +1340,8 @@ def check_screen_fallback(probe, host_config_dir, agent=DEFAULT_AGENT, live_vers
             "the catch-all")
     snapshot = override_source_version(text)
     if live_version and snapshot and live_version != snapshot:
-        return CheckResult(
-            name, True,
-            "%s is installed but snapshotted from manifest %s while the host now has %s — a local "
-            "override SHADOWS the auto-updating one, so its detection rules are frozen at the "
-            "snapshot. Re-run `superlooper fleet --install` to refresh it (advisory only: the "
-            "host's state gates nothing here)" % (path, snapshot, live_version),
-            warn=True)
+        return CheckResult(name, True, stale_override_warning(path, snapshot, live_version),
+                           warn=True)
     return CheckResult(name, True,
                        "%s makes an unrecognised screen UNKNOWN (snapshot %s)"
                        % (path, snapshot or "unrecorded"))

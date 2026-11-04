@@ -388,8 +388,13 @@ wander, an unattended debugger, a runner resurrection, a triage-flight verdict, 
 or a standing hold or merge freeze past its age threshold. A queue of approved issues waiting is not
 news — six issues sitting there is something the dashboard shows, not something that happened. A
 freeze younger than its threshold isn't either, because every freeze already texts you when it
-starts. The installed-engine drift nudge stays in the file and never goes in the text. On a quiet
-morning the file is still written, the day still counts as reported, and the journal records
+starts. The installed-engine drift nudge stays in the file and never goes in the text. So does the
+**stale screen-override** line: on a machine whose session host runs a local screen-detection
+override snapshotted from an older manifest than the one the host now caches, the file carries the
+same warning `superlooper fleet` gives — both manifest versions and the remedy, `superlooper fleet
+--install` — for as long as it stays stale, and says nothing when the override is current or there
+is none. On a quiet morning the file is still written, the day still counts as reported, and the
+journal records
 `morning_push_skipped` with the reason. `superlooper morning-report` follows the same rule when you
 run it by hand; add `--always-send` to text it anyway.
 
@@ -946,7 +951,9 @@ superlooper doctor --stack
 
 This runs the machine-level checks (the coding-agent binary and login, `gh` auth and API headroom,
 the notify channel — which sends one real test message — the launch shim, the session host's own
-fence and state-report hook, the installed engine and ops docs) plus **exactly one of two
+fence and state-report hook, whether the host's local screen-detection override has gone stale
+(`host screen override`: a WARN naming both manifest versions and `superlooper fleet --install`,
+never a FAIL), the installed engine and ops docs) plus **exactly one of two
 home-specific blocks**, and the other prints as a clean skip:
 
 - **`runner anchor (live)`** — the `pane` home's block. When a runner is live it re-runs the

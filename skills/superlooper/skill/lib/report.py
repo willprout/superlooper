@@ -1137,6 +1137,24 @@ def _engine_drift(view):
             "republish when convenient).")
 
 
+def _screen_override(view):
+    """The stale screen-detection override line (issue #517), or None.
+
+    The caller pre-computes the reading with `fleet.override_drift` — it reads the session host's
+    files, which this pure module never does — and hands it in via view['screen_override']. Rendered
+    ONLY when it is stale, with the warning `superlooper fleet` gives carried verbatim (it names both
+    manifest versions and the remedy); current, absent, unknown or malformed stays silent. Like the
+    engine-drift nudge it is a standing condition: in the file while it stands, never news, never
+    the text — the owner's posture on drift is warn-only."""
+    d = view.get("screen_override")
+    if not isinstance(d, dict) or d.get("status") != "stale":
+        return None
+    warning = d.get("warning")
+    if not isinstance(warning, str) or not warning.strip():
+        return None
+    return f"**Session host's screen-detection override is stale** — {warning.strip()}."
+
+
 def _section(title, lines, empty="None."):
     body = "\n".join(lines) if lines else empty
     return f"## {title}\n{body}\n"
@@ -1272,7 +1290,10 @@ def morning(journal_records, gh_view, ledger, config):
                           state (#320), pre-computed by the caller from state/ALERT via
                           actions.queue_hold_reasons; absent/empty renders no hold,
                           "alerts": [{"reason", "headline", "remedy"}, …] — every standing ALERT
-                          reason (#490), from actions.standing_alerts; absent renders none}
+                          reason (#490), from actions.standing_alerts; absent renders none,
+                          "screen_override": fleet.override_drift's {"status", "warning", …} —
+                          the session host's screen-detection override (#517); one line in the
+                          file only while "status" is "stale", never news}
       ledger           the known-failure ledger dict {fingerprint: {...}} (accepted-failure count).
       config           the per-repo config (repo for links, qa.quarantine size).
     Never raises; every arg is coerced to a safe empty shape."""
@@ -1351,6 +1372,11 @@ def morning(journal_records, gh_view, ledger, config):
     drift = _engine_drift(view)
     if drift:
         parts.append(f"{drift}\n")
+    # Same placement and posture as the drift nudge (issue #517): a standing condition, rendered
+    # independently of `quiet` and never part of the headline.
+    override = _screen_override(view)
+    if override:
+        parts.append(f"{override}\n")
     parts += [
         _section("Merged", merged, "Nothing merged."),
         _section("Parked / needs-owner", parked),

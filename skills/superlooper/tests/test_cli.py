@@ -2029,6 +2029,87 @@ def test_doctor_stack_sends_a_test_tier_text(rig, tmp_path):
     assert title in r.stdout                        # the announce shows exactly what goes out
 
 
+# --------------------------- a stale screen-detection override (issue #517) ---------------------------
+# The two surfaces the owner actually reads, driven through the real CLI over a HOME the rig owns:
+# the host's dirs resolve from it (conftest scrubs XDG), so nothing here reads the machine's own.
+
+_SNAP, _LIVE = "2026.08.04.1", "2026.10.11.1"
+
+
+def _seed_host(rig, snapshot=None, live=None):
+    import fleet
+    if snapshot is not None:
+        override = rig.home / ".config" / "herdr" / "agent-detection" / "claude.toml"
+        override.parent.mkdir(parents=True, exist_ok=True)
+        override.write_text(fleet.render_manifest_override(
+            'id = "claude"\nversion = "%s"\n' % snapshot))
+    if live is not None:
+        cached = rig.home / ".local" / "state" / "herdr" / "agent-detection" / "remote" / "claude.toml"
+        cached.parent.mkdir(parents=True, exist_ok=True)
+        cached.write_text('id = "claude"\nversion = "%s"\n' % live)
+
+
+def _stack_ready(rig):
+    cfg_path = rig.repo / ".superlooper" / "config.json"
+    cfg = json.loads(cfg_path.read_text())
+    cfg["notify"] = {"cmd": "true", "imessage_to": None}
+    cfg_path.write_text(json.dumps(cfg))
+    (rig.home / ".zshrc").write_text('source "$HOME/.superlooper/launch-shim.zsh"\n')
+
+
+def test_doctor_stack_warns_on_a_stale_screen_override_and_still_passes(rig):
+    _stack_ready(rig)
+    _seed_host(rig, snapshot=_SNAP, live=_LIVE)
+    r = cli(rig, "doctor", "--stack", "--repo", str(rig.repo), env_over=_stack_env(rig))
+    line = [ln for ln in r.stdout.splitlines()
+            if ln.startswith("  ") and "host screen override" in ln]       # the block, not the tally
+    assert len(line) == 1, r.stdout + r.stderr
+    assert line[0].startswith("  WARN host screen override")
+    assert _SNAP in line[0] and _LIVE in line[0] and "superlooper fleet --install" in line[0]
+    assert str(rig.home / ".config" / "herdr" / "agent-detection" / "claude.toml") in line[0]
+    # warn-only: the stale override alone never turns the doctor red, and the closing line names it
+    assert r.returncode == 0, r.stdout + r.stderr
+    last = r.stdout.splitlines()[-1]
+    assert last.startswith("all stack checks passed (warnings:") and "host screen override" in last
+
+
+def test_doctor_stack_is_quiet_on_a_current_screen_override_and_on_no_override(rig):
+    _stack_ready(rig)
+    r = cli(rig, "doctor", "--stack", "--repo", str(rig.repo), env_over=_stack_env(rig))
+    assert "  ok   host screen override" in r.stdout, r.stdout
+    _seed_host(rig, snapshot=_LIVE, live=_LIVE)
+    r = cli(rig, "doctor", "--stack", "--repo", str(rig.repo), env_over=_stack_env(rig))
+    (line,) = [ln for ln in r.stdout.splitlines() if "host screen override" in ln]
+    assert line.startswith("  ok   host screen override") and _LIVE in line
+    assert "fleet --install" not in line
+
+
+def test_morning_report_carries_a_stale_screen_override_and_texts_nothing_for_it(rig, tmp_path):
+    home = rig.tmp / "slhome" / "o__r"
+    sent = tmp_path / "sent.txt"
+    _texting_config(rig, sent)
+    _seed_host(rig, snapshot=_SNAP, live=_LIVE)
+    r = cli(rig, "morning-report", "--repo", str(rig.repo))
+    assert r.returncode == 0, r.stdout + r.stderr
+    text = sorted((home / "reports").glob("morning-*.md"))[0].read_text()
+    (line,) = [ln for ln in text.splitlines() if "fleet --install" in ln]
+    assert _SNAP in line and _LIVE in line and "superlooper fleet --install" in line
+    # warn-only, no owner text: a stale override is not news, so a quiet night still sends nothing
+    assert not sent.exists() and "not sent" in r.stdout
+
+
+def test_morning_report_says_nothing_about_a_current_or_absent_screen_override(rig):
+    home = rig.tmp / "slhome" / "o__r"
+    for seed in ({}, {"snapshot": _LIVE, "live": _LIVE}):
+        _seed_host(rig, **seed)
+        for f in (home / "reports").glob("morning-*.md") if (home / "reports").exists() else ():
+            f.unlink()
+        r = cli(rig, "morning-report", "--repo", str(rig.repo))
+        assert r.returncode == 0, r.stdout + r.stderr
+        text = sorted((home / "reports").glob("morning-*.md"))[0].read_text()
+        assert "fleet --install" not in text and "screen-detection override" not in text.lower()
+
+
 # --------------------------- D1: gh pinned to config.repo, never cwd ---------------------------
 
 def _recording_gh(rig):
