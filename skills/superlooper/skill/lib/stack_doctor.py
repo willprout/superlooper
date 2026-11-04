@@ -1711,6 +1711,51 @@ _PLUGIN_INSTALL = (
 )
 
 
+
+# --- the stale screen-detection override (issue #517) -------------------------------------------
+# The fleet build-up's own judge (`superlooper fleet`, block `screen fallback`) has warned about this
+# from the start, and nothing routine runs it: on 2026-10-27 (#513) the override `fleet --install`
+# wrote was a snapshot of manifest 2026.08.04.1 while the host cached 2026.10.11.1, which carried the
+# vendor's fix for the agent's new busy spinner. The whole-file override shadowed that fix, every
+# busy worker read `unknown`, and probes failed intermittently for weeks. This block is that same
+# warning on the doctor every machine runs.
+
+def check_host_screen_override(probe):
+    """doctor --stack's `host screen override` line — a WARN, never a FAIL.
+
+    Deliberately NOT `screen fallback` again. That block is the fleet build-up's judge and FAILs a
+    fleet host with no override at all; this one runs on EVERY machine, most of which host no fleet
+    and need no override, so absence here is a plain ok. It asks only the question nothing routine
+    used to: is the override this machine has older than the manifest the host now caches. Warn-only
+    is the owner's posture (2026-08-05 triage): no block, no reinstall — the host's word gates
+    nothing (plan §5.2).
+
+    Every fact about the override — where it lives, how its snapshot version is recorded, the one
+    wording of the warning — is `fleet`'s; this reads them through `fleet.override_drift`, lazily,
+    because `fleet` imports THIS module at load time (the one-way rule the `identity` import keeps).
+    """
+    import fleet
+    name = "host screen override"
+    d = fleet.override_drift(probe)
+    if d["status"] == fleet.OVERRIDE_STALE:
+        return CheckResult(name, True, d["warning"], warn=True)
+    if d["status"] == fleet.OVERRIDE_CURRENT:
+        return CheckResult(name, True,
+                           "%s was snapshotted from manifest %s, the version the host caches — "
+                           "nothing newer is shadowed" % (d["path"], d["snapshot"]))
+    if d["status"] == fleet.OVERRIDE_ABSENT:
+        return CheckResult(name, True,
+                           "no local screen-detection override at %s, so nothing shadows the "
+                           "host's own manifest (on a fleet host, `superlooper fleet` judges "
+                           "whether one is required)" % d["path"])
+    if d["snapshot"] is None:
+        why = ("it records no snapshot version (not one `superlooper fleet --install` wrote) or "
+               "could not be read")
+    else:
+        why = "the host has no cached manifest to compare its snapshot %s against" % d["snapshot"]
+    return CheckResult(name, True, "%s is there but cannot be judged stale: %s"
+                       % (d["path"] or "the override", why))
+
 def _plugin_rows(probe, claude):
     """(rows, problem) from `claude plugin list --json` — the DOCUMENTED CLI surface for plugin
     state (plugins reference → `plugin list`), which reports install AND enable state in one call.
@@ -1861,6 +1906,10 @@ def check_stack(config, config_error=None, probe=None, sender=None, announce=Non
         # operator's settings file is clean, and this one asks whether the report it fires can
         # actually cross the fence on THIS machine (issue #331).
         check_host_state_capture(probe),
+        # The third question about the session host, and the one nothing routine used to ask
+        # (issue #517): is this machine's local screen-detection override older than the manifest
+        # the host caches. `superlooper fleet` always warned; nobody runs it. Warn-only.
+        check_host_screen_override(probe),
         check_superlooper_plugin(probe),
     ]
 

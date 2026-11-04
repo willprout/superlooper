@@ -662,6 +662,59 @@ def test_drift_notice_does_not_flip_a_quiet_night_to_noisy():
     assert "installed engine" in out.lower()
 
 
+# --- a stale screen-detection override (issue #517) --------------------------------------------
+# The runner/CLI pre-computes it with fleet.override_drift (it reads the host's files, so it lives
+# in the impure assembler; report.py stays pure) and hands it in via view['screen_override']. Same
+# posture as the drift nudge above: a standing condition, carried in the FILE while it stands,
+# silent when the override is current or absent, and never news — warn-only, no owner text.
+
+_SNAP, _LIVE = "2026.08.04.1", "2026.10.11.1"
+_STALE_WARNING = ("/h/.config/herdr/agent-detection/claude.toml is installed but snapshotted from "
+                  "manifest %s while the host now has %s — a local override SHADOWS the "
+                  "auto-updating one, so its detection rules are frozen at the snapshot. Re-run "
+                  "`superlooper fleet --install` to refresh it (advisory only: the host's state "
+                  "gates nothing here)" % (_SNAP, _LIVE))
+
+
+def _override(status="stale", warning=_STALE_WARNING):
+    return {"status": status, "path": "/h/.config/herdr/agent-detection/claude.toml",
+            "snapshot": _SNAP, "live": _LIVE if status != "current" else _SNAP,
+            "warning": warning}
+
+
+def test_morning_report_carries_the_stale_override_warning_while_it_stands():
+    out = report.morning([], _view(now=0, queue=[], screen_override=_override()),
+                         ledger={}, config=_cfg())
+    lines = [ln for ln in out.splitlines() if "fleet --install" in ln]
+    assert len(lines) == 1, out
+    line = lines[0]
+    # the same warning `superlooper fleet` gives, verbatim, under a lead a glance can catch
+    assert _STALE_WARNING in line
+    assert _SNAP in line and _LIVE in line and "superlooper fleet --install" in line
+    assert line.lower().startswith("**") and "screen-detection override" in line.lower()
+
+
+def test_morning_report_says_nothing_when_the_override_is_current_absent_or_unknown():
+    for so in (_override("current", warning=None), _override("absent", warning=None),
+               _override("unknown", warning=None), None, "stale", ["stale"],
+               # malformed: a stale status with no words to say is not a line to invent
+               _override("stale", warning=None), _override("stale", warning="   "),
+               _override("current", warning="leftover words")):
+        out = report.morning([], _view(now=0, queue=[], screen_override=so),
+                             ledger={}, config=_cfg())
+        assert "fleet --install" not in out and "screen-detection override" not in out.lower(), so
+
+
+def test_the_stale_override_never_flips_a_quiet_night_and_never_reaches_the_text():
+    view = _view(now=_NEWS_NOW, queue=[], usage=None, screen_override=_override())
+    out = report.morning([_LAST_REPORT], view, ledger={}, config=_cfg())
+    summary = next(ln for ln in out.splitlines() if ln.strip() and not ln.startswith("#"))
+    assert "nothing happened" in summary.lower() and "fleet" not in summary.lower()
+    assert "fleet --install" in out                                   # ...but the file carries it
+    assert report.morning_news([_LAST_REPORT], view, config=_cfg()) == []
+    assert report.morning_headline([_LAST_REPORT], view, config=_cfg()) == report.QUIET_HEADLINE
+
+
 # =============================== promotion evidence ===============================
 
 def _f(tid, text):
@@ -1113,6 +1166,12 @@ _NEWS_TABLE = [
      [], {"frozen": {"reason": "dev checks red: tests (failure)", "since": _NEWS_NOW - 3600}}, []),
     ("installed-engine drift (file only, never the text)",
      [], {"engine_drift": {"status": "behind", "behind": 4, "ref": "main"}}, []),
+    ("a stale screen-detection override (file only, never the text — issue #517)",
+     [], {"screen_override": {"status": "stale", "snapshot": "2026.08.04.1",
+                              "live": "2026.10.11.1", "path": "/h/.config/host/claude.toml",
+                              "warning": "snapshotted from manifest 2026.08.04.1 while the host "
+                                         "now has 2026.10.11.1 — re-run `superlooper fleet "
+                                         "--install`"}}, []),
     ("a green nightly", [_rec(_OVERNIGHT, "nightly", date="2026-07-02", green=True, flakes=0,
                              persistent=0, filed=[], parse_error=False, outcome="ok")], {}, []),
     ("a watchdog countdown that launched nothing",

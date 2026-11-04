@@ -175,6 +175,7 @@ def test_stack_doctor_all_checks_pass_with_injected_probe():
         ("installed ops docs", True),        # no installed engine home injected -> clean skip (#199)
         ("host state hook", True),           # clean global settings, no engine home yet (#307)
         ("host state capture", True),        # no control socket injected -> nothing to ask (#331)
+        ("host screen override", True),      # no override on this machine -> nothing shadowed (#517)
         ("superlooper plugin", True),        # installed + enabled in the healthy probe
     ]
 
@@ -1808,3 +1809,86 @@ def test_the_suite_can_never_reach_the_real_host_config_dir():
     for name in ("XDG_CONFIG_HOME", "XDG_STATE_HOME"):
         assert name not in os.environ, (
             "%s is how `fleet --install` would reach the owner's real herdr config dir" % name)
+
+
+# --- the stale screen-detection override, on the doctor every machine runs (issue #517) --------
+# `superlooper fleet` judged it from the start, and nobody runs that routinely: on 2026-10-27 (#513)
+# a snapshot two manifest versions behind had shadowed the host's own detection fix for weeks while
+# that warning sat unread. `doctor --stack` carries the same reading now, warn-only — never a FAIL.
+
+_SNAP, _LIVE = "2026.08.04.1", "2026.10.11.1"
+
+
+def _with_override(probe, snapshot=None, live=None):
+    import fleet
+    import session_host
+    env = dict(probe.env)
+    env.setdefault("HOME", probe.home)
+    if snapshot is not None:
+        probe.files[fleet.override_path(session_host.config_dir(env))] = (
+            fleet.render_manifest_override('id = "claude"\nversion = "%s"\n' % snapshot))
+    if live is not None:
+        probe.files[session_host.remote_manifest_path(session_host.state_dir(env), "claude")] = (
+            'id = "claude"\nversion = "%s"\n' % live)
+    return probe
+
+
+def _stack(probe):
+    config = {"notify": {"cmd": "true", "imessage_to": None}}
+    return stack_doctor.check_stack(config, probe=probe, sender=_ok_sender(),
+                                    announce=lambda *a: None)
+
+
+def _row(results, name="host screen override"):
+    rows = [r for r in results if r.name == name]
+    assert len(rows) == 1, [r.name for r in results]
+    return rows[0]
+
+
+def test_doctor_stack_warns_on_a_stale_override_naming_both_versions_and_the_remedy():
+    results = _stack(_with_override(_healthy_probe(), snapshot=_SNAP, live=_LIVE))
+    row = _row(results)
+    assert row.ok and row.warn
+    line = [ln for ln in stack_doctor.format_results(results) if "host screen override" in ln][0]
+    assert line.startswith("  WARN host screen override")
+    assert _SNAP in line and _LIVE in line and "superlooper fleet --install" in line
+    # Warn-only (owner posture, 2026-08-05 triage): the stack still passes.
+    assert [r.name for r in results if not r.ok] == []
+
+
+def test_doctor_stack_is_quiet_on_a_current_override_and_on_a_machine_with_none():
+    for probe in (_with_override(_healthy_probe(), snapshot=_LIVE, live=_LIVE),
+                  _with_override(_healthy_probe(), live=_LIVE),
+                  _healthy_probe()):
+        row = _row(_stack(probe))
+        assert row.ok and not row.warn, row
+        assert "fleet --install" not in row.detail, row.detail
+
+
+def test_the_block_warns_on_stale_and_passes_quietly_on_current_absent_and_uncomparable():
+    stale = stack_doctor.check_host_screen_override(
+        _with_override(FakeProbe(home="/home/will"), snapshot=_SNAP, live=_LIVE))
+    assert stale.name == "host screen override"
+    assert stale.ok and stale.warn                     # warn-only: never a FAIL
+    assert _SNAP in stale.detail and _LIVE in stale.detail
+    assert "superlooper fleet --install" in stale.detail
+    cases = {"current": dict(snapshot=_LIVE, live=_LIVE), "absent": {},
+             "no cached manifest": dict(snapshot=_SNAP)}
+    for why, seed in cases.items():
+        r = stack_doctor.check_host_screen_override(
+            _with_override(FakeProbe(home="/home/will"), **seed))
+        assert r.ok and not r.warn, (why, r)
+        assert "Re-run" not in r.detail, (why, r.detail)     # the remedy is the stale case's
+    current = stack_doctor.check_host_screen_override(
+        _with_override(FakeProbe(home="/home/will"), snapshot=_LIVE, live=_LIVE))
+    assert _LIVE in current.detail and "/home/will/.config/herdr/" in current.detail
+
+
+def test_the_block_reads_the_same_words_superlooper_fleet_prints():
+    import fleet
+    import session_host
+    probe = _with_override(FakeProbe(home="/home/will"), snapshot=_SNAP, live=_LIVE)
+    doctor = stack_doctor.check_host_screen_override(probe)
+    build_up = fleet.check_screen_fallback(
+        probe, session_host.config_dir({"HOME": "/home/will"}), live_version=_LIVE)
+    assert build_up.warn and doctor.detail == build_up.detail

@@ -5806,6 +5806,7 @@ class Runner:
         import report                                # lazy: keep the agent-agnostic runner light
         import notify
         import stack_doctor
+        import fleet
         records = journal.read(self.home)
         # ledger.json is the flat accepted-failure map (Task 12); the report only needs its size.
         # Read fail-closed here, exactly as _read_json does everywhere else in the runner.
@@ -5839,6 +5840,9 @@ class Runner:
         held = actions.queue_hold_reasons(alert)
         view = {"date": date, "now": now, "frozen": frozen, "queue": queue,
                 "usage": self.usage_view(), "engine_drift": drift,
+                # A stale session-host screen override (issue #517): read here for the reason
+                # engine_drift is — it reads the host's files, and report.py stays pure.
+                "screen_override": fleet.override_drift(stack_doctor.Probe()),
                 "queue_hold": {"reasons": held,
                                "since": (alert or {}).get("since")} if held else None,
                 # every standing ALERT reason with its remedy (issue #490) — what no text carries

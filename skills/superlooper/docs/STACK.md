@@ -267,6 +267,19 @@ An orchestrator additionally needs the tools used by the gate and by worker hand
   write nothing: the capture question names a pane that cannot resolve and an empty agent label, so
   the host refuses it before touching any state. `HERDR_SOCKET_PATH` overrides where it looks, the
   same variable the host itself reads first.
+- `host screen override`: WARNs — never FAILs — when this machine's local screen-detection override
+  (`<host config dir>/agent-detection/claude.toml`) was snapshotted from an OLDER manifest than the
+  one the host now caches (`<host state dir>/agent-detection/remote/claude.toml`). The line names
+  both versions and the remedy, word for word what `superlooper fleet`'s `screen fallback` block
+  says: re-run `superlooper fleet --install`, which re-snapshots the host's current manifest. Why it
+  matters: the override replaces the manifest it shadows, so every detection fix the host fetched
+  since the snapshot is frozen out — on 2026-10-27 (#513) a snapshot two versions behind made the
+  host read every busy worker as `unknown` for weeks, while only `superlooper fleet`, which nothing
+  routine runs, said so. A current override, a machine with no override at all (every machine that
+  hosts no fleet), and an override the doctor cannot compare (no recorded snapshot version, or no
+  cached manifest) are a plain ok. It only reads the host's files, and the host directories resolve
+  the host's own way (`XDG_CONFIG_HOME` / `XDG_STATE_HOME`, else under `HOME`). The morning report
+  carries the same line while the override stays stale (issue #517).
 - `superlooper plugin`: install it with `claude plugin marketplace add willprout/superlooper` then
   `claude plugin install superlooper@superlooper --scope user`; if it is installed but disabled, run
   `claude plugin enable superlooper@superlooper`. Always a WARN — the loop runs correctly without

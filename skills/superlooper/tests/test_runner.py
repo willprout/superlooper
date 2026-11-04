@@ -557,6 +557,32 @@ def test_every_runner_direct_send_arrives_whole(rig, tmp_path, monkeypatch):
     assert not [j for j in _journal(rig) if j.get("act") == "notify_truncated"]
 
 
+def test_the_morning_file_carries_a_stale_screen_override_and_drops_it_once_current(
+        rig, tmp_path, monkeypatch):
+    # Issue #517: the scheduled report is the FIRST entry point (the hand-run `morning-report` verb
+    # is the second) and both read the host's override the same way. HOME is the rig's own, and
+    # conftest scrubs XDG, so the host dirs resolve under it — never the machine's real ones.
+    import fleet
+    home = tmp_path / "userhome"
+    monkeypatch.setenv("HOME", str(home))
+    override = home / ".config" / "herdr" / "agent-detection" / "claude.toml"
+    cached = home / ".local" / "state" / "herdr" / "agent-detection" / "remote" / "claude.toml"
+    for p in (override, cached):
+        p.parent.mkdir(parents=True, exist_ok=True)
+    override.write_text(fleet.render_manifest_override('id = "claude"\nversion = "2026.08.04.1"\n'))
+    cached.write_text('id = "claude"\nversion = "2026.10.11.1"\n')
+    rig.r._morning_report_hook("2026-07-02", NOW)
+    text = (rig.home / "reports" / "morning-2026-07-02.md").read_text()
+    (line,) = [ln for ln in text.splitlines() if "fleet --install" in ln]
+    assert "2026.08.04.1" in line and "2026.10.11.1" in line and str(override) in line
+    # not news: a quiet night with a stale override still sends no text
+    assert [j for j in _journal(rig) if j.get("act") == "morning_push_skipped"]
+
+    override.write_text(fleet.render_manifest_override('id = "claude"\nversion = "2026.10.11.1"\n'))
+    rig.r._morning_report_hook("2026-07-03", NOW)
+    assert "fleet --install" not in (rig.home / "reports" / "morning-2026-07-03.md").read_text()
+
+
 def test_the_morning_file_carries_the_remedy_for_each_standing_alert(rig):
     import actions as actions_mod
     loopstate.save(str(rig.home / "state" / "ALERT"),

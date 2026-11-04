@@ -1115,3 +1115,99 @@ def test_the_judge_asks_the_capture_question_of_the_socket_the_fence_block_judge
     paths = {p for _who, p in asked}
     assert paths == {fleet.socket_path(_HOST_CONFIG_DIR)}, asked
     assert ("capture", fleet.socket_path(_HOST_CONFIG_DIR)) in asked
+
+
+# --- the stale override, carried to the surfaces the owner reads (issue #517) ------------------
+# On 2026-10-27 (#513) the override `fleet --install` wrote was a snapshot of manifest 2026.08.04.1
+# while the host cached 2026.10.11.1 — which carried the vendor's fix for the agent's new busy
+# spinner. The whole-file override shadowed it, every busy worker read `unknown`, and probes failed
+# for weeks. `superlooper fleet` warned the whole time; nothing routine runs it. So the one reading
+# below is what `doctor --stack` and the morning report now say too — same words, one helper.
+
+_OLD, _NEW = "2026.08.04.1", "2026.10.11.1"
+
+
+def _override_host(snapshot=None, live=None, env=None, home=_HOME, override_text=None):
+    """A probe over a host whose override was snapshotted from `snapshot` and whose cached remote
+    manifest is `live` (None = that file is absent), resolved the host's own way from `env`."""
+    env = {"HOME": home} if env is None else env
+    files = {}
+    path = fleet.override_path(session_host.config_dir(env))
+    if override_text is not None:
+        files[path] = override_text
+    elif snapshot is not None:
+        files[path] = fleet.render_manifest_override(
+            'id = "claude"\nversion = "%s"\n' % snapshot)
+    if live is not None:
+        files[session_host.remote_manifest_path(session_host.state_dir(env), "claude")] = (
+            'id = "claude"\nversion = "%s"\n' % live)
+    return FakeProbe(files=files, env=env, home=home)
+
+
+def test_a_stale_override_names_both_versions_and_the_remedy():
+    drift = fleet.override_drift(_override_host(snapshot=_OLD, live=_NEW))
+    assert drift["status"] == "stale"
+    assert drift["snapshot"] == _OLD and drift["live"] == _NEW
+    assert drift["path"] == _HOME + "/.config/herdr/agent-detection/claude.toml"
+    w = drift["warning"]
+    assert _OLD in w and _NEW in w and "superlooper fleet --install" in w
+    assert w.index(_OLD) < w.index(_NEW), "the snapshot is named first, then what the host has"
+
+
+def test_the_stale_warning_is_word_for_word_what_superlooper_fleet_gives():
+    # DoD: the OTHER surfaces report "the stale-override warning `superlooper fleet` gives" — so the
+    # words come from one place, not three hand-kept copies that drift apart.
+    probe = _override_host(snapshot=_OLD, live=_NEW)
+    drift = fleet.override_drift(probe)
+    fleet_block = fleet.check_screen_fallback(
+        probe, session_host.config_dir(probe.env), live_version=_NEW)
+    assert fleet_block.ok and fleet_block.warn
+    assert fleet_block.detail == drift["warning"]
+
+
+def test_a_current_override_and_an_absent_one_carry_no_warning():
+    current = fleet.override_drift(_override_host(snapshot=_NEW, live=_NEW))
+    assert current["status"] == "current" and current["warning"] is None
+    assert current["snapshot"] == _NEW and current["live"] == _NEW
+    # A machine with no override at all — every machine that is not a fleet host. Nothing shadows
+    # the host's manifest, so there is nothing to warn about (`superlooper fleet` alone judges
+    # whether a fleet host is MISSING one).
+    for probe in (_override_host(live=_NEW), _override_host()):
+        absent = fleet.override_drift(probe)
+        assert absent["status"] == "absent" and absent["warning"] is None
+
+
+def test_an_override_that_cannot_be_compared_is_not_called_stale():
+    # Warn-only means warn on EVIDENCE: no cached manifest, or an override that records no snapshot
+    # version (hand-written, or older than the marker), is not a stale one.
+    no_cache = fleet.override_drift(_override_host(snapshot=_OLD))
+    assert no_cache["status"] == "unknown" and no_cache["warning"] is None
+    assert no_cache["snapshot"] == _OLD and no_cache["live"] is None
+    unmarked = fleet.override_drift(_override_host(
+        override_text='id = "claude"\nversion = "%s"\n' % _OLD, live=_NEW))
+    assert unmarked["status"] == "unknown" and unmarked["warning"] is None
+    # ...and an override that EXISTS but cannot be read is unknown too, never absent.
+    unreadable = _Unreadable(
+        files={fleet.override_path(session_host.config_dir({"HOME": _HOME})): "x"},
+        env={"HOME": _HOME}, home=_HOME)
+    assert fleet.override_drift(unreadable)["status"] == "unknown"
+
+
+def test_the_drift_reading_resolves_the_host_dirs_from_the_probe_not_the_process():
+    # XDG first, then the probe's HOME — the host's own resolution, and never this process's real
+    # home (the "no test reads the operator's host config" ratchet).
+    env = {"XDG_CONFIG_HOME": "/xdg/cfg", "XDG_STATE_HOME": "/xdg/state"}
+    drift = fleet.override_drift(_override_host(snapshot=_OLD, live=_NEW, env=env))
+    assert drift["status"] == "stale"
+    assert drift["path"] == "/xdg/cfg/herdr/agent-detection/claude.toml"
+    homeless = FakeProbe(env={}, home="/elsewhere")
+    assert fleet.override_drift(homeless)["path"].startswith("/elsewhere/.config/")
+
+
+def test_the_drift_reading_never_raises():
+    # The morning report and the doctor both call it; a damaged file must cost a line, never them.
+    class _Exploding(FakeProbe):
+        def read_text(self, path):
+            raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+    assert fleet.override_drift(_Exploding(env={"HOME": _HOME}, home=_HOME))["status"] == "unknown"
+

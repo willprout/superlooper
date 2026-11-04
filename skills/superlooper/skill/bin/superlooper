@@ -2579,6 +2579,7 @@ def _ready_queue():
 # ------------------------------- morning-report -------------------------------
 
 def cmd_morning_report(args):
+    import fleet
     cfg = _load_config(args.repo)
     home = str(config_lib.state_home(cfg))
     date = time.strftime("%Y-%m-%d", time.localtime())
@@ -2602,7 +2603,11 @@ def cmd_morning_report(args):
             # stays pure). engine_drift never raises and skips cleanly when there is no source
             # checkout, so a plain adopted repo simply carries no drift notice.
             "engine_drift": stack_doctor.engine_drift(
-                repo_path=args.repo, dev_branch=cfg.get("dev_branch"))}
+                repo_path=args.repo, dev_branch=cfg.get("dev_branch")),
+            # A stale session-host screen override (issue #517), read through the SAME call the
+            # runner's hook makes, so the scheduled and the hand-run report cannot disagree. It
+            # never raises and only reads; a machine with no override carries no line.
+            "screen_override": fleet.override_drift(stack_doctor.Probe())}
     records = journal.read(home)
     text = report.morning(records, view, _ledger_map(home), cfg)
     out_dir = os.path.join(home, "reports")
