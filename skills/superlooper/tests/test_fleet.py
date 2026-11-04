@@ -1225,11 +1225,24 @@ def test_an_override_the_host_would_refuse_is_never_called_stale_and_agrees_with
     for why, text in cases.items():
         probe = _override_host(override_text=text, live=_NEW)
         drift = fleet.override_drift(probe)
-        assert drift["status"] == "unknown" and drift["warning"] is None, why
-        assert "not an active superlooper override" in drift["reason"], (why, drift["reason"])
         judge = fleet.check_screen_fallback(probe, session_host.config_dir(probe.env),
                                             live_version=_NEW)
-        assert not judge.ok, why
+        # The invariant, on EVERY interpreter: the drift reading and the fleet judge read the file
+        # through the same `has_catchall_rule`, so they cannot disagree about it. Where the judge
+        # FAILs it as no active override, the other two surfaces call it unknown — never stale.
+        assert (drift["status"] == "unknown") == (not judge.ok), (why, drift, judge)
+        if not judge.ok:
+            assert drift["warning"] is None, why
+            assert "not an active superlooper override" in drift["reason"], (why, drift["reason"])
+    # A commented-out catch-all is caught by both readers (the fallback strips comments too)...
+    assert fleet.override_drift(_override_host(
+        override_text=cases["catch-all commented out"], live=_NEW))["status"] == "unknown"
+    # ...but only a real TOML parser can see that `[[broken` makes the file unparseable. The CI floor
+    # (3.9) has none, and its fallback reader is narrow by its own docstring — there, BOTH the judge
+    # and this reading take the file as active, which is the agreement asserted above.
+    if fleet.tomllib is not None:
+        assert fleet.override_drift(_override_host(
+            override_text=cases["unparseable"], live=_NEW))["status"] == "unknown"
 
 
 def test_the_uncomparable_reason_tells_a_missing_cache_from_an_unversioned_one():
