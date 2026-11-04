@@ -2114,6 +2114,96 @@ def test_wildcard_hold_dedupes_once_per_episode():
     assert only(out, "launch") == []
 
 
+# ---- issue #519: the restore-green fix during a merge freeze, and its hold prose ----
+# #518 (eApp, 2026-11-03): the auto-filed fix (`touches: *`) sat 32 minutes behind a RUNNING lane
+# stuck on a startup dialog, with a lane free and merges frozen. Its journaled reason said "it
+# declares no `touches:` ... declare a narrower `touches:`", and the operator hand-narrowed a
+# declaration the engine wrote on purpose.
+
+def _fix_issue(num=1044):
+    return parsed(num, labels=("agent-ready", "type:diagnose-and-fix", "auto-approved:nightly-red",
+                               "expedite", "source:qa"), touches=("*",))
+
+
+def _frozen_disk(**over):
+    fp = actions.dev_fingerprint(list(RED), ["ci"])
+    return disk(frozen={"reason": "dev checks red: ci (failure)", "fingerprint": fp,
+                        "since": NOW - 100, "source": "dev-check"},
+                filed_fingerprints={fp: 1044}, **over)
+
+
+def test_frozen_restore_green_fix_launches_past_the_running_lane_the_518_case():
+    lane = [{"id": "i1031", "touches": ["frontend", "api"], "type": "build"}]
+    d = _frozen_disk(issues_state={"version": 1, "issues": {
+        "i1031": ist("running", declared_touches=["frontend", "api"], type="build")}})
+    out = decide(config=cfg(lanes=2), parsed_issues=[_fix_issue()], lane_state=lane, dsk=d,
+                 gh_view=ghv(dev_checks=list(RED)))
+    assert [a["id"] for a in only(out, "launch")] == ["i1044"]
+    assert only(out, "wildcard_hold") == []
+
+
+def test_frozen_restore_green_fix_with_every_lane_busy_is_not_launched():
+    lanes = [{"id": "i1031", "touches": ["frontend"], "type": "build"},
+             {"id": "i1032", "touches": ["api"], "type": "build"}]
+    d = _frozen_disk(issues_state={"version": 1, "issues": {
+        "i1031": ist("running", declared_touches=["frontend"], type="build"),
+        "i1032": ist("running", declared_touches=["api"], type="build")}})
+    out = decide(config=cfg(lanes=2), parsed_issues=[_fix_issue()], lane_state=lanes, dsk=d,
+                 gh_view=ghv(dev_checks=list(RED)))
+    assert only(out, "launch") == [] and only(out, "wildcard_hold") == []
+
+
+def _assert_no_narrowing_advice(reason):
+    low = reason.lower()
+    assert "narrower" not in low and "narrow " not in low, reason
+    assert "declares no `touches:`" not in reason, reason       # it declares `touches: *`
+    assert "add matching `areas`" not in reason, reason
+
+
+def test_restore_green_hold_behind_a_running_lane_says_so_and_when_it_releases():
+    # Unfrozen (the exemption is freeze-only), so the fix really is held — and the journal must say
+    # by WHAT kind of blocker, when that releases, and that the wildcard is the engine's on purpose.
+    lane = [{"id": "i9", "touches": ["frontend"], "type": "build"}]
+    d = disk(issues_state={"version": 1, "issues": {
+        "i9": ist("running", declared_touches=["frontend"], type="build")}})
+    out = decide(config=cfg(lanes=3), parsed_issues=[_fix_issue()], lane_state=lane, dsk=d)
+    assert only(out, "launch") == []
+    wh = only(out, "wildcard_hold")
+    assert len(wh) == 1 and wh[0]["id"] == "i1044" and wh[0]["blocker"] == "i9"
+    assert wh[0]["blocker_kind"] == "lane"
+    reason = wh[0]["reason"]
+    assert "running lane i9" in reason, reason
+    assert "releases when" in reason and "merges" in reason, reason
+    assert "not frozen" in reason, reason
+    assert "touches: *" in reason and "engine" in reason.lower(), reason
+    _assert_no_narrowing_advice(reason)
+
+
+def test_restore_green_hold_behind_a_finished_claim_says_so_and_when_it_releases():
+    d = disk(issues_state={"version": 1, "issues": {
+        "i533": ist("holding", declared_touches=["api"], type="build")}})
+    out = decide(config=cfg(lanes=3), parsed_issues=[_fix_issue()], dsk=d)
+    assert only(out, "launch") == []
+    wh = only(out, "wildcard_hold")
+    assert len(wh) == 1 and wh[0]["blocker"] == "i533" and wh[0]["blocker_kind"] == "claim"
+    reason = wh[0]["reason"]
+    assert "finished" in reason and "i533" in reason and "territory claim" in reason, reason
+    assert "releases when" in reason and "merges" in reason, reason
+    _assert_no_narrowing_advice(reason)
+
+
+def test_an_ordinary_wildcard_hold_keeps_its_original_prose():
+    # Every other candidate's hold reads exactly as before — only the restore-green fix's changed.
+    lane = [{"id": "i9", "touches": ["frontend"], "type": "build"}]
+    out = decide(config=cfg(touches_required=False, lanes=3),
+                 parsed_issues=[parsed(5, touches=())], lane_state=lane)
+    wh = only(out, "wildcard_hold")
+    assert len(wh) == 1
+    assert wh[0]["reason"] == actions._wildcard_hold_reason(
+        {"blocker_id": "i9", "self_wildcard": True, "blocker_wildcard": False})
+    assert "declare a narrower `touches:`" in wh[0]["reason"]
+
+
 def test_named_overlap_hold_is_not_journaled_as_wildcard():
     # A genuine named-area overlap (both declare 'frontend') serializes by the operator's design —
     # no wildcard mystery, so no wildcard_hold record.
@@ -3073,6 +3163,33 @@ def test_restore_green_exemption_reads_the_live_label_not_loopstate():
                  parsed_issues=[parsed(5, labels=("in-progress", "type:diagnose-and-fix"),
                                        touches=("*",))])
     assert only(out, "merge") == []
+
+
+def test_a_finished_lane_overlapping_the_inflight_fix_holds_until_the_fix_resolves():
+    # Issue #519's safety premise, pinned: the fix may now launch past a RUNNING lane while merges
+    # are frozen because the gate's overlap step holds that OTHER lane's merge while the fix is in
+    # flight — #518's i1031 PR journaled "diff overlaps in-flight lane i1044" and merged after it.
+    files = ("src/f/page.txt",)                                   # area `frontend`
+    fix_running = {"i1044": ist("running", declared_touches=["*"], type="diagnose-and-fix")}
+    d, g = _gating(pv=pr_view(files=files), issues_extra=fix_running, frozen=DEV_FREEZE)
+    out = decide(dsk=d, gh_view={**g, "dev_checks": list(RED)},
+                 parsed_issues=[parsed(5, labels=("in-progress", "type:build"))])
+    assert only(out, "merge") == []
+    h = [a for a in only(out, "hold") if a["id"] == "i5"]
+    assert len(h) == 1 and h[0]["overlap_lane"] == "i1044", h
+
+    # the fix merged but dev has not greened yet: the overlap is gone, the freeze still holds it
+    fix_done = {"i1044": ist("merged", declared_touches=["*"], type="diagnose-and-fix")}
+    d, g = _gating(pv=pr_view(files=files), issues_extra=fix_done, frozen=DEV_FREEZE)
+    out = decide(dsk=d, gh_view={**g, "dev_checks": list(RED)},
+                 parsed_issues=[parsed(5, labels=("in-progress", "type:build"))])
+    h = [a for a in only(out, "hold") if a["id"] == "i5"]
+    assert only(out, "merge") == [] and h and h[0].get("overlap_lane") is None, h
+
+    # dev green, freeze lifted: it merges
+    d, g = _gating(pv=pr_view(files=files), issues_extra=fix_done)
+    out = decide(dsk=d, gh_view=g, parsed_issues=[parsed(5, labels=("in-progress", "type:build"))])
+    assert [m["num"] for m in only(out, "merge")] == [5]
 
 
 # --------------------------- merge refusals: bounded + surfaced (issue #27) ---------------------------

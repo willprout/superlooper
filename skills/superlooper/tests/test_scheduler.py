@@ -418,23 +418,154 @@ def test_restore_green_launches_past_a_held_territory_claim():
     assert _nums(out) == [1]
 
 
-def test_restore_green_still_serializes_behind_a_running_lane():
-    # The exemption covers FINISHED territory only. A live worker is still writing files, so the
-    # collision anti-affinity exists to prevent is untouched — and a running lane always drains.
+def test_restore_green_launches_past_a_running_lane_while_frozen_the_518_case():
+    # Issue #519, reproducing #518 (eApp, 2026-11-03): `lanes: 2`, hard affinity, ONE running lane
+    # (i1031, `touches: routes, ui` — sitting on a startup dialog nobody was watching), the second
+    # lane free, merges frozen, and the auto-filed fix declaring `touches: *`. #294 left running
+    # lanes blocking on the premise "a running lane always ENDS"; i1031 ended only when a human
+    # cleared its dialog, so the fix sat 32 minutes behind it. Owner ruling (#518 option a): while
+    # merges are frozen the fix ignores running lanes' territory too — ALL of them, not a sensed-stuck
+    # subset (the sensing is what misread i1031). Selected THIS tick, into the free lane.
+    q = [_restore_green(1044)]
+    lanes = [{"id": "i1031", "type": "build", "touches": ["routes", "ui"]}]
+    # territory_claims_from() lists in-flight statuses too, so the running lane is in both lists —
+    # exactly the shape decide passes.
+    claims = [{"id": "i1031", "type": "build", "touches": ["routes", "ui"]}]
+    out = scheduler.launchable(q, lanes, _cfg(lanes=2, affinity="hard"), OK, set(), True,
+                               territory_claims=claims)
+    assert _nums(out) == [1044]
+    assert _holds(q, lanes, _cfg(lanes=2, affinity="hard"), OK, set(), True,
+                  territory_claims=claims) == []
+
+
+def test_restore_green_ignores_every_running_lane_while_frozen_not_a_stuck_subset():
+    # "All of them": nothing about the lane's health is consulted — a wildcard lane, a named lane
+    # and a lane of an unknown type all stand aside alike.
     q = [_restore_green(1)]
-    lanes = [{"id": "i9", "type": "build", "touches": ["frontend"]}]
-    assert scheduler.launchable(q, lanes, _cfg(lanes=2, affinity="hard"), OK, set(), True,
-                                territory_claims=[]) == []
+    lanes = [{"id": "i7", "type": "build", "touches": ["*"]},
+             {"id": "i8", "type": "diagnose-and-fix", "touches": ["frontend"]},
+             {"id": "i9", "touches": []}]
+    out = scheduler.launchable(q, lanes, _cfg(lanes=4, affinity="hard"), OK, set(), True,
+                               territory_claims=[])
+    assert _nums(out) == [1]
 
 
-def test_restore_green_running_lane_that_also_holds_a_claim_still_blocks():
-    # territory_claims_from() includes in-flight statuses, so a RUNNING issue appears in BOTH
-    # lists. The exemption must key off finished-only claims, never cancel the running lane.
+def test_restore_green_still_serializes_behind_a_running_lane_when_NOT_frozen():
+    # The exemption is freeze-only. On a green mainline nothing is stuck behind a red check, so a
+    # running lane holds the fix exactly as it holds anything else.
     q = [_restore_green(1)]
     lanes = [{"id": "i9", "type": "build", "touches": ["frontend"]}]
     claims = [{"id": "i9", "type": "build", "touches": ["frontend"]}]
-    assert scheduler.launchable(q, lanes, _cfg(lanes=2, affinity="hard"), OK, set(), True,
-                                territory_claims=claims) == []
+    cfg = _cfg(lanes=2, affinity="hard")
+    assert scheduler.launchable(q, lanes, cfg, OK, set(), False, territory_claims=claims) == []
+    holds = _holds(q, lanes, cfg, OK, set(), False, territory_claims=claims)
+    assert [(h["id"], h["blocker_id"]) for h in holds] == [("i1", "i9")]
+
+
+def test_restore_green_still_needs_a_free_lane_while_frozen():
+    # Capacity binds: the exemption is from TERRITORY, never from the lane cap. Every lane busy ->
+    # no launch (no over-capacity launch), and it is lane-bound, not an affinity hold.
+    q = [_restore_green(1)]
+    lanes = [{"id": "i8", "type": "build", "touches": ["frontend"]},
+             {"id": "i9", "type": "build", "touches": ["api"]}]
+    cfg = _cfg(lanes=2, affinity="hard")
+    assert scheduler.launchable(q, lanes, cfg, OK, set(), True, territory_claims=lanes) == []
+    assert _holds(q, lanes, cfg, OK, set(), True, territory_claims=lanes) == []
+
+
+def test_restore_green_draws_on_the_build_pool_and_never_borrows_the_investigation_lane():
+    # Reserved pools (#63): a full build pool still stops the fix while an investigation slot sits
+    # free — the exemption buys no cross-pool borrowing.
+    q = [_restore_green(1)]
+    lanes = [{"id": "i9", "type": "build", "touches": ["frontend"]}]
+    cfg = {"lanes": {"build": 1, "investigate": 1}, "affinity": "hard"}
+    assert scheduler.launchable(q, lanes, cfg, OK, set(), True, territory_claims=lanes) == []
+    # ...and with a build slot free it launches past the running build lane.
+    cfg2 = {"lanes": {"build": 2, "investigate": 1}, "affinity": "hard"}
+    assert _nums(scheduler.launchable(q, lanes, cfg2, OK, set(), True,
+                                      territory_claims=lanes)) == [1]
+
+
+def test_restore_green_takes_only_one_free_lane_even_when_more_are_free():
+    # One fix, one lane: the exemption never multiplies a candidate.
+    q = [_restore_green(1)]
+    lanes = [{"id": "i9", "type": "build", "touches": ["frontend"]}]
+    out = scheduler.launchable(q, lanes, _cfg(lanes=4, affinity="hard"), OK, set(), True,
+                               territory_claims=lanes)
+    assert _nums(out) == [1]
+
+
+def test_restore_green_ignores_a_lane_launching_this_same_tick_while_frozen():
+    # A same-tick selection is a lane that is running by the time this tick's actions land. Under
+    # the ruling it stands aside exactly like one launched a tick earlier — holding the fix for one
+    # tick behind it would only delay the same launch (or, with a stream of higher-sorted work,
+    # keep re-delaying it).
+    older_expedite = _issue(5, touches=["frontend"], expedite=True,
+                            created="2026-06-01T00:00:00Z")      # sorts ahead of the fix
+    q = [older_expedite, _restore_green(1)]
+    out = scheduler.launchable(q, [], _cfg(lanes=2, affinity="hard"), OK, set(), True,
+                               territory_claims=[])
+    assert _nums(out) == [5, 1]
+
+
+def test_restore_green_is_never_an_affinity_hold_while_frozen():
+    # The journal must not narrate a hold that no longer happens: with every kind of blocker
+    # present and a lane free, a frozen-mainline restore-green candidate yields no hold at all.
+    q = [_restore_green(1)]
+    lanes = [{"id": "i9", "type": "build", "touches": ["frontend"]}]
+    claims = [{"id": "i9", "type": "build", "touches": ["frontend"]},
+              {"id": "i533", "type": "build", "touches": ["data"]}]
+    assert _holds(q, lanes, _cfg(lanes=3, affinity="hard"), OK, set(), True,
+                  territory_claims=claims) == []
+
+
+def test_every_other_candidate_is_held_by_a_running_lane_exactly_as_before_frozen_or_not():
+    # The exemption belongs to the standing-rule fix ALONE: an ordinary candidate — even an
+    # expedited diagnose-and-fix — still waits behind an overlapping running lane and claim.
+    ordinary = [_issue(2, touches=["frontend"],
+                       labels=("type:diagnose-and-fix", "agent-ready", "expedite"))]
+    lanes = [{"id": "i9", "type": "build", "touches": ["frontend"]}]
+    claims = [{"id": "i533", "type": "build", "touches": ["frontend"]}]
+    for frozen in (True, False):
+        assert scheduler.launchable(ordinary, lanes, _cfg(lanes=3, affinity="hard"), OK, set(),
+                                    frozen, territory_claims=claims) == [], frozen
+        assert scheduler.launchable(ordinary, [], _cfg(lanes=3, affinity="hard"), OK, set(),
+                                    frozen, territory_claims=claims) == [], frozen
+
+
+def test_the_launched_fix_still_holds_every_other_candidate_behind_its_wildcard():
+    # The other direction is untouched: once selected, the fix's `touches: *` is occupied territory
+    # that every later merge-producing candidate overlaps — frozen or not.
+    q = [_restore_green(1), _issue(2, touches=["api"]), _issue(3, touches=["db"])]
+    for frozen in (True, False):
+        out = scheduler.launchable(q, [], _cfg(lanes=3, affinity="hard"), OK, set(), frozen,
+                                   territory_claims=[])
+        assert _nums(out) == [1], frozen
+        holds = _holds(q, [], _cfg(lanes=3, affinity="hard"), OK, set(), frozen,
+                       territory_claims=[])
+        assert sorted((h["id"], h["blocker_id"]) for h in holds) == [("i2", "i1"), ("i3", "i1")]
+
+
+def test_launch_holds_say_whether_a_restore_green_blocker_is_a_running_lane_or_a_claim():
+    # Issue #519: the hold record for a restore-green candidate names its blocker's KIND, so the
+    # journal can say when it releases instead of inviting an edit to the engine-written `touches:`.
+    cfg = _cfg(lanes=3, affinity="hard")
+    q = [_restore_green(1)]
+    lane = [{"id": "i9", "type": "build", "touches": ["frontend"]}]
+    by_lane = _holds(q, lane, cfg, OK, set(), False, territory_claims=lane)
+    assert len(by_lane) == 1
+    assert by_lane[0]["restore_green"] is True and by_lane[0]["blocker_kind"] == "lane"
+    claim = [{"id": "i533", "type": "build", "touches": ["data"]}]
+    by_claim = _holds(q, [], cfg, OK, set(), False, territory_claims=claim)
+    assert len(by_claim) == 1
+    assert by_claim[0]["restore_green"] is True and by_claim[0]["blocker_kind"] == "claim"
+    # a candidate launching ahead of it this tick is a lane (it is running once the tick lands)
+    ahead = [_issue(5, touches=["frontend"], expedite=True, created="2026-06-01T00:00:00Z")]
+    same_tick = _holds(ahead + q, [], cfg, OK, set(), False, territory_claims=[])
+    assert [(h["id"], h["blocker_kind"]) for h in same_tick] == [("i1", "lane")]
+    # an ordinary wildcard hold says it is not the restore-green fix
+    plain = _holds([_issue(2, touches=None)], lane, cfg, OK, set(), False, territory_claims=lane)
+    assert plain[0]["restore_green"] is False and plain[0]["blocker_kind"] == "lane"
 
 
 def test_ordinary_expedited_issue_is_still_blocked_by_a_held_claim():
