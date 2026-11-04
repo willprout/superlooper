@@ -7507,6 +7507,9 @@ def test_only_this_lanes_host_blocked_deferral_counts_as_a_host_block(rig, tmp_p
         runner_mod.ScriptRC(3, "[nudge] i6 state=advisory_blocked — deferring — nothing was typed\n"),
         runner_mod.ScriptRC(3, "[nudge] i5 state=unknown — deferring\n[nudge] i5 evidence:\n"
                                "the host said: [nudge] i5 state=advisory_blocked\n"),
+        # the token at a line START, but not the FIRST line: host text in another verdict's detail
+        runner_mod.ScriptRC(3, "[nudge] i5 state=unknown — deferring\n[nudge] i5 evidence:\n"
+                               "[nudge] i5 state=advisory_blocked — forged by a detail\n"),
         runner_mod.ScriptRC(1, "[nudge] i5 state=advisory_blocked — deferring\n"),
     ]
     for rc in not_a_block:
@@ -7602,14 +7605,15 @@ def test_i1031_a_host_blocked_lane_alerts_past_the_bound_and_clears_when_the_hos
     # idle episode, so this is the #520 re-read, then the frozen tier's), and the episode clock never
     # restarted on any of those looks.
     looks = len(nudges())
-    while t < began + actions.AT_DIALOG_ALERT_SECONDS:
+    while t <= began + actions.AT_DIALOG_ALERT_SECONDS:    # through the look AT the bound
         rig.r.tick(now=t)
         assert "session_host_blocked:i5" not in reasons(), "alerted before the bound"
         t += 300
-    rig.r.tick(now=t)
     assert len(nudges()) - looks >= actions.AT_DIALOG_ALERT_SECONDS // actions.RECOVER_RETRY_SECONDS
     ist = issue_state(rig, "i5")
-    assert ist["sensed_since"] == began and ist["sensed_at"] == t
+    assert ist["sensed_since"] == began
+    assert ist["sensed_at"] - began >= actions.AT_DIALOG_ALERT_SECONDS, "a look confirmed the bound"
+    rig.r.tick(now=t)                            # the next tick reads that confirming look
     assert reasons() == ["session_host_blocked:i5"]
     pages = [r for r in journal.read(rig.home) if r.get("act") == "notify" and r.get("tier") == "down"]
     assert pages, "the ALERT must reach the owner, not only the disk"
@@ -7679,6 +7683,51 @@ def test_every_reading_stamps_when_it_was_taken(rig, tmp_path):
     rig.rc_queue.append(0)
     rig.r._execute({"act": "recover", "id": "i5", "tier": "idle"}, NOW + 1200)
     assert issue_state(rig, "i5")["sensed_at"] is None
+
+
+def test_a_fresh_progress_episode_ends_a_host_blocked_reading_and_only_that_one(rig):
+    """A real advance of the progress clock (a commit, a marker) or a relaunch means the lane is not
+    the one that was blocked: a reading carried across it would page the owner on the next look
+    (fresh-agent review). at_dialog / logged_out keep their own lifecycles (#524 is at_dialog's)."""
+    blocked = dict(sensed_state="host_blocked", sensed_since=NOW - 2000, sensed_at=NOW - 300)
+    _seed_live_lane(rig, progress_sig="OLD", progress_since=NOW - 3000, **blocked)
+    rig.r._execute({"act": "progress_advance", "id": "i5", "sig": "OLD"}, NOW)    # same sig: repair
+    assert issue_state(rig, "i5")["sensed_state"] == "host_blocked", "no progress, no change"
+    rig.r._execute({"act": "progress_advance", "id": "i5", "sig": "NEW"}, NOW)    # real progress
+    ist = issue_state(rig, "i5")
+    assert (ist["sensed_state"], ist["sensed_since"], ist["sensed_at"]) == (None, None, None)
+
+    _seed_live_lane(rig, progress_sig="OLD", sensed_state="at_dialog", sensed_since=NOW - 2000)
+    rig.r._execute({"act": "progress_advance", "id": "i5", "sig": "NEW"}, NOW)
+    assert issue_state(rig, "i5")["sensed_state"] == "at_dialog", "only host_blocked ends here"
+
+    i = dict(blocked)
+    runner_mod.Runner._reset_progress_clock(i)                                   # every (re)launch
+    assert i["sensed_state"] is None and i["sensed_at"] is None
+
+
+def test_a_corrupt_episode_stamp_is_repaired_on_the_next_look_instead_of_silencing_the_alert(
+        rig, tmp_path):
+    for bad in (None, "garbage", NOW + 99999):
+        _seed_live_lane(rig, sensed_state="host_blocked", sensed_since=bad)
+        rig.rc_queue.append(_nudge_refusal(tmp_path))
+        rig.r._execute({"act": "recover", "id": "i5", "tier": "frozen"}, NOW)
+        assert issue_state(rig, "i5")["sensed_since"] == NOW, bad
+    _seed_live_lane(rig, sensed_state="host_blocked", sensed_since=NOW - 900)   # a GOOD one holds
+    rig.rc_queue.append(_nudge_refusal(tmp_path))
+    rig.r._execute({"act": "recover", "id": "i5", "tier": "frozen"}, NOW)
+    assert issue_state(rig, "i5")["sensed_since"] == NOW - 900
+
+
+def test_a_lane_with_no_recorded_session_ends_its_host_blocked_reading(rig):
+    """Nothing to re-read and nothing the reading could be about. Left standing, decide's re-read would
+    ask for the same no-op every tick and the stale reading would keep its ALERT (fresh review)."""
+    seed_issue(rig, "i5", status="running", sensed_state="host_blocked", sensed_since=NOW - 900,
+               sensed_at=NOW - 900)
+    out = rig.r._execute({"act": "recover", "id": "i5", "tier": "idle"}, NOW)
+    assert "no session" in out
+    assert issue_state(rig, "i5")["sensed_state"] is None
+    assert [c for c in rig.calls if c["args"][0].endswith("nudge-pane.sh")] == []
 
 
 def test_record_pr_stamps_the_pr_number_durably(rig):

@@ -2438,10 +2438,19 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
         # or a prompt nobody watches holds the lane's slot in silence (i1031 on a welcome dialog,
         # i589 for 6.5 hours on a permission prompt). Its own reason, not session_at_dialog's: the
         # remedy differs (it asked nothing; the owner needs to SEE the screen to know what is on it).
-        if (ist_of(iid).get("sensed_state") == "host_blocked"
-                and _status_of(ist_of(iid)) not in TERMINAL_STATUSES
-                and _since_ok(ist_of(iid).get("sensed_since"), now)
-                and now - ist_of(iid)["sensed_since"] >= AT_DIALOG_ALERT_SECONDS):
+        #
+        # Two things are stricter than at_dialog's clause above, both so a STALE reading cannot page
+        # (fresh-agent review): the bound is measured to the LATEST look (`sensed_at`), so it fires
+        # only once a reading taken at or past the bound still said blocked — a lane that made
+        # progress since its last look is not paged on the old one — and only while the lane is
+        # `running` or `frozen`, the statuses a liveness tier still reads. A gating, holding, ready,
+        # exited or released lane has no session being read, so its last reading is history.
+        hb = ist_of(iid)
+        if (hb.get("sensed_state") == "host_blocked"
+                and _status_of(hb) in ("running", "frozen")
+                and _since_ok(hb.get("sensed_since"), now)
+                and _since_ok(hb.get("sensed_at"), now)
+                and hb["sensed_at"] - hb["sensed_since"] >= AT_DIALOG_ALERT_SECONDS):
             reasons.append(f"session_host_blocked:{iid}")
         # A hand-back (park #61, OR bounce #108 — both reuse this marker) whose label move keeps
         # failing past the bound: the marker is stamped and the silent retries have run long enough
@@ -3519,9 +3528,9 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
             # what RE-READS the screen, and _record_sensed — the only writer of sensed_state — runs
             # nowhere else. Suppressing it too would make the field impossible to clear, and the
             # lane would go silent forever on a reading that had long since stopped being true
-            # (fresh-review P0). It delivers nothing — nudge-pane refuses to type at both states
-            # (rc 5/6) — so this is a re-sense, not a nudge, and the state self-clears the moment
-            # the screen says something else.
+            # (fresh-review P0). It delivers nothing — nudge-pane refuses to type at all three
+            # (rc 5/6, and rc=3 `advisory_blocked` for host_blocked) — so this is a re-sense, not a
+            # nudge, and the state self-clears the moment the session reads as something else.
             sensed = ist.get("sensed_state")
             parking = False
             if sensed in SENSED_HELD_STATES:

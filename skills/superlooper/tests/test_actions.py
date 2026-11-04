@@ -5886,8 +5886,8 @@ def test_a_dialog_alert_needs_a_real_stamp_and_a_live_lane():
 # started, and the lane deferred every 10 minutes in silence until a human happened to look. It now
 # gets the at_dialog shape: re-sensed, never parked, and a bounded ALERT naming the lane.
 
-def _host_blocked(status="frozen", since=NOW - actions.AT_DIALOG_ALERT_SECONDS, **over):
-    return ist(status, sensed_state="host_blocked", sensed_since=since, **over)
+def _host_blocked(status="frozen", since=NOW - actions.AT_DIALOG_ALERT_SECONDS, at=NOW, **over):
+    return ist(status, sensed_state="host_blocked", sensed_since=since, sensed_at=at, **over)
 
 
 def test_a_host_blocked_lane_reaches_the_owner_on_the_dialog_alerts_bound():
@@ -5964,14 +5964,35 @@ def test_the_progress_ladder_never_parks_a_host_blocked_lane_at_its_cap():
     assert len(only(out, "park")) == 1
 
 
-def test_a_host_blocked_alert_needs_a_real_stamp_and_a_live_lane():
+def test_a_host_blocked_alert_needs_real_stamps_and_a_lane_still_being_read():
     for since in (None, "garbage", NOW + 99999):
         d = disk(issues_state={"version": 1, "issues": {"i5": _host_blocked(since=since)}})
         assert only(decide(events=[{"type": "frozen", "id": "i5"}], dsk=d), "alert") == [], since
-    for status in ("merged", "parked"):
+    for at in (None, "garbage", NOW + 99999):
+        d = disk(issues_state={"version": 1, "issues": {"i5": _host_blocked(at=at)}})
+        assert only(decide(events=[{"type": "frozen", "id": "i5"}], dsk=d), "alert") == [], at
+    # Only `running` / `frozen` — the statuses a liveness tier still reads. Any other status has no
+    # session being read, so a confirmed old reading is history: it must not page (fresh review).
+    for status in ("merged", "parked", "ready", "gating", "holding", "exited", "awaiting_answer"):
         d = disk(issues_state={"version": 1,
                                "issues": {"i5": _host_blocked(status, since=NOW - 99999)}})
         assert only(decide(dsk=d), "alert") == [], status
+    d = disk(issues_state={"version": 1, "issues": {"i5": _host_blocked("running")}})
+    assert len(only(decide(dsk=d), "alert")) == 1, "running is read, so it alerts"
+
+
+def test_a_host_blocked_alert_needs_a_look_at_or_past_the_bound_that_still_said_blocked():
+    """The bound is measured to the LATEST look, not to now: a lane last read as blocked 25 minutes
+    into its episode may have made progress since — it is paged only once a reading taken at or past
+    the bound still says blocked (fresh-agent review: a commit landing on the tick the bound passed
+    paged the owner about a lane that was working)."""
+    stale = _host_blocked("running", since=NOW - actions.AT_DIALOG_ALERT_SECONDS - 300,
+                          at=NOW - 600)
+    d = disk(issues_state={"version": 1, "issues": {"i5": stale}})
+    out = decide(dsk=d)
+    assert only(out, "alert") == []
+    assert [a["tier"] for a in only(out, "recover") if a["id"] == "i5"] == ["idle"], \
+        "it is re-read instead — the reading that can confirm the block or end it"
 
 
 def test_a_host_blocked_alert_points_at_its_lanes_issue():

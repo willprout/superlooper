@@ -4319,6 +4319,10 @@ class Runner:
             return self._record_sensed(iid, rc, now, tier=tier)
         # idle: the safe peek — a gentle status ask, never a blind action
         if not self._has_session(iid):
+            # (#520) No session is recorded, so there is nothing a host-blocked reading could be
+            # about and nothing to re-read it from: end it here. Left standing, decide's re-read
+            # would ask for this same no-op every tick, and the stale reading would keep its ALERT.
+            self._update_issue(iid, fn=lambda st, i: self._end_host_blocked(i))
             return "no session recorded"
         msg = ("[superlooper] Status check: are you progressing? If you are waiting on long "
                "background work, touch your awaiting marker (see your brief).")
@@ -4345,8 +4349,10 @@ class Runner:
         """Did nudge-pane defer because the SESSION HOST reports this agent `blocked` — waiting on a
         person (issue #520)? rc=3 has several causes (the host could not vouch, no record yet, the
         host's `blocked`), and only the evidence line says which: `[nudge] <id> state=advisory_blocked`,
-        the FIRST line lib/nudge.py writes. Anchored on a line START and on THIS lane's id, so the
-        token quoted inside an evidence detail, or another lane's line, reads as no block. Plain int
+        the FIRST line lib/nudge.py writes. Read from that first line ONLY and anchored on THIS lane's
+        id, so the token inside a later evidence detail (another verdict's detail can carry host
+        text across lines), or another lane's line, reads as no block. The refusal is ~200
+        characters, far inside the tail ScriptRC keeps, so the first line always survives. Plain int
         rc (a stub that captured nothing) fails to "not blocked" — today's reading, never a worse one.
 
         Read off stderr rather than given an exit code of its own on purpose: rc=3's promise — nothing
@@ -4355,9 +4361,9 @@ class Runner:
         which banner rc=5 saw."""
         if rc != 3:
             return False
-        tail = getattr(rc, "stderr_tail", "") or ""
-        return re.search(r"(?m)^\[nudge\] %s state=advisory_blocked\b" % re.escape(iid),
-                         tail) is not None
+        first = (getattr(rc, "stderr_tail", "") or "").lstrip().split("\n", 1)[0]
+        return re.match(r"\[nudge\] %s state=advisory_blocked\b" % re.escape(iid),
+                        first) is not None
 
     def _record_sensed(self, iid, rc, now, tier=None):
         """Turn a nudge-pane rc into the lane's honest sensed state (issue #151). Shared by BOTH
@@ -4395,9 +4401,12 @@ class Runner:
         dialog or prompt waiting on a person (see `_host_blocked`). Before it, that refusal cleared
         the reading like any other rc=3, so no bound ever started and the lane deferred every 10
         minutes in silence (#518's i1031 on a welcome dialog; i589, 6.5 hours on a permission
-        prompt). It gets at_dialog's treatment downstream — re-sensed, never parked, a bounded
-        ALERT — and the same episode rule: the clock starts at the first blocked reading, holds
-        while the host keeps saying it, and any other reading ends it."""
+        prompt). Downstream it is re-sensed, never parked and owed a bounded ALERT, as at_dialog is,
+        and it goes two steps further (at_dialog's equivalents are #524): the #157 ladder neither
+        counts a blocked probe (`_exec_probe`) nor parks the lane at its cap, and decide re-reads a
+        standing reading on the recovery cadence wherever no tier would (`sensed_at`). The episode
+        rule is the same: the clock starts at the first blocked reading, holds while the host keeps
+        saying it, and any other reading — or a fresh progress episode — ends it."""
         sensed = {5: "logged_out", 6: "at_dialog"}.get(rc)
         if sensed is None and self._host_blocked(iid, rc):
             sensed = "host_blocked"
@@ -4407,6 +4416,11 @@ class Runner:
             if i.get("sensed_state") != sensed:
                 i["sensed_state"] = sensed
                 i["sensed_since"] = now if sensed else None
+            elif sensed and not actions._since_ok(i.get("sensed_since"), now):
+                # (#520 review) An unusable stamp on a reading that still stands is REPAIRED to this
+                # look. It was only ever written on a change, so a corrupt one kept the alert's stamp
+                # check false — the lane silent for good, the hole the bound exists to close.
+                i["sensed_since"] = now
             # (#520) When the standing reading was last TAKEN — every look, unlike sensed_since. decide
             # re-reads a host_blocked lane on this clock wherever no liveness tier would.
             i["sensed_at"] = now if sensed else None
@@ -4447,6 +4461,21 @@ class Runner:
         i["harvest_tried"] = False              # (#189) a new episode re-arms the one report rescue
         i["worktree_head"] = None               # (#515) the last HEAD known for the lane worktree
         i["worktree_head_at"] = None            # (#515) ...and when it was first known
+        Runner._end_host_blocked(i)             # (#520) a fresh episode is not one blocked on a person
+
+    @staticmethod
+    def _end_host_blocked(i):
+        """End a standing host_blocked reading (issue #520), and only that one. Called where the lane
+        has demonstrably moved on — a fresh progress episode (a relaunch, or a real advance of the
+        progress clock: a commit, a report or blocked marker) — or where there is no session left to
+        read. Without it the reading would outlive the block: an episode that was blocked for the
+        whole bound before a person cleared it would page the owner as soon as the lane was read
+        again from a new session or after its first commit. at_dialog and logged_out keep their own
+        lifecycles (#524 is at_dialog's)."""
+        if i.get("sensed_state") == "host_blocked":
+            i["sensed_state"] = None
+            i["sensed_since"] = None
+            i["sensed_at"] = None
 
     @staticmethod
     def _remember_worktree_head(i, a, prior, prior_at, now):
