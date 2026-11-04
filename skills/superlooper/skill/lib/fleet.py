@@ -500,8 +500,19 @@ def override_drift(probe, agent=DEFAULT_AGENT):
     a command nothing routine runs. This is that same reading, shaped for the surfaces the owner
     does read: `doctor --stack` (`stack_doctor.check_host_screen_override`) and the morning report.
 
-    Returns ``{"status", "path", "snapshot", "live", "warning"}`` — `status` one of the OVERRIDE_*
-    strings above, `warning` the `stale_override_warning` text when (and only when) it is stale.
+    Returns ``{"status", "path", "snapshot", "live", "warning", "reason"}`` — `status` one of the
+    OVERRIDE_* strings above; `warning` the `stale_override_warning` text when (and only when) it is
+    stale; `reason` a plain clause saying WHY when it is unknown, else None.
+
+    Judged only for an ACTIVE override — one carrying our catch-all as a rule that can fire, the
+    same test `check_screen_fallback` applies (fresh-agent review). A file the host refuses to parse
+    shadows nothing, and calling it stale here while `superlooper fleet` reports it as no override
+    at all would be two surfaces disagreeing about one file; it reads UNKNOWN, and the fleet judge
+    is where it is named.
+
+    Machine-level and agent-fixed by default: the fleet overrides its default agent's manifest
+    (DEFAULT_AGENT, the agent the loop launches), which is also what `superlooper fleet` judges when
+    it is not told otherwise — so the report's line and the fleet block describe the same file.
 
     The host's directories are resolved from the PROBE's environment, the host's own way (XDG
     first, then HOME), never from this process's — so an injected probe cannot read the operator's
@@ -509,7 +520,7 @@ def override_drift(probe, agent=DEFAULT_AGENT):
     is a report or a doctor, and a damaged file must cost a line, never the surface.
     """
     out = {"status": OVERRIDE_UNKNOWN, "path": None, "snapshot": None, "live": None,
-           "warning": None}
+           "warning": None, "reason": "the override could not be read"}
     # Contained BROADLY on purpose, and only here: every caller is a report or a doctor, the line
     # this feeds is advisory, and an advisory line must never be the reason the morning report did
     # not render. Anything unexpected reads as UNKNOWN — never as absent, never as current.
@@ -522,21 +533,36 @@ def override_drift(probe, agent=DEFAULT_AGENT):
         if text is None:
             # `read_text` answers None for absent AND unreadable; only the first is "nothing here".
             if not probe.exists(path):
-                out["status"] = OVERRIDE_ABSENT
+                out.update(status=OVERRIDE_ABSENT, reason=None)
+            return out
+        if not has_catchall_rule(text):
+            out["reason"] = ("it is not an active superlooper override (it does not parse, or its "
+                             "catch-all rule is gone) — `superlooper fleet` judges that file")
             return out
         out["snapshot"] = override_source_version(text)
-        out["live"] = manifest_version(probe.read_text(
-            session_host.remote_manifest_path(session_host.state_dir(env), agent)))
+        if not out["snapshot"]:
+            out["reason"] = "it records no snapshot version to compare"
+            return out
+        cached = session_host.remote_manifest_path(session_host.state_dir(env), agent)
+        cached_text = probe.read_text(cached)
+        out["live"] = manifest_version(cached_text)
+        if not out["live"]:
+            if cached_text is None and not probe.exists(cached):
+                out["reason"] = ("the host has no cached manifest at %s to compare its snapshot "
+                                 "%s against" % (cached, out["snapshot"]))
+            else:
+                out["reason"] = ("the host's cached manifest at %s declares no version, or "
+                                 "could not be read" % cached)
+            return out
     except Exception:                                   # noqa: BLE001 — see the comment above
         return out
-    if out["snapshot"] and out["live"]:
-        if out["snapshot"] == out["live"]:
-            out["status"] = OVERRIDE_CURRENT
-        else:
-            out["status"] = OVERRIDE_STALE
-            out["warning"] = stale_override_warning(out["path"], out["snapshot"], out["live"])
+    out["reason"] = None
+    if out["snapshot"] == out["live"]:
+        out["status"] = OVERRIDE_CURRENT
+    else:
+        out["status"] = OVERRIDE_STALE
+        out["warning"] = stale_override_warning(out["path"], out["snapshot"], out["live"])
     return out
-
 
 # --------------------------------------------------------------------------------- the login item
 

@@ -1711,7 +1711,6 @@ _PLUGIN_INSTALL = (
 )
 
 
-
 # --- the stale screen-detection override (issue #517) -------------------------------------------
 # The fleet build-up's own judge (`superlooper fleet`, block `screen fallback`) has warned about this
 # from the start, and nothing routine runs it: on 2026-10-27 (#513) the override `fleet --install`
@@ -1748,13 +1747,9 @@ def check_host_screen_override(probe):
                            "no local screen-detection override at %s, so nothing shadows the "
                            "host's own manifest (on a fleet host, `superlooper fleet` judges "
                            "whether one is required)" % d["path"])
-    if d["snapshot"] is None:
-        why = ("it records no snapshot version (not one `superlooper fleet --install` wrote) or "
-               "could not be read")
-    else:
-        why = "the host has no cached manifest to compare its snapshot %s against" % d["snapshot"]
     return CheckResult(name, True, "%s is there but cannot be judged stale: %s"
-                       % (d["path"] or "the override", why))
+                       % (d["path"] or "the override", d.get("reason") or "the reading failed"))
+
 
 def _plugin_rows(probe, claude):
     """(rows, problem) from `claude plugin list --json` — the DOCUMENTED CLI surface for plugin

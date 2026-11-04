@@ -1211,3 +1211,37 @@ def test_the_drift_reading_never_raises():
             raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
     assert fleet.override_drift(_Exploding(env={"HOME": _HOME}, home=_HOME))["status"] == "unknown"
 
+
+
+def test_an_override_the_host_would_refuse_is_never_called_stale_and_agrees_with_the_fleet_judge():
+    # Fresh-agent review: a file the host refuses to parse shadows nothing, and `superlooper fleet`
+    # FAILs it as no active override. The drift reading must not call that same file "stale ... a
+    # local override SHADOWS" on the other two surfaces.
+    rendered = fleet.render_manifest_override('id = "claude"\nversion = "%s"\n' % _OLD)
+    cases = {
+        "unparseable": rendered + "\n[[broken\n",
+        "catch-all commented out": rendered.replace('state = "unknown"', '# state = "unknown"'),
+    }
+    for why, text in cases.items():
+        probe = _override_host(override_text=text, live=_NEW)
+        drift = fleet.override_drift(probe)
+        assert drift["status"] == "unknown" and drift["warning"] is None, why
+        assert "not an active superlooper override" in drift["reason"], (why, drift["reason"])
+        judge = fleet.check_screen_fallback(probe, session_host.config_dir(probe.env),
+                                            live_version=_NEW)
+        assert not judge.ok, why
+
+
+def test_the_uncomparable_reason_tells_a_missing_cache_from_an_unversioned_one():
+    missing = fleet.override_drift(_override_host(snapshot=_OLD))
+    assert "has no cached manifest at" in missing["reason"] and _OLD in missing["reason"]
+    probe = _override_host(snapshot=_OLD)
+    cached = session_host.remote_manifest_path(session_host.state_dir(probe.env), "claude")
+    probe.files[cached] = 'id = "claude"\n'                         # present, but no version line
+    unversioned = fleet.override_drift(probe)
+    assert unversioned["status"] == "unknown"
+    assert "declares no version" in unversioned["reason"] and cached in unversioned["reason"]
+    # the comparable states carry no reason at all
+    for snap in (_OLD, _NEW):
+        assert fleet.override_drift(_override_host(snapshot=snap, live=_NEW))["reason"] is None
+    assert fleet.override_drift(_override_host())["reason"] is None

@@ -393,8 +393,8 @@ starts. The installed-engine drift nudge stays in the file and never goes in the
 override snapshotted from an older manifest than the one the host now caches, the file carries the
 same warning `superlooper fleet` gives — both manifest versions and the remedy, `superlooper fleet
 --install` — for as long as it stays stale, and says nothing when the override is current or there
-is none. On a quiet
-morning the file is still written, the day still counts as reported, and the journal records
+is none. On a quiet morning the file is still written, the day still counts as reported, and the
+journal records
 `morning_push_skipped` with the reason. `superlooper morning-report` follows the same rule when you
 run it by hand; add `--always-send` to text it anyway.
 

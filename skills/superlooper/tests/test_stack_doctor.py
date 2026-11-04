@@ -1811,6 +1811,30 @@ def test_the_suite_can_never_reach_the_real_host_config_dir():
             "%s is how `fleet --install` would reach the owner's real herdr config dir" % name)
 
 
+def test_the_suite_cannot_resolve_the_operators_real_host_dirs_even_with_a_real_home():
+    """The guard for the rigs that leave HOME real (issue #517's fresh-agent review).
+
+    The XDG scrub above assumes every rig overrides HOME; the runner rigs do not, and the morning
+    report reads the host's screen override through a REAL Probe. conftest therefore redirects any
+    resolution that names the operator's own host dirs — and only those: a probe or rig with its
+    own HOME resolves exactly as before, which is what every other test here depends on.
+    """
+    import conftest
+    import fleet
+    import session_host
+    real = {"HOME": conftest._IMPORT_ENV.get("HOME") or os.path.expanduser("~")}
+    assert session_host.config_dir(real) == conftest.NEUTRAL_HOST_CONFIG_DIR
+    assert session_host.state_dir(real) == conftest.NEUTRAL_HOST_STATE_DIR
+    # The exact shape the runner's morning-report hook uses: a real Probe over this process's env,
+    # which in a runner rig still carries the real HOME.
+    real_env = dict(os.environ, HOME=real["HOME"])
+    drift = fleet.override_drift(stack_doctor.Probe(env=real_env))
+    assert drift["path"].startswith(conftest.NEUTRAL_HOST_CONFIG_DIR) and drift["status"] == "absent"
+    # ...and nothing else moved.
+    assert session_host.config_dir({"HOME": "/home/will"}) == "/home/will/.config/herdr"
+    assert session_host.state_dir({"HOME": "/home/will"}) == "/home/will/.local/state/herdr"
+
+
 # --- the stale screen-detection override, on the doctor every machine runs (issue #517) --------
 # `superlooper fleet` judged it from the start, and nobody runs that routinely: on 2026-10-27 (#513)
 # a snapshot two manifest versions behind had shadowed the host's own detection fix for weeks while

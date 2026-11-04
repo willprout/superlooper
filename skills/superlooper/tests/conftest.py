@@ -241,6 +241,49 @@ def _never_probe_the_real_control_socket(monkeypatch):
         monkeypatch.delenv(name, raising=False)
 
 
+# The operator's own environment, captured ONCE at import — before any fixture scrubs XDG or a test
+# points HOME somewhere else — so the guard below knows which directories are the REAL ones.
+_IMPORT_ENV = dict(os.environ)
+# Where the guard sends a resolution that would have landed on the operator's real host dirs. A path
+# that cannot exist, in the same spirit as the socket and binary defaults above.
+NEUTRAL_HOST_CONFIG_DIR = "/nonexistent/superlooper-test-host-config"
+NEUTRAL_HOST_STATE_DIR = "/nonexistent/superlooper-test-host-state"
+
+
+@pytest.fixture(autouse=True)
+def _never_read_the_real_host_dirs(monkeypatch, _never_probe_the_real_control_socket):
+    # The premise the XDG scrub above rests on — "every rig here overrides HOME" — is not true of
+    # every rig, and since issue #517 that matters. The runner rigs (test_runner, test_standing_holds,
+    # and the files that reuse them) leave HOME real, and the morning report now reads the session
+    # host's screen-detection override and cached manifest. A fresh-agent review measured ~200 report
+    # files written during one run carrying THIS machine's real stale-override line: every test
+    # passed, but a report's content had become a fact about the machine the suite ran on.
+    #
+    # So the guard sits at the one resolution every reader goes through — session_host's own
+    # `config_dir` / `state_dir` — and redirects only an answer that names the operator's REAL host
+    # directories (by HOME or by an exported XDG home, as captured at import). A rig with its own
+    # HOME, or a probe with its own env, resolves exactly as before. Fail-closed GLOBAL, per the
+    # toast-spam ratchet: no rig has to remember to opt in, and a reader added later is covered too.
+    import session_host
+    real_home = _IMPORT_ENV.get("HOME") or os.path.expanduser("~")
+    real_config, real_state = set(), set()
+    for env in ({"HOME": real_home}, _IMPORT_ENV):
+        real_config.add(os.path.realpath(session_host.config_dir(env)))
+        real_state.add(os.path.realpath(session_host.state_dir(env)))
+    resolve_config, resolve_state = session_host.config_dir, session_host.state_dir
+
+    def config_dir(env=None):
+        got = resolve_config(env)
+        return NEUTRAL_HOST_CONFIG_DIR if os.path.realpath(got) in real_config else got
+
+    def state_dir(env=None):
+        got = resolve_state(env)
+        return NEUTRAL_HOST_STATE_DIR if os.path.realpath(got) in real_state else got
+
+    monkeypatch.setattr(session_host, "config_dir", config_dir)
+    monkeypatch.setattr(session_host, "state_dir", state_dir)
+
+
 @pytest.fixture(autouse=True)
 def _never_reach_real_launchctl(monkeypatch, _clear_worker_launch_env):
     # Same ratchet as the four above, for macOS's service manager (issue #306). The runner's
