@@ -13,18 +13,25 @@ import shutil
 import subprocess
 
 GIT_TIMEOUT = 60   # seconds per git command — a hung network fetch must never wedge a tick
+# lane_head runs for EVERY in-flight lane on EVERY tick (issue #515), with no network in it, so a
+# hung read must cost seconds — the same bound the worker's own Stop-hook stamp gives the same read.
+LANE_HEAD_TIMEOUT = 5
 
 # An OBJECT ID as a citation may take: a 7-to-40 character hex abbreviation, either case.
 # `commit_on_branch` explains why a ref name is not allowed to stand in for one.
 _OID_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
+# A FULL object id as `rev-parse` prints one: sha-1 (40) or sha-256 (64), lowercase.
+_FULL_OID_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 
 
-def _git(cwd, *args, timeout=GIT_TIMEOUT):
+def _git(cwd, *args, timeout=GIT_TIMEOUT, env=None):
     """Run `git -C <cwd> <args>`. Returns (rc, combined output). Never raises: timeout, missing
-    binary, or any OSError becomes a nonzero rc with the message as output (fail closed)."""
+    binary, or any OSError becomes a nonzero rc with the message as output (fail closed). `env`
+    adds variables on top of the inherited environment."""
     try:
         r = subprocess.run(["git", "-C", os.fspath(cwd), *args],
-                           capture_output=True, text=True, timeout=timeout)
+                           capture_output=True, text=True, timeout=timeout,
+                           env={**os.environ, **env} if env else None)
         return (r.returncode, (r.stdout or "") + (r.stderr or ""))
     except subprocess.TimeoutExpired:
         return (124, f"git {' '.join(args)} timed out after {timeout}s")
@@ -98,6 +105,36 @@ def head_oid(worktree):
     rc, out = _git(worktree, "rev-parse", "HEAD")
     oid = (out or "").strip()
     return oid if rc == 0 and len(oid) == 40 and all(c in "0123456789abcdef" for c in oid) else None
+
+
+def lane_head(worktree, timeout=LANE_HEAD_TIMEOUT):
+    """The lane worktree's HEAD oid as the runner reads it for the progress clock, or None when it
+    cannot be read (issue #515). Never raises.
+
+    It runs beside a LIVE worker, every tick, so:
+      * NO LOCK. `--no-optional-locks` plus GIT_OPTIONAL_LOCKS=0, and `rev-parse` is a pure ref
+        read — it never refreshes the index, so it neither takes the worker's index.lock nor fails
+        while the worker's own `git add`/`commit` holds it.
+      * NEVER ANOTHER REPO'S HEAD. Plain `git -C <dir>` walks UP until it finds a repository, so a
+        lane directory with no git of its own (or a stray, invalid `.git`) inside some other checkout
+        would answer with THAT checkout's HEAD — a false "commit" the moment it differs. A `.git`
+        entry must exist in the directory itself, and GIT_CEILING_DIRECTORIES stops discovery at its
+        parent. A pruned worktree (its gitdir gone) then fails outright.
+      * BOUNDED. LANE_HEAD_TIMEOUT seconds, and the answer must be a full object id; a timeout, a
+        missing git, an unborn branch or any stray output is None. The caller reads None as
+        "unknown", never as movement (events.progress_clock)."""
+    try:
+        p = os.fspath(worktree)
+        if not os.path.lexists(os.path.join(p, ".git")):
+            return None
+        ceiling = os.path.dirname(os.path.realpath(p))
+    except (OSError, TypeError, ValueError):
+        return None
+    rc, out = _git(p, "--no-optional-locks", "rev-parse", "--verify", "--quiet", "HEAD^{commit}",
+                   timeout=timeout,
+                   env={"GIT_OPTIONAL_LOCKS": "0", "GIT_CEILING_DIRECTORIES": ceiling})
+    oid = (out or "").strip()
+    return oid if rc == 0 and _FULL_OID_RE.match(oid) else None
 
 
 def merge_update(worktree, dev_branch):

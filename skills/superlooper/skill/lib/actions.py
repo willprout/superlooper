@@ -934,6 +934,26 @@ def _launch_stderr_memo(tail):
     return "\n\nlaunch stderr (tail — the agent's own error just before it exited):\n" + t
 
 
+def _lane_clock(iid, ist, status_clocks, worktree_heads):
+    """One lane's #157 progress clock as the runner measures it (issue #515): the Stop-hook stamp with
+    the HEAD the runner read from the lane's worktree this tick — or, when that read failed, the last
+    one that succeeded (`worktree_head` in the issue state). Every reader of the clock in decide goes
+    through here, so the ladder, the #231 un-latch and their baselines can never compare a worktree
+    HEAD against a stamped one. The rules themselves live in events.progress_clock."""
+    last = ist.get("worktree_head") if isinstance(ist, dict) else None
+    return events_mod.progress_clock(status_clocks.get(iid), worktree_heads.get(iid), last)
+
+
+def _with_worktree_head(action, clock):
+    """`action` plus the worktree HEAD its clock was measured at, when there is one (issue #515). It
+    is the journaled evidence of a mid-turn commit, and the executor remembers it so a later failed
+    read keeps measuring from it."""
+    head = clock.get("worktree_head") if isinstance(clock, dict) else None
+    if head is not None:
+        action["worktree_head"] = head
+    return action
+
+
 def _progress_stall_memo(iid, clock, stall_secs, attempts, ack_state):
     """The dossier for a progress-stall park (issue #157). Names the evidence William reads instead
     of an unbounded nudge loop: how long the progress clock has been frozen, the frozen HEAD, how
@@ -1784,6 +1804,9 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     exited = _dget(dsk, "exited", dict)
     launch_stderr = _dget(dsk, "launch_stderr", dict)   # {id: bounded stderr tail} (issue #40)
     status_clocks = _dget(dsk, "status_clocks", dict)   # {id: parsed status.json} — the #157 progress clock
+    # {id: HEAD oid | None} — the lane worktree's HEAD as the RUNNER read it this tick (issue #515).
+    # Overlaid on the stamp by _lane_clock, so a commit made mid-turn is progress within one tick.
+    worktree_heads = _dget(dsk, "worktree_heads", dict)
     acks = _dget(dsk, "acks", dict)                      # {id: raw ack text} — the worker's probe reply
     awaiting = _dget(dsk, "awaiting", dict)              # {id: marker} — worker flagged long background work
     exit_receipts = _dget(dsk, "exit_receipts", dict)    # {id: newest mail-consumption ts} (#148/#215)
@@ -3358,7 +3381,8 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
             # a lane crossing INTO frozen this tick (`frozen_ids`, status still 'running') takes the
             # normal recover below, which is what stamps the baseline the comparison reads.
             if status == "frozen":
-                cur_sig = events_mod.progress_signature(status_clocks.get(iid))
+                fclock = _lane_clock(iid, ist, status_clocks, worktree_heads)
+                cur_sig = events_mod.progress_signature(fclock)
                 if cur_sig is not None:
                     baseline = ist.get("progress_sig")
                     if events_mod.progress_advanced(baseline, cur_sig):
@@ -3371,8 +3395,10 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                         # (i328). The action is `unlatch_frozen`, deliberately NOT `unfreeze` — that
                         # verb is the unrelated MERGES-frozen mechanism (state/merges_frozen.json), a
                         # different machine that happens to share the word (this issue's boundary).
-                        out.append({"act": "unlatch_frozen", "id": iid, "num": num, "sig": cur_sig,
-                                    "evidence_class": events_mod.progress_evidence(baseline, cur_sig)})
+                        out.append(_with_worktree_head(
+                            {"act": "unlatch_frozen", "id": iid, "num": num, "sig": cur_sig,
+                             "evidence_class": events_mod.progress_evidence(baseline, cur_sig)},
+                            fclock))
                         continue
                     if not events_mod.usable_baseline(baseline) and events_mod.usable_baseline(cur_sig):
                         # No baseline fit to measure a future advance against — it froze before the
@@ -3384,7 +3410,8 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                         # #157). Anchor only to a readable signature — never poison the baseline with an
                         # unreadable 'None' head. A good baseline that simply did not advance falls
                         # through to the nudge ladder, its last-known-good head preserved.
-                        out.append({"act": "progress_advance", "id": iid, "sig": cur_sig})
+                        out.append(_with_worktree_head(
+                            {"act": "progress_advance", "id": iid, "sig": cur_sig}, fclock))
                         continue
             # The lane looks frozen by the clock, but the runner has SENSED why (issue #151), and
             # in both cases PARKING is the wrong answer:
@@ -3432,7 +3459,10 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
         # (each demanding a machine-readable ack file), then escalated with a dossier. The frozen
         # tier above already claimed dead/frozen lanes, so a lane reaching here is ALIVE (taking
         # turns) — "turns taken but no progress" is exactly what this measures.
-        clock = status_clocks.get(iid)
+        # The HEAD is the one the runner read from the lane's worktree this tick, not only the one the
+        # worker's last rest stamped (issue #515): a worker committing inside one long turn never
+        # rests, and #513's three false parks were exactly that. See events.progress_clock.
+        clock = _lane_clock(iid, ist, status_clocks, worktree_heads)
         cur_sig = events_mod.progress_signature(clock)
         have_clock = cur_sig is not None
         if have_clock and status in INFLIGHT_STATUSES and not in_wake_grace and iid not in awaiting:
@@ -3441,7 +3471,8 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                 # first sight / real progress / a corrupt clock: re-anchor and (on a genuine change)
                 # reset the episode. The executor clears the probe counters ONLY when the signature
                 # actually changed, so a mere since-repair never drops an in-flight escalation.
-                out.append({"act": "progress_advance", "id": iid, "sig": cur_sig})
+                out.append(_with_worktree_head(
+                    {"act": "progress_advance", "id": iid, "sig": cur_sig}, clock))
                 continue
             if now - since >= progress_stall_secs:
                 # STALLED: turns taken, no commit/marker/HEAD change for the whole window.

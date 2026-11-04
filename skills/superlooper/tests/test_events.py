@@ -533,6 +533,52 @@ def test_progress_evidence_is_fail_closed_on_unparseable_input():
     assert events.progress_evidence("A|False|False", "A|False|False") == "progress clock advanced"
 
 
+# ---- the runner reads the lane worktree's HEAD itself (issue #515) ----
+# The Stop hook stamps HEAD only when the worker RESTS, so a worker committing inside one long turn
+# (background agents, a review cascade) looked frozen to the ladder and was parked mid-commit
+# (#513: i893, i1013, i1028). progress_clock overlays the HEAD the runner read from the lane's
+# worktree this tick onto the stamp; the stamp still owns the report/blocked markers.
+
+_STAMP = {"id": "i5", "ts": 100, "cwd": "/w", "head": "X", "dirty": False,
+          "report": False, "blocked": False}
+
+
+def test_progress_clock_takes_the_worktree_head_over_a_stale_stamp():
+    c = events.progress_clock(_STAMP, worktree_head="Y")
+    assert c["head"] == "Y" and c["worktree_head"] == "Y"
+    assert events.progress_signature(c) == "Y|False|False"
+    assert _STAMP["head"] == "X"                       # the stamp itself is never mutated
+
+
+def test_progress_clock_never_invents_a_clock_without_a_stamp():
+    # No stamp = no clock, whatever git says: the no-clock fallback (idle peek) stays as it is, so a
+    # worktree read alone never drags an unstamped lane onto the probe ladder.
+    for bad in (None, {}, [], "junk"):
+        assert events.progress_signature(events.progress_clock(bad, worktree_head="Y")) is None
+
+
+def test_an_unreadable_worktree_head_keeps_the_last_head_the_runner_read():
+    # A git timeout / pruned worktree reads as None. That must NEVER count as movement — and falling
+    # back to the stamp would (stamp X is stale, last read was Y: Y -> X is a false advance). So the
+    # last readable worktree HEAD stands until a read succeeds again.
+    for unreadable in (None, "", "None", 42):
+        c = events.progress_clock(_STAMP, worktree_head=unreadable, last_worktree_head="Y")
+        assert c["head"] == "Y" and c["worktree_head"] == "Y", unreadable
+
+
+def test_a_lane_whose_worktree_was_never_read_keeps_the_stamped_head():
+    # Never read (no worktree at the runner's path, or git always failing): the stamp is the only
+    # HEAD there is — exactly the pre-#515 clock, so nothing regresses for such a lane.
+    for unreadable in (None, "", "None"):
+        c = events.progress_clock(_STAMP, worktree_head=unreadable, last_worktree_head=unreadable)
+        assert c == _STAMP
+
+
+def test_the_worktree_head_never_hides_a_stamped_marker():
+    c = events.progress_clock(dict(_STAMP, report=True, blocked=True), worktree_head="Y")
+    assert events.progress_signature(c) == "Y|True|True"
+
+
 def test_parse_ack_reads_a_valid_reply_only_when_the_nonce_matches():
     assert events.parse_ack("WORKING nonce-42", "nonce-42") == "WORKING"
     assert events.parse_ack("DONE nonce-42", "nonce-42") == "DONE"

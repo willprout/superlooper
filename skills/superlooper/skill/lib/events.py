@@ -94,6 +94,40 @@ def _readable_head(h):
     return isinstance(h, str) and h not in ("", "None")
 
 
+def progress_clock(stamp, worktree_head=None, last_worktree_head=None):
+    """The progress clock as the RUNNER measures it (issue #515): the Stop hook's stamp, with its HEAD
+    replaced by the lane worktree's HEAD the runner read for itself.
+
+    WHY. The stamp is written only when the worker RESTS. A worker that commits inside one long turn
+    (background agents, a review cascade) takes no rest, so the stamp went on naming the branch's
+    base commit while the commits piled up — and the #157 ladder parked three live, committing,
+    probe-answering workers that way (#513: i893, i1013, i1028). A commit is progress the moment it
+    lands; the runner reading the worktree each tick sees it within one tick, for any agent.
+
+    The HEAD, in order of preference:
+      1. `worktree_head`, the runner's read THIS tick, when it names a commit;
+      2. `last_worktree_head`, the last read that did — when this tick's failed (a git timeout, a
+         pruned or missing worktree). An unreadable read is "unknown", never movement, and falling
+         back to the stamp instead would be: a stamp at X that the worktree had long since left for
+         Y would read as Y -> X, a fresh "commit", and reset the episode on a failed read;
+      3. the stamp's own head, when the worktree has never been read (no worktree at the runner's
+         path) — exactly the pre-#515 clock, so such a lane loses nothing.
+
+    The report/blocked markers stay the stamp's. With no stamp there is no clock at all, whatever
+    git says: the lane keeps its no-clock fallback rather than being dragged onto the ladder by a
+    read alone. The result carries `worktree_head` (cases 1 and 2) so decide can hand the executor
+    the value to remember. Pure, never raises, never mutates `stamp`."""
+    if not isinstance(stamp, dict) or not stamp:
+        return stamp
+    if _readable_head(worktree_head):
+        head = worktree_head
+    elif _readable_head(last_worktree_head):
+        head = last_worktree_head
+    else:
+        return stamp
+    return dict(stamp, head=head, worktree_head=head)
+
+
 def usable_baseline(sig):
     """A signature fit to serve as the #231 un-latch BASELINE: a well-formed 'head|report|blocked'
     string whose HEAD is readable, so a later HEAD movement can actually be proven against it. A

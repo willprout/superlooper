@@ -6,6 +6,8 @@ The constitutional assertion lives here too: NO gitops command line ever contain
 module produces during this suite is recorded and screened; the module source is screened as
 well, so the forbidden machinery cannot even exist in dead code.
 """
+import os
+import shutil
 import subprocess
 
 import pytest
@@ -329,6 +331,93 @@ def test_reclaim_block_never_reads_a_broken_git_as_safe(repos, tmp_path, monkeyp
     (lane / "only_copy.txt").write_text("unsaved work")           # dirty + real
     monkeypatch.setattr(gitops, "_git", lambda *a, **k: (127, "git: command not found"))
     assert gitops.worktree_reclaim_block(lane) == "unreadable"    # NOT None
+
+
+# --------------------------- lane_head: the progress clock's HEAD (issue #515) ---------------------------
+# The runner reads every in-flight lane's worktree HEAD each tick, so a commit made mid-turn counts
+# as progress without waiting for the worker to rest. The read runs beside a live worker's own git,
+# so it must take no lock, and anything it cannot read is None — never another repo's HEAD.
+
+def test_lane_head_reads_a_commit_made_in_the_worktree(repos, tmp_path):
+    lane = tmp_path / "worktrees" / "i2"
+    assert gitops.worktree_add(repos["wt"], lane, "sl/i2-y", "origin/main") is True
+    before = gitops.lane_head(lane)
+    assert before == _sh(lane, "rev-parse", "HEAD") and len(before) == 40
+    _init_identity(lane)
+    _commit_file(lane, "work.txt", "mid-turn\n", "a commit inside one long turn")
+    after = gitops.lane_head(lane)
+    assert after != before and after == _sh(lane, "rev-parse", "HEAD")
+
+
+def test_lane_head_takes_no_lock_in_the_workers_worktree(repos, tmp_path):
+    # A worker mid-`git add` holds its index.lock. A read that wanted that lock would fail (or, worse,
+    # make the worker's own git fail); this one must read straight past it and leave it untouched.
+    lane = tmp_path / "worktrees" / "i2"
+    assert gitops.worktree_add(repos["wt"], lane, "sl/i2-y", "origin/main") is True
+    gitdir = _sh(lane, "rev-parse", "--absolute-git-dir")
+    lock = os.path.join(gitdir, "index.lock")
+    with open(lock, "w") as f:
+        f.write("held by the worker")
+    st = os.stat(lock)
+    expected = _sh(lane, "rev-parse", "HEAD")
+    seen = len(_SEEN_ARGV)                         # the spy records every argv, this test's own too
+    assert gitops.lane_head(lane) == expected
+    argv = _SEEN_ARGV[seen:]
+    with open(lock) as f:
+        assert f.read() == "held by the worker"
+    assert os.stat(lock).st_mtime_ns == st.st_mtime_ns
+    assert argv and all("--no-optional-locks" in a for a in argv)
+    assert all(a[a.index("--no-optional-locks") + 1] == "rev-parse" for a in argv)
+
+
+def test_lane_head_is_none_for_a_missing_worktree(tmp_path):
+    assert gitops.lane_head(tmp_path / "worktrees" / "gone") is None
+
+
+def test_lane_head_is_none_for_a_pruned_worktree(repos, tmp_path):
+    # The directory survives but its gitdir was pruned: git cannot read it, and that is None.
+    lane = tmp_path / "worktrees" / "i2"
+    assert gitops.worktree_add(repos["wt"], lane, "sl/i2-y", "origin/main") is True
+    shutil.rmtree(_sh(lane, "rev-parse", "--absolute-git-dir"))
+    assert gitops.lane_head(lane) is None
+
+
+def test_lane_head_never_reads_an_enclosing_repo(repos):
+    # A lane directory with no git of its own, sitting INSIDE some other repo (a state home that lives
+    # in a checkout): plain `git -C` walks up and answers with THAT repo's HEAD. Never.
+    stray = repos["wt"] / "worktrees" / "i9"
+    stray.mkdir(parents=True)
+    assert gitops.lane_head(stray) is None
+    (stray / ".git").mkdir()                       # a .git that is not a repository: same answer
+    assert gitops.lane_head(stray) is None
+
+
+def test_lane_head_is_none_when_git_times_out_or_is_missing(repos, tmp_path, monkeypatch):
+    lane = tmp_path / "worktrees" / "i2"
+    assert gitops.worktree_add(repos["wt"], lane, "sl/i2-y", "origin/main") is True
+    for res in ((124, "git rev-parse timed out after 5s"), (127, "git: command not found"),
+                (0, "not-an-oid"), (0, "")):
+        monkeypatch.setattr(gitops, "_git", lambda *a, _r=res, **k: _r)
+        assert gitops.lane_head(lane) is None, res
+
+
+def test_lane_head_bounds_the_read_with_a_short_timeout(repos, tmp_path, monkeypatch):
+    # Every in-flight lane is read every tick: a hung git must cost seconds, not the 60s fetch bound.
+    lane = tmp_path / "worktrees" / "i2"
+    assert gitops.worktree_add(repos["wt"], lane, "sl/i2-y", "origin/main") is True
+    seen = {}
+
+    def fake(cwd, *args, timeout=None, env=None):
+        seen.update(timeout=timeout)
+        return (124, "timed out")
+    monkeypatch.setattr(gitops, "_git", fake)
+    assert gitops.lane_head(lane) is None
+    assert seen["timeout"] == gitops.LANE_HEAD_TIMEOUT <= 10
+
+
+def test_lane_head_never_raises_on_a_wrong_typed_path():
+    for bad in (None, 42, ["x"]):
+        assert gitops.lane_head(bad) is None
 
 
 # --------------------------- commit_on_branch (issue #449) ---------------------------
