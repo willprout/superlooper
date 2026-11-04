@@ -120,7 +120,9 @@ pid singleton), `started/<id>.*` (launch delivery proof). Siblings at the home r
 ## 6. The usage meter
 
 Launches gate on the Claude usage meter, fail-closed: fresh read over the ceilings (90%
-five-hour / 96% seven-day) launches nothing. One deliberate exception (issue #46): a meter
+five-hour / 96% seven-day) launches nothing. The usage endpoint can answer with no five-hour window
+at all (issue #533): that is a healthy read, the five-hour ceiling is simply not in effect, the
+seven-day one still gates, and the dashboard shows `5h —`. One deliberate exception (issue #46): a meter
 that is **unreadable** past a 30-minute grace fails **open** (journal records `fail_open` on
 entry, `usage_recovered` on exit; ALERT carries `usage_stale` for exactly as long as the
 episode is active). Read the signals the right way around: **`usage_stale` in ALERT means

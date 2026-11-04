@@ -23,6 +23,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -34,6 +35,7 @@ import journal
 import loopstate
 import runner as runner_mod
 import tidy
+import usage as usage_lib
 
 _FIXTURES = Path(__file__).resolve().parent / "fixtures" / "gh"
 _FAKE_GH = Path(__file__).resolve().parent / "fakes" / "fake-gh"
@@ -1595,6 +1597,59 @@ def test_dark_meter_past_grace_fails_open_launches_and_journals(rig):
     rig.r.tick(now=NOW + 1802)                                 # still dark, still past grace
     fo2 = [r for r in journal.read(rig.home) if r.get("act") == "fail_open"]
     assert len(fo2) == 1                                       # ...one record for the whole episode
+
+
+def test_no_five_hour_window_never_goes_dark_past_the_grace(rig):
+    # Issue #533, end to end: the REAL producer, fed the body the endpoint really sent, through the
+    # runner's last-good keeper, across the full fail-open grace. The meter stays fresh, so i101
+    # launches at once, and there is no usage_stale ALERT and no fail_open record at any point.
+    cm = mock.MagicMock()
+    cm.__enter__.return_value.read.return_value = json.dumps(
+        {"five_hour": None,
+         "seven_day": {"utilization": 24.0, "resets_at": "2026-11-09T00:00:00Z"}}).encode()
+    creds = mock.Mock(returncode=0, stdout=json.dumps({"claudeAiOauth": {"accessToken": "tok"}}))
+
+    def fetch():
+        with mock.patch.object(usage_lib.subprocess, "run", return_value=creds), \
+             mock.patch.object(usage_lib.urllib.request, "urlopen", return_value=cm):
+            return usage_lib.fetch_claude_usage()
+
+    rig.r._fetch_usage = fetch
+    for offset in (0, 61, 900, 1801, 1862):                    # across and past the 30-min grace
+        rig.r.tick(now=NOW + offset)
+    assert issue_state(rig, "i101")["status"] == "running"
+    assert [r for r in journal.read(rig.home) if r.get("act") == "fail_open"] == []
+    assert not (rig.home / "state" / "ALERT").exists()
+    view = rig.r.usage_view()
+    assert view["auth_status"] == "ok" and view["seven_day_pct"] == 24.0
+    assert view["five_hour_pct"] is None
+    assert view["last_ok_at"] == NOW + 1862                    # a fresh read every minute
+
+
+def test_wrong_typed_figures_are_a_dark_meter_not_a_silent_stall(rig):
+    # Issue #533, a behaviour named on purpose: a 200 whose figures are wrong-typed reads api_error
+    # at the reader, so it takes the same bounded, loud path as a renamed window. It holds within the
+    # grace, then fails open WITH the alert. It used to read `ok`, which the scheduler then refused
+    # with a fresh clock: no launch, no alert, ever, and nothing telling anyone why.
+    cm = mock.MagicMock()
+    cm.__enter__.return_value.read.return_value = json.dumps(
+        {"five_hour": {"utilization": "95"}, "seven_day": {"utilization": "97"}}).encode()
+    creds = mock.Mock(returncode=0, stdout=json.dumps({"claudeAiOauth": {"accessToken": "tok"}}))
+
+    def fetch():
+        with mock.patch.object(usage_lib.subprocess, "run", return_value=creds), \
+             mock.patch.object(usage_lib.urllib.request, "urlopen", return_value=cm):
+            return usage_lib.fetch_claude_usage()
+
+    rig.r._fetch_usage = fetch
+    rig.r.tick(now=NOW)
+    rig.r.tick(now=NOW + 900)
+    assert issue_state(rig, "i101") is None                    # within the grace: held
+    assert not (rig.home / "state" / "ALERT").exists()
+    rig.r.tick(now=NOW + 1801)
+    assert issue_state(rig, "i101")["status"] == "running"     # past the grace: fails open...
+    alert = json.loads((rig.home / "state" / "ALERT").read_text())
+    assert alert["reasons"] == ["usage_stale"]                 # ...and says so
 
 
 def test_meter_recovery_closes_the_fail_open_episode_and_clears_the_alert(rig):

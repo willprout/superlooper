@@ -26,6 +26,7 @@ the unsuffixed one answers about the owner.
 """
 import datetime
 import json
+import math
 import re
 import subprocess
 import urllib.request
@@ -72,6 +73,50 @@ _CLI_LOGGED_OUT = re.compile(r"not logged in|please run /login|run claude auth l
 # Any OTHER nonzero rc (a keychain DB error, the login keychain not in the search list) is a read we
 # could not TRUST, not proof of absence, so it fails OPEN (unknown) rather than blocking every launch.
 _SEC_ITEM_NOT_FOUND = 44
+
+
+def _usable_pct(x):
+    """A utilization figure we can gate on: a finite real number. A bool counts as an int in Python,
+    and NaN/inf come straight through json.loads, so each needs refusing by name. This is the same
+    rule scheduler._finite_pct applies on the reading side, kept here so a body that would only ever
+    be refused there reads as what it is: api_error, not a healthy `ok` nobody can launch on."""
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+
+
+def _usage_windows(body):
+    """``(five_hour, seven_day)`` window dicts from a 200 body, or None if the body earns no trust.
+
+    Schema-drift defense (RC-USAGEFAILOPEN, producer side): a 200 that renamed or mangled what we
+    read must never report as healthy. The SEVEN-DAY figure is therefore required, and it has to be
+    a real number.
+
+    The FIVE-HOUR window is optional (issue #533). On 2026-11-04 the endpoint answered 200 with
+    ``five_hour: null`` beside a good ``seven_day`` on a healthy account (and earlier episodes
+    recovered by themselves, so it comes and goes). Requiring both read that as an unreadable meter:
+    the runner failed open, held a usage_stale alert and texted about it, with real data in hand. So
+    an absent, null or empty window, or an explicitly null figure, is honest "no such window right
+    now". Anything else that is PRESENT but unrecognisable (a string, a list, a stringly figure) is
+    still drift, and so is a window with fields but no `utilization` key: that is a renamed figure,
+    and reading it as "no window" would switch the five-hour ceiling off silently.
+
+    A wrong-typed figure reads api_error here rather than `ok`, so it takes the dark-meter path: held
+    through the grace, then failing open WITH the usage_stale alert. As `ok` it would hold a fresh
+    clock that the scheduler refuses to launch on, which is a permanent stall with no alert."""
+    if not isinstance(body, dict):
+        return None
+    five_hour, seven_day = body.get("five_hour"), body.get("seven_day")
+    if five_hour is None:
+        five_hour = {}
+    if not isinstance(five_hour, dict) or not isinstance(seven_day, dict):
+        return None
+    if not _usable_pct(seven_day.get("utilization")):
+        return None
+    if five_hour and "utilization" not in five_hour:
+        return None
+    five_hour_pct = five_hour.get("utilization")
+    if five_hour_pct is not None and not _usable_pct(five_hour_pct):
+        return None
+    return five_hour, seven_day
 
 
 def _keychain_ts_to_epoch(s):
@@ -278,14 +323,16 @@ def fetch_claude_usage(env=None) -> dict:
     """Fetch Claude Code/Max subscription usage (5-hour and weekly windows).
 
     Returns a dict with:
-      five_hour_pct, seven_day_pct  -> utilization percentages (0-100)
+      five_hour_pct, seven_day_pct  -> utilization percentages (0-100). five_hour_pct is also None
+                     on an `ok` read when the account reports no five-hour window (issue #533): that
+                     ceiling is simply not in effect. seven_day_pct is always a number on `ok`.
       five_hour_resets, seven_day_resets -> ISO reset timestamps
       five_hour_resets_epoch, seven_day_resets_epoch -> int epoch seconds (R4)
       auth_status -> ok | no_keychain | no_token | rate_limited | auth_expired | api_error
                      | namespace_unknown
       config_dir  -> the config dir whose pool these numbers describe (None = the machine's default)
       note        -> why there was no pool to meter, on `namespace_unknown` only (else "")
-    All numeric values are None on failure. macOS only (reads the Keychain).
+    All numeric values are None on any status but `ok`. macOS only (reads the Keychain).
 
     ISSUE #350: the pool metered is the one this machine's WORKERS spend, not the owner's default
     login. The scheduler paces lanes on this read and the two Max accounts are separate rate-limit
@@ -341,23 +388,20 @@ def fetch_claude_usage(env=None) -> dict:
         with urllib.request.urlopen(req, timeout=5) as resp:
             data = json.loads(resp.read())
 
-        # 3. Parse the two usage windows.
-        fh = data.get("five_hour") or {}
-        sd = data.get("seven_day") or {}
+        # 3. Parse the two usage windows; a body we cannot trust keeps every number None (see
+        #    _usage_windows for what earns `ok`, and why five_hour may be absent).
+        windows = _usage_windows(data)
+        if windows is None:
+            result["auth_status"] = "api_error"
+            return result
+        fh, sd = windows
         result["five_hour_pct"] = fh.get("utilization")
         result["seven_day_pct"] = sd.get("utilization")
         result["five_hour_resets"] = fh.get("resets_at")
         result["seven_day_resets"] = sd.get("resets_at")
         result["five_hour_resets_epoch"] = iso_to_epoch(result["five_hour_resets"])
         result["seven_day_resets_epoch"] = iso_to_epoch(result["seven_day_resets"])
-        # Schema-drift defense (RC-USAGEFAILOPEN, producer side): a 200 whose body renamed/omitted
-        # the windows would leave the pcts None. Do NOT report that as healthy 'ok' (the scheduler
-        # would then fail closed anyway, but mark it here so the cause is visible and last-good
-        # staleness logic is correct). Fail closed: api_error.
-        if result["five_hour_pct"] is None or result["seven_day_pct"] is None:
-            result["auth_status"] = "api_error"
-        else:
-            result["auth_status"] = "ok"
+        result["auth_status"] = "ok"
     except urllib.error.HTTPError as e:
         if e.code == 429:
             result["auth_status"] = "rate_limited"       # back off and retry later

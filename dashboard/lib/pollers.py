@@ -23,6 +23,7 @@ foreign worktree, or an unreachable usage endpoint:
 """
 import datetime
 import json
+import math
 import os
 import subprocess
 import time
@@ -197,8 +198,15 @@ def iso_to_epoch(iso):
 
 
 def _is_num(v):
-    # a utilization percentage; bool is an int subclass, so exclude it explicitly
-    return isinstance(v, (int, float)) and not isinstance(v, bool)
+    # a utilization percentage; bool is an int subclass, so exclude it explicitly, and NaN/inf come
+    # straight through json.loads
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+
+def _usable_five_hour(v):
+    # None means the account has no five-hour window right now (issue #533); anything else must be
+    # a real figure
+    return v is None or _is_num(v)
 
 
 def _keychain_token():
@@ -229,8 +237,9 @@ def fetch_claude_usage(token_source=_keychain_token, http_get=_https_get_json):
     """Fetch Claude Code/Max subscription usage (5-hour + 7-day windows), ported from the skill's
     ``lib/usage.py``. Returns a dict with ``five_hour_pct``/``seven_day_pct`` (None on failure),
     their reset epochs, and ``auth_status`` (``ok`` | ``no_keychain`` | ``no_token`` |
-    ``rate_limited`` | ``auth_expired`` | ``api_error``). ``token_source`` and ``http_get`` are
-    injected so the whole path is testable without the Keychain or the network."""
+    ``rate_limited`` | ``auth_expired`` | ``api_error``). ``five_hour_pct`` is also None on an ``ok``
+    read when the account reports no five-hour window (issue #533). ``token_source`` and ``http_get``
+    are injected so the whole path is testable without the Keychain or the network."""
     result = {
         "five_hour_pct": None, "seven_day_pct": None,
         "five_hour_resets_epoch": None, "seven_day_resets_epoch": None,
@@ -264,33 +273,38 @@ def fetch_claude_usage(token_source=_keychain_token, http_get=_https_get_json):
         result["auth_status"] = "api_error"
         return result
 
+    # Schema-drift defense: a 200 whose body renamed or omitted the seven-day window, or gave a
+    # wrong-typed figure (a string "42", a bool) in either window, is NOT healthy, so it fails closed
+    # to api_error with no stray number and the pill shows "?" honestly. The five-hour window is the
+    # one optional part (issue #533, the same rule as the engine's lib/usage.py): absent, null, empty
+    # or an explicitly null figure is "no such window right now", while a five-hour that is present
+    # but unrecognisable is still drift, including fields with no `utilization` (a renamed figure).
     if not isinstance(data, dict):
         result["auth_status"] = "api_error"
         return result
-    fh = data.get("five_hour") if isinstance(data.get("five_hour"), dict) else {}
-    sd = data.get("seven_day") if isinstance(data.get("seven_day"), dict) else {}
+    fh, sd = data.get("five_hour"), data.get("seven_day")
+    if fh is None:
+        fh = {}
+    if not isinstance(fh, dict) or not isinstance(sd, dict) or not _is_num(sd.get("utilization")) \
+            or (fh and "utilization" not in fh) or not _usable_five_hour(fh.get("utilization")):
+        result["auth_status"] = "api_error"
+        return result
     result["five_hour_pct"] = fh.get("utilization")
     result["seven_day_pct"] = sd.get("utilization")
     result["five_hour_resets_epoch"] = iso_to_epoch(fh.get("resets_at"))
     result["seven_day_resets_epoch"] = iso_to_epoch(sd.get("resets_at"))
-    # Schema-drift defense: a 200 whose body renamed/omitted a window (pct None) OR gave a
-    # wrong-typed utilization (a string "42", a bool) is NOT healthy. Only real numbers for BOTH
-    # windows earn 'ok'; anything else fails closed to api_error so the pill shows "?" honestly and
-    # the status never contradicts an unusable reading.
-    if _is_num(result["five_hour_pct"]) and _is_num(result["seven_day_pct"]):
-        result["auth_status"] = "ok"
-    else:
-        result["auth_status"] = "api_error"
+    result["auth_status"] = "ok"
     return result
 
 
 def read_usage(fetcher=fetch_claude_usage):
     """The usage pill's fail-closed feed. Calls ``fetcher()`` FRESH every time (no cached state) and
     returns ``{known, five_hour_pct, seven_day_pct, five_hour_resets_epoch, seven_day_resets_epoch,
-    status}``. ``known`` is ``True`` only when the fetch reported ``ok`` AND both percentages are
-    real numbers; on anything else — an exception, a non-dict, a non-``ok`` status, or a missing
-    percentage — it returns the UNKNOWN sentinel (``known: False``, all numbers ``None``), never a
-    stale or partial number. ``status`` surfaces the underlying reason (``auth_expired`` /
+    status}``. ``known`` is ``True`` only when the fetch reported ``ok``, the seven-day percentage is
+    a real number and the five-hour percentage is a real number or ``None`` (no such window, issue
+    #533: the pill renders that as empty); on anything else — an exception, a non-dict, a non-``ok``
+    status, or a missing or malformed percentage — it returns the UNKNOWN sentinel (``known: False``,
+    all numbers ``None``), never a stale or partial number. ``status`` surfaces the underlying reason (``auth_expired`` /
     ``rate_limited`` / …) so the pill can explain the "?" rather than just show it."""
     try:
         raw = fetcher()
@@ -300,7 +314,7 @@ def read_usage(fetcher=fetch_claude_usage):
         return dict(_UNKNOWN_USAGE)
     status = raw.get("auth_status")
     fh, sd = raw.get("five_hour_pct"), raw.get("seven_day_pct")
-    if status == "ok" and _is_num(fh) and _is_num(sd):
+    if status == "ok" and _usable_five_hour(fh) and _is_num(sd):
         return {
             "known": True,
             "five_hour_pct": fh, "seven_day_pct": sd,

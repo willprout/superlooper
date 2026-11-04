@@ -76,6 +76,18 @@ def test_snapshot_carries_every_panel_the_shell_binds(home):
     assert set(repo["boards"]) == {"departures", "arrivals"}
 
 
+def test_a_no_five_hour_reading_reaches_the_shell_and_raises_no_alert(home):
+    # Issue #533: the seven-day figure and an empty five-hour ride the snapshot, and a healthy field
+    # stays healthy: the usage reading never feeds the pill's alert.
+    _calm(home)
+    usage = {"known": True, "status": "ok", "five_hour_pct": None, "seven_day_pct": 24.0,
+             "five_hour_resets_epoch": None, "seven_day_resets_epoch": 2000}
+    snap = server.assemble_snapshot(_config(home), now=NOW, usage=usage)
+    assert snap["usage"]["known"] is True
+    assert snap["usage"]["five_hour_pct"] is None and snap["usage"]["seven_day_pct"] == 24.0
+    assert snap["pill"]["level"] != "alert"
+
+
 def test_snapshot_exposes_the_configured_operator(home):
     # issue #58: the shell's approve toast reads snapshot.operator to sign the owner's word. An
     # explicit operator flows through; absent, it falls back to the neutral word, never "William".

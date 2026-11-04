@@ -262,6 +262,28 @@ def test_read_usage_wrong_typed_pct_is_not_reported_ok():
     assert u["status"] != "ok"
 
 
+def test_read_usage_known_with_no_five_hour_window():
+    # Issue #533: a healthy read with no five-hour window is KNOWN. The pill gets the real seven-day
+    # figure and a None five-hour, which it renders as empty, never as "?" and never as 0%.
+    for five_hour_part in ({"five_hour_pct": None}, {}):
+        u = pollers.read_usage(fetcher=lambda: {**five_hour_part, "seven_day_pct": 24.0,
+                                                "seven_day_resets_epoch": 2000,
+                                                "auth_status": "ok"})
+        assert u["known"] is True
+        assert u["five_hour_pct"] is None
+        assert u["seven_day_pct"] == 24.0
+        assert u["seven_day_resets_epoch"] == 2000
+        assert u["status"] == "ok"
+
+
+def test_read_usage_wrong_typed_seven_day_with_no_five_hour_is_unknown():
+    u = pollers.read_usage(fetcher=lambda: {"five_hour_pct": None, "seven_day_pct": "24",
+                                            "auth_status": "ok"})
+    assert u["known"] is False
+    assert u["seven_day_pct"] is None
+    assert u["status"] == "api_error"
+
+
 def test_read_usage_is_stateless_never_serves_a_stale_number():
     good = pollers.read_usage(fetcher=_good_raw)
     assert good["five_hour_pct"] == 42
@@ -333,6 +355,56 @@ def test_fetch_usage_wrong_typed_utilization_fails_closed_not_ok():
         return {"five_hour": {"utilization": "12"}, "seven_day": {"utilization": True}}
     r = pollers.fetch_claude_usage(token_source=lambda: "tok", http_get=stringy)
     assert r["auth_status"] == "api_error"
+
+
+_SEVEN = {"utilization": 24.0, "resets_at": "2026-11-09T00:00:00Z", "limit_dollars": None}
+
+
+def test_fetch_usage_with_no_five_hour_window_is_ok():
+    # Issue #533: `five_hour: null` is what the endpoint really sent on 2026-11-04.
+    for part in ({"five_hour": None}, {}, {"five_hour": {}},
+                 {"five_hour": {"utilization": None, "resets_at": None}}):
+        r = pollers.fetch_claude_usage(token_source=lambda: "tok",
+                                       http_get=lambda *a: {**part, "seven_day": _SEVEN})
+        assert r["auth_status"] == "ok", part
+        assert r["five_hour_pct"] is None
+        assert r["five_hour_resets_epoch"] is None
+        assert r["seven_day_pct"] == 24.0
+        assert r["seven_day_resets_epoch"] == pollers.iso_to_epoch("2026-11-09T00:00:00Z")
+
+
+def test_fetch_usage_with_no_usable_seven_day_or_an_unrecognised_body_stays_api_error():
+    # The schema-drift defense stays. A five-hour window that is PRESENT but unrecognisable is drift
+    # too, not "no window", so a bad type there cannot pass as a healthy account.
+    for body in ({}, [], "nope", {"weekly": {"utilization": 41}},
+                 {"five_hour": {"utilization": 12}},
+                 {"five_hour": None, "seven_day": None},
+                 {"five_hour": None, "seven_day": {}},
+                 {"five_hour": None, "seven_day": {"utilization": "24"}},
+                 {"five_hour": None, "seven_day": {"utilization": True}},
+                 {"five_hour": None, "seven_day": {"utilization": float("nan")}},
+                 {"five_hour": None, "seven_day": {"utilization": float("inf")}},
+                 {"five_hour": {"utilization": float("nan")}, "seven_day": _SEVEN},
+                 # fields but no `utilization`: a renamed figure, not an absent window
+                 {"five_hour": {"percent": 95, "resets_at": "2026-11-04T20:00:00Z"},
+                  "seven_day": _SEVEN},
+                 {"five_hour": {"resets_at": "2026-11-04T20:00:00Z"}, "seven_day": _SEVEN},
+                 {"five_hour": "soon", "seven_day": _SEVEN},
+                 {"five_hour": 0, "seven_day": _SEVEN},
+                 {"five_hour": [], "seven_day": _SEVEN},
+                 {"five_hour": {"utilization": "12"}, "seven_day": _SEVEN},
+                 {"five_hour": {"utilization": True}, "seven_day": _SEVEN}):
+        r = pollers.fetch_claude_usage(token_source=lambda: "tok", http_get=lambda *a: body)
+        assert r["auth_status"] == "api_error", body
+        assert r["five_hour_pct"] is None and r["seven_day_pct"] is None, body
+
+
+def test_read_usage_over_a_real_no_five_hour_fetch_is_known():
+    # The two halves together, which is what the pill actually receives.
+    u = pollers.read_usage(fetcher=lambda: pollers.fetch_claude_usage(
+        token_source=lambda: "tok", http_get=lambda *a: {"five_hour": None, "seven_day": _SEVEN}))
+    assert u["known"] is True and u["status"] == "ok"
+    assert u["five_hour_pct"] is None and u["seven_day_pct"] == 24.0
 
 
 def test_fetch_usage_default_token_source_is_neutralized_in_tests():
