@@ -280,15 +280,7 @@
     if ((s.runner && s.runner.down) || pill.level === "alert") cls = "pill alert";
     else if (pill.level === "ok") cls = "pill ok";
 
-    var usageHTML;
-    if (usage.known) {
-      var pct = Math.round(usage.five_hour_pct);
-      usageHTML = '<span class="k">usage</span>' +
-        '<span class="usage-bar"><span style="width:' + pct + '%"></span></span>' +
-        '<span class="usage-pct">' + pct + '%</span>';
-    } else {
-      usageHTML = '<span class="k" title="' + esc(usage.status || "unknown") + '">usage ?</span>';
-    }
+    var usageHTML = window.UsagePill.html(usage);
 
     var wk = s.shipped_total || {};
     var cargo = s.live_cargo || {};

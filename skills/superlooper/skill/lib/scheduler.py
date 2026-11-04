@@ -5,6 +5,8 @@ Three gates, in order:
      partial / malformed usage, or over the five-hour / seven-day ceilings, launches NOTHING.
      v1's `or 0` coercion once read a partial payload as "0% used" and launched over quota; a
      NaN pct would sneak past a bare `>` comparison (NaN > 96 is False), so pcts must be FINITE.
+     A read with no five-hour window at all is not partial (issue #533): that ceiling is simply not
+     in effect, and the seven-day one still gates.
   2. LANES: never exceed capacity; never launch the same id twice. `lanes` is EITHER a plain
      integer (one shared pool of N — today's behaviour) OR {"build": N, "investigate": M}: two
      STRICT pools, N for merge-producing work plus M RESERVED for investigations, with no
@@ -39,9 +41,15 @@ def _finite_pct(x):
 
 
 def _usage_ok(usage):
-    """FAIL CLOSED: only a dict with 'ok' auth, non-stale, both pcts FINITE and under the ceilings
-    passes. Any missing / partial / unhealthy / malformed usage (None, wrong type, NaN, ...)
-    returns False (launch nothing).
+    """FAIL CLOSED: only a dict with 'ok' auth, non-stale, a FINITE seven-day pct under its ceiling
+    and a five-hour pct that is either FINITE and under its ceiling or None passes. Any other missing
+    / partial / unhealthy / malformed usage (None, wrong type, NaN, ...) returns False (launch
+    nothing).
+
+    Why five-hour may be None (issue #533): the usage endpoint can answer 200 with no five-hour
+    window. usage.py reports that as `ok` with five_hour_pct None, meaning that ceiling is not in
+    effect, not that the figure is unknown. A five-hour value that is present but unusable ("10",
+    NaN, True) is still malformed and still launches nothing.
 
     ONE exception, FAIL OPEN (issue #46): when the caller sets `fail_open`, launch. The scheduler
     never decides this itself — it is a typed, understood flag that decide() sets ONLY after the
@@ -63,11 +71,13 @@ def _usage_ok(usage):
         return False
     fh = usage.get("five_hour_pct")
     sd = usage.get("seven_day_pct")
-    if not _finite_pct(fh) or not _finite_pct(sd):
+    if not _finite_pct(sd):
+        return False
+    if fh is not None and not _finite_pct(fh):
         return False
     if sd > SEVEN_DAY_NEW_WORK_CEILING:
         return False
-    if fh > FIVE_HOUR_LAUNCH_CEILING:
+    if fh is not None and fh > FIVE_HOUR_LAUNCH_CEILING:
         return False
     return True
 

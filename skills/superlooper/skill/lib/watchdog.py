@@ -275,7 +275,8 @@ def usage_reads_exhausted(usage):
     the scheduler's `>` gate — a read exactly AT the ceiling still launches, so it is not
     exhausted) — the runner's designed fail-closed hold. Anything unreadable/partial/malformed is
     False: a dark meter is unreadable, NOT exhausted (the #46/#76 asymmetry), so it never
-    suppresses the detector."""
+    suppresses the detector. A None five-hour pct on an 'ok' read means that window is not in effect
+    (issue #533), exactly as the scheduler reads it, so the seven-day ceiling alone decides."""
     if not isinstance(usage, dict) or usage.get("auth_status") != "ok":
         return False
     fh, sd = usage.get("five_hour_pct"), usage.get("seven_day_pct")
@@ -283,9 +284,9 @@ def usage_reads_exhausted(usage):
     def _finite(x):
         return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
 
-    if not _finite(fh) or not _finite(sd):
+    if not _finite(sd) or (fh is not None and not _finite(fh)):
         return False
-    return fh > _FIVE_HOUR_CEILING or sd > _SEVEN_DAY_CEILING
+    return sd > _SEVEN_DAY_CEILING or (fh is not None and fh > _FIVE_HOUR_CEILING)
 
 
 def launchable_nums(parsed_issues, lane_state, config, closed_nums, territory_claims):

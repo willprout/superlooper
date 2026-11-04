@@ -60,8 +60,8 @@ def test_overlaps_soft_never_blocks():
 def test_usage_fail_closed_launches_nothing():
     q = [_issue(1)]
     for bad in (
-        {"five_hour_pct": None, "seven_day_pct": 10, "auth_status": "ok"},      # partial payload
-        {"five_hour_pct": 10, "seven_day_pct": None, "auth_status": "ok"},
+        {"five_hour_pct": 10, "seven_day_pct": None, "auth_status": "ok"},      # partial payload
+        {"five_hour_pct": None, "seven_day_pct": None, "auth_status": "ok"},    # no figure at all
         {"five_hour_pct": 10, "seven_day_pct": 10, "auth_status": "api_error"},
         {"five_hour_pct": 10, "seven_day_pct": 10, "auth_status": "auth_expired"},
         {"five_hour_pct": 10, "seven_day_pct": 10, "auth_status": "ok", "stale": True},
@@ -81,6 +81,36 @@ def test_usage_malformed_shapes_fail_closed():
         {"five_hour_pct": float("inf"), "seven_day_pct": 10, "auth_status": "ok"},
         {"five_hour_pct": True, "seven_day_pct": 10, "auth_status": "ok"},        # bool
         {"five_hour_pct": 10, "seven_day_pct": [10], "auth_status": "ok"},        # list pct
+    ):
+        assert scheduler.launchable(q, [], _cfg(), bad, set(), False) == [], bad
+
+
+def test_no_five_hour_window_gates_on_the_seven_day_ceiling_alone():
+    # Issue #533: a healthy read with no five-hour window. That ceiling is simply not in effect; the
+    # seven-day one still gates, at the same `>` boundary, whether the key is null or missing.
+    q = [_issue(1)]
+    for five_hour_part in ({"five_hour_pct": None}, {}):
+        under = {**five_hour_part, "seven_day_pct": 24.0, "auth_status": "ok"}
+        assert [s["num"] for s in scheduler.launchable(q, [], _cfg(), under, set(), False)] == [1]
+        assert scheduler.usage_ok(under) is True
+        assert scheduler.launch_ok(q[0], set(), False, under) is True
+        at = {**five_hour_part, "seven_day_pct": 96, "auth_status": "ok"}
+        assert scheduler.usage_ok(at) is True
+        over = {**five_hour_part, "seven_day_pct": 97, "auth_status": "ok"}
+        assert scheduler.launchable(q, [], _cfg(), over, set(), False) == [], over
+        assert scheduler.usage_ok(over) is False
+        assert scheduler.launch_ok(q[0], set(), False, over) is False
+
+
+def test_no_five_hour_window_does_not_excuse_anything_else():
+    # Issue #533 waives the five-hour ceiling and nothing more: every other fail-closed rule binds.
+    q = [_issue(1)]
+    for bad in (
+        {"five_hour_pct": None, "seven_day_pct": 10, "auth_status": "ok", "stale": True},
+        {"five_hour_pct": None, "seven_day_pct": 10, "auth_status": "api_error"},
+        {"five_hour_pct": None, "seven_day_pct": "10", "auth_status": "ok"},
+        {"five_hour_pct": None, "seven_day_pct": float("nan"), "auth_status": "ok"},
+        {"five_hour_pct": None, "seven_day_pct": True, "auth_status": "ok"},
     ):
         assert scheduler.launchable(q, [], _cfg(), bad, set(), False) == [], bad
 

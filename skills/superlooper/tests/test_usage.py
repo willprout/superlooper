@@ -131,6 +131,79 @@ def test_schema_drift_is_not_ok():
 
 
 # ---------------------------------------------------------------------------
+# The five-hour window is optional (issue #533). On 2026-11-04 the endpoint answered 200 with
+# `five_hour: null` and a good `seven_day`, the old "both or api_error" rule read that as unreadable,
+# and the whole meter went dark on a healthy account. The body below is the real shape, cut down.
+# ---------------------------------------------------------------------------
+
+_SEVEN = {"utilization": 24.0, "resets_at": "2026-11-09T00:00:00Z", "limit_dollars": None,
+          "used_dollars": None, "remaining_dollars": None, "locked_reason": None}
+
+
+def _fetch_body(body):
+    cm = mock.MagicMock()
+    cm.__enter__.return_value.read.return_value = json.dumps(body).encode()
+    with mock.patch("usage.subprocess.run", return_value=_keychain_ok()), \
+         mock.patch("usage.urllib.request.urlopen", return_value=cm):
+        return usage.fetch_claude_usage()
+
+
+@pytest.mark.parametrize("five_hour_part", [
+    {"five_hour": None},                                        # the shape seen live
+    {},                                                         # the key is gone altogether
+    {"five_hour": {}},                                          # a window with nothing in it
+    {"five_hour": {"utilization": None, "resets_at": None}},    # a window whose figure is null
+], ids=["null", "absent", "empty-window", "null-utilization"])
+def test_a_valid_seven_day_without_a_five_hour_window_reads_usable(five_hour_part):
+    r = _fetch_body({**five_hour_part, "seven_day": _SEVEN, "seven_day_opus": None, "limits": []})
+    assert r["auth_status"] == "ok"
+    assert r["seven_day_pct"] == 24.0
+    assert r["seven_day_resets_epoch"] == usage.iso_to_epoch("2026-11-09T00:00:00Z")
+    assert r["five_hour_pct"] is None
+    assert r["five_hour_resets_epoch"] is None
+
+
+def test_both_windows_present_still_reports_both():
+    r = _fetch_body({"five_hour": {"utilization": 12.5, "resets_at": "2026-11-04T20:00:00Z"},
+                     "seven_day": _SEVEN})
+    assert r["auth_status"] == "ok"
+    assert r["five_hour_pct"] == 12.5 and r["seven_day_pct"] == 24.0
+
+
+@pytest.mark.parametrize("body", [
+    {},
+    [],
+    "nope",
+    {"weekly": {"utilization": 41}},                                 # renamed window
+    {"five_hour": {"utilization": 12}},                              # no seven_day at all
+    {"five_hour": {"utilization": 12}, "seven_day": None},
+    {"five_hour": None, "seven_day": None},
+    {"five_hour": {"utilization": 12}, "seven_day": {}},
+    {"five_hour": {"utilization": 12}, "seven_day": {"utilization": None}},
+    {"five_hour": {"utilization": 12}, "seven_day": {"utilization": "24"}},
+    {"five_hour": {"utilization": 12}, "seven_day": {"utilization": True}},
+    {"five_hour": {"utilization": 12}, "seven_day": {"utilization": float("nan")}},
+    {"five_hour": {"utilization": 12}, "seven_day": {"utilization": float("inf")}},
+    {"five_hour": {"utilization": 12}, "seven_day": 24},
+    {"five_hour": "soon", "seven_day": _SEVEN},                      # a five-hour that is PRESENT
+    {"five_hour": 12, "seven_day": _SEVEN},                          # but unrecognisable is drift,
+    {"five_hour": 0, "seven_day": _SEVEN},                           # not "no window"
+    {"five_hour": [], "seven_day": _SEVEN},
+    {"five_hour": "", "seven_day": _SEVEN},
+    {"five_hour": False, "seven_day": _SEVEN},
+    {"five_hour": {"utilization": "12"}, "seven_day": _SEVEN},
+    {"five_hour": {"utilization": True}, "seven_day": _SEVEN},
+    {"five_hour": {"utilization": float("nan")}, "seven_day": _SEVEN},
+])
+def test_a_200_with_no_usable_seven_day_or_an_unrecognised_body_stays_api_error(body):
+    # The schema-drift defense stays: only a real seven-day figure earns `ok`, and a five-hour
+    # window is either honestly absent or a real figure. No stray number survives a failed read.
+    r = _fetch_body(body)
+    assert r["auth_status"] == "api_error"
+    assert r["five_hour_pct"] is None and r["seven_day_pct"] is None
+
+
+# ---------------------------------------------------------------------------
 # probe_auth (issue #159): the cheap, agent-specific, NEVER-metered auth probe the runner uses to
 # gate a launch/recovery spend and to feed the 30-min forensic capture. It runs `claude auth
 # status` (a status read) + reads the credential keychain item's mtime (never -w, so the secret is

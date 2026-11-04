@@ -511,6 +511,26 @@ def test_usage_reads_exhausted_only_on_a_successful_over_ceiling_read():
                                      "seven_day_pct": 1.0}) is False
 
 
+def test_usage_reads_exhausted_with_no_five_hour_window():
+    # Issue #533: this mirrors the scheduler's hold. With no five-hour window the scheduler still
+    # holds a read over the seven-day ceiling, and if the watchdog called that "not exhausted" it
+    # would read a designed-safe wait as a stuck queue and trip the no-progress detector.
+    for five_hour_part in ({"five_hour_pct": None}, {}):
+        assert wd.usage_reads_exhausted(
+            {"auth_status": "ok", "seven_day_pct": 97.0, **five_hour_part}) is True
+        assert wd.usage_reads_exhausted(
+            {"auth_status": "ok", "seven_day_pct": 24.0, **five_hour_part}) is False
+        assert wd.usage_reads_exhausted(
+            {"auth_status": "ok", "seven_day_pct": float(wd._SEVEN_DAY_CEILING),
+             **five_hour_part}) is False
+    # A five-hour figure that is present but unusable is still malformed, never a hold.
+    assert wd.usage_reads_exhausted(
+        {"auth_status": "ok", "five_hour_pct": "95", "seven_day_pct": 97.0}) is False
+    # And no seven-day figure is still no reading at all.
+    assert wd.usage_reads_exhausted(
+        {"auth_status": "ok", "five_hour_pct": 95.0, "seven_day_pct": None}) is False
+
+
 def test_watchdog_usage_ceilings_match_the_schedulers():
     # The watchdog duplicates the scheduler's launch ceilings (to stay importable without it), so a
     # drift would make the detector's "designed hold" suppression disagree with what the scheduler

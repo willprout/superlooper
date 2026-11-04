@@ -243,6 +243,36 @@ def test_meter_recovery_resumes_gating_and_closes_the_episode():
     assert len(only(out, "clear_alert")) == 1         # the usage_stale alert clears
 
 
+def _no_five_hour(seven_day=24.0, now=NOW):
+    """A healthy read from an account with no five-hour window (issue #533)."""
+    return {**usage_ok(now), "five_hour_pct": None, "seven_day_pct": seven_day}
+
+
+def test_no_five_hour_window_launches_with_no_alert_and_no_fail_open():
+    out = decide(usage=_no_five_hour(), parsed_issues=[parsed(5)], dsk=disk())
+    assert len(only(out, "launch")) == 1
+    assert only(out, "fail_open") == []
+    assert not any("usage_stale" in a.get("reasons", []) for a in only(out, "alert"))
+
+
+def test_no_five_hour_window_closes_a_standing_usage_stale_episode():
+    # The live state on 2026-11-04: both repos carry a durable usage_stale ALERT. The first good
+    # read after the fix must close the episode, not keep it standing.
+    d = disk(alert={"reasons": ["usage_stale"], "since": NOW - 100})
+    out = decide(usage=_no_five_hour(), parsed_issues=[parsed(5)], dsk=d)
+    assert len(only(out, "usage_recovered")) == 1
+    assert len(only(out, "clear_alert")) == 1
+    assert len(only(out, "launch")) == 1
+
+
+def test_no_five_hour_window_over_the_seven_day_ceiling_holds_quietly():
+    # A fresh read over the seven-day ceiling is the designed hold: no launch, no fail-open, no alert.
+    out = decide(usage=_no_five_hour(seven_day=97.0), parsed_issues=[parsed(5)], dsk=disk())
+    assert only(out, "launch") == []
+    assert only(out, "fail_open") == []
+    assert not any("usage_stale" in a.get("reasons", []) for a in only(out, "alert"))
+
+
 def test_usage_stale_alert_fires_once_per_dark_episode_while_failing_open():
     out = decide(usage=dark_usage(), parsed_issues=[parsed(5)])
     a = only(out, "alert")
