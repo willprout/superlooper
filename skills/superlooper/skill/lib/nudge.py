@@ -102,6 +102,12 @@ PROMPT_TIMEOUT_MS = 30000
 #
 # It is a supplement, never the mechanism: `blocked` is the host's word for "waiting on a person"
 # and is not AskUserQuestion-specific, so it can neither name the variant nor be relied on to fire.
+#
+# When it DOES fire, its refusal's `state=advisory_blocked` evidence line is a contract (issue #520):
+# the runner reads that token for THIS lane id off stderr and records the lane `host_blocked`, which
+# starts the bounded owner ALERT a dialog nobody watches is owed. The exit code stays rc=3 — every
+# caller's handling of "nothing was typed" is already right — so renaming the token would silently
+# turn that alert off again; tests/test_runner.py feeds this module's real output to the runner.
 REFUSING_ADVISORY = ("blocked",)
 
 

@@ -166,7 +166,16 @@ NUDGE_GRACE_WINDOW_SECONDS = 480
 # an in-window AskUserQuestion is off that channel, so nobody will ever answer it and the lane's
 # slot (frozen is an INFLIGHT status) would leak forever. 30 min is far past any dialog a watching
 # owner answers, and far inside the 94-minute class of silence this issue exists to end.
+# The SAME bound times a lane the session host reports `blocked` (issue #520): a prompt waiting on a
+# person nobody is watching is the same silence whoever noticed it — the session's own record or the
+# host — so one number, not two to drift apart.
 AT_DIALOG_ALERT_SECONDS = 1800
+# The sensed readings (runner._record_sensed) of a lane that is ALIVE and HELD rather than stuck:
+# the frozen tier re-senses them and never parks them, and each is owed its own ALERT instead.
+#   logged_out (#151) — auth died in-session; alerted at once.
+#   at_dialog  (#151) — the session's own in-window question; alerted past the bound above.
+#   host_blocked (#520) — the session host reports it waiting on a person; same bound.
+SENSED_HELD_STATES = ("logged_out", "at_dialog", "host_blocked")
 LAUNCH_FAILURE_CAP = 2             # launch never delivered twice -> park (RC-LAUNCHVERIFY x2)
 # (#299/#320) EVIDENCE reason -> the ALERT reason that names it, for every launch fault the loop
 # HOLDS the queue on. Without this the systemic-launch alert is the only thing said about them, and
@@ -649,6 +658,7 @@ AUTH_DEATH_REMEDIES = {
 # The dynamic reasons: `<prefix>:<id>[:<detail>]`. Each headline template names the lane (or the
 # count) the reason carries; its remedy is composed in alert_remedy below.
 AT_DIALOG_HEADLINE = "{iid} waiting at its own dialog"
+HOST_BLOCKED_HEADLINE = "{iid} waiting on a person, the host reports"
 LOGGED_OUT_HEADLINE = "{iid} session auth dead"
 LOGGED_OUT_VARIANT_HEADLINE = "{iid} session auth dead ({variant})"
 PARK_LABEL_STUCK_HEADLINE = "{iid} hand-back label not landing"
@@ -701,6 +711,8 @@ def alert_headline(reason):
     iid = _notify.clip(parts[1], _DETAIL_BUDGET) if len(parts) > 1 else "?"
     if parts[0] == "session_at_dialog":
         return AT_DIALOG_HEADLINE.format(iid=iid)
+    if parts[0] == "session_host_blocked":
+        return HOST_BLOCKED_HEADLINE.format(iid=iid)
     if parts[0] == "session_logged_out":
         variant = ":".join(parts[2:]).replace("_", " ")
         if variant.strip():
@@ -730,8 +742,8 @@ def alert_headlines(reasons, budget=_notify.HEADLINE_MAX_BYTES, clip_first=True)
 
 
 # The reason prefixes whose id names ONE issue lane — the lane a page about them can point at.
-_LANE_REASON_PREFIXES = ("session_at_dialog", "session_logged_out", "park_label_stuck",
-                         "launch_runaway", "update_errors")
+_LANE_REASON_PREFIXES = ("session_at_dialog", "session_host_blocked", "session_logged_out",
+                         "park_label_stuck", "launch_runaway", "update_errors")
 
 
 def alert_issue_num(reasons):
@@ -756,6 +768,22 @@ def alert_remedy(reason):
                 "it is holding its slot and cannot progress. Open its tab and answer the dialog "
                 "(or press Esc so it writes a blocked file instead). Clears by itself once the "
                 "dialog is gone.")
+    if isinstance(reason, str) and reason.startswith("session_host_blocked:"):
+        iid = reason.split(":", 1)[1]
+        # (#520) Names the SUPPORTED way to see the session — the engine's focus verb (#339) and the
+        # dashboard button that rides it — never the host binary: a caller that names the host is a
+        # second doorway (#310). And it does not tell the owner the session asked anything: the
+        # host's `blocked` is any prompt waiting on a person (a welcome dialog, a permission
+        # prompt), not only the session's own question, which is session_at_dialog's remedy.
+        return (f"The session host has reported {iid}'s session 'blocked' — waiting on a person — "
+                f"for {AT_DIALOG_ALERT_SECONDS // 60}+ min: usually a Claude Code dialog or prompt "
+                "on its screen that nobody is watching (a welcome screen, a permission prompt). The "
+                "loop never types into it, reads its screen or dismisses it, and does not park or "
+                "relaunch the lane for it, so the lane holds its slot and cannot progress until a "
+                "person clears it. Bring that session to the screen with `superlooper "
+                f"focus-session --repo <path> --id {iid}` (or the dashboard's Open session window "
+                "button) and clear the prompt, or send the fixer (`superlooper debug`). Clears by "
+                "itself once the host stops reporting it blocked.")
     if isinstance(reason, str) and reason.startswith("session_logged_out:"):
         parts = reason.split(":")
         iid = parts[1]
@@ -2405,6 +2433,25 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                 and _since_ok(ist_of(iid).get("sensed_since"), now)
                 and now - ist_of(iid)["sensed_since"] >= AT_DIALOG_ALERT_SECONDS):
             reasons.append(f"session_at_dialog:{iid}")
+        # A session the HOST has reported `blocked` — waiting on a person — past the same bound
+        # (issue #520). The at_dialog reasoning holds word for word: never parked, so it must speak,
+        # or a prompt nobody watches holds the lane's slot in silence (i1031 on a welcome dialog,
+        # i589 for 6.5 hours on a permission prompt). Its own reason, not session_at_dialog's: the
+        # remedy differs (it asked nothing; the owner needs to SEE the screen to know what is on it).
+        #
+        # Two things are stricter than at_dialog's clause above, both so a STALE reading cannot page
+        # (fresh-agent review): the bound is measured to the LATEST look (`sensed_at`), so it fires
+        # only once a reading taken at or past the bound still said blocked — a lane that made
+        # progress since its last look is not paged on the old one — and only while the lane is
+        # `running` or `frozen`, the statuses a liveness tier still reads. A gating, holding, ready,
+        # exited or released lane has no session being read, so its last reading is history.
+        hb = ist_of(iid)
+        if (hb.get("sensed_state") == "host_blocked"
+                and _status_of(hb) in ("running", "frozen")
+                and _since_ok(hb.get("sensed_since"), now)
+                and _since_ok(hb.get("sensed_at"), now)
+                and hb["sensed_at"] - hb["sensed_since"] >= AT_DIALOG_ALERT_SECONDS):
+            reasons.append(f"session_host_blocked:{iid}")
         # A hand-back (park #61, OR bounce #108 — both reuse this marker) whose label move keeps
         # failing past the bound: the marker is stamped and the silent retries have run long enough
         # to be ALERT-worthy (one text via the standard dedup — never twenty). The marker clearing
@@ -3474,16 +3521,19 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
             #     bypasses the blocked-file question channel, so the wait can be endless — which is
             #     why refusing to park it obliges the bounded session_at_dialog ALERT above. Alive
             #     is not the same as fine.
+            #   host_blocked (#520) — the session HOST reports it waiting on a person (a dialog or a
+            #     prompt nobody is watching). The same reading of the same evidence class: alive,
+            #     not fine, and owed the bounded session_host_blocked ALERT above instead of a park.
             # The recover still fires (below). That is deliberate and load-bearing: `recover` is
             # what RE-READS the screen, and _record_sensed — the only writer of sensed_state — runs
             # nowhere else. Suppressing it too would make the field impossible to clear, and the
             # lane would go silent forever on a reading that had long since stopped being true
-            # (fresh-review P0). It delivers nothing — nudge-pane refuses to type at both states
-            # (rc 5/6) — so this is a re-sense, not a nudge, and the state self-clears the moment
-            # the screen says something else.
+            # (fresh-review P0). It delivers nothing — nudge-pane refuses to type at all three
+            # (rc 5/6, and rc=3 `advisory_blocked` for host_blocked) — so this is a re-sense, not a
+            # nudge, and the state self-clears the moment the session reads as something else.
             sensed = ist.get("sensed_state")
             parking = False
-            if sensed in ("logged_out", "at_dialog"):
+            if sensed in SENSED_HELD_STATES:
                 parking = False                        # sensed alive/held: re-sense, never park
             elif type(retries) is not int:
                 park(iid, num, "frozen, and the retry counter is unreadable — parking",
@@ -3559,7 +3609,14 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                     # (fresh review P2 — this comment used to claim it did).
                     out.append({"act": "harvest_report", "id": iid, "num": num})
                     continue
-                if ack_state == "STUCK" or (type(probe_cap) is int and attempts >= probe_cap):
+                # (#520) A lane the host reports `blocked` is never marched to the cap's park: it is
+                # waiting on a person, not failing to answer. It keeps being re-sensed at the
+                # ladder's cadence (the probe is what can end the reading, and the runner refunds a
+                # probe the host refused as blocked), and the bounded ALERT above is the escalation.
+                # A STUCK ack still parks — that is the worker's own word, not the block.
+                host_blocked = ist.get("sensed_state") == "host_blocked"
+                if ack_state == "STUCK" or (type(probe_cap) is int and attempts >= probe_cap
+                                            and not host_blocked):
                     # cap exhausted, OR the worker explicitly asked for help: escalate to a
                     # classified park with a dossier — never an infinite loop, never a false park of
                     # a lane still making progress (a progressing lane re-anchored above). STUCK /
@@ -3581,6 +3638,20 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
             # peek, degraded-but-safe. A clock-bearing lane is handled by the tier above instead.
             out.append({"act": "recover", "id": iid, "tier": "idle"})
             continue
+        # (#520) A standing host_blocked reading is RE-READ on the recovery cadence wherever no tier
+        # above re-reads it. The frozen tier and the stalled ladder do; but the idle peek fires once
+        # per idle episode, so a lane read as blocked by it — i1031's shape: a prompt from launch, no
+        # progress clock yet — would otherwise keep that one reading until it froze, and a lane a
+        # person unblocked would keep it until its first REST (a worker that runs its whole issue in
+        # one turn may never rest), raising an ALERT for a lane that is working. Only the next
+        # reading can end the episode, so readings must keep coming while it stands. The re-read is
+        # the idle peek's: nudge-pane refuses to type while the host still says blocked, and a
+        # session the host has let go gets the same gentle status ask any idle lane gets.
+        # `running` only: a frozen lane is the frozen tier's (above), an exited one the relaunch's.
+        if ist.get("sensed_state") == "host_blocked" and status == "running" and not in_wake_grace:
+            last_read = ist.get("sensed_at")
+            if not _since_ok(last_read, now) or now - last_read >= RECOVER_RETRY_SECONDS:
+                out.append({"act": "recover", "id": iid, "tier": "idle"})
 
         # ---- label reconciliation + orphaned in-progress (restart rebuild) ----
         labels = p.get("labels") if isinstance(p, dict) and isinstance(p.get("labels"), list) else []

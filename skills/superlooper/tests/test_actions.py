@@ -5879,6 +5879,162 @@ def test_a_dialog_alert_needs_a_real_stamp_and_a_live_lane():
         assert only(decide(dsk=d), "alert") == [], status
 
 
+# ====== a lane the SESSION HOST reports `blocked` (issue #520) ======
+# The i1031 shape (#518) and i589's 6.5 hours (the 2026-10-27 comment on #514): the host's advisory
+# said the agent was waiting on a person, nudge-pane refused to type (rc=3, state=advisory_blocked),
+# and the runner read that as a plain deferral. No sensed state, so session_at_dialog's bound never
+# started, and the lane deferred every 10 minutes in silence until a human happened to look. It now
+# gets the at_dialog shape: re-sensed, never parked, and a bounded ALERT naming the lane.
+
+def _host_blocked(status="frozen", since=NOW - actions.AT_DIALOG_ALERT_SECONDS, at=NOW, **over):
+    return ist(status, sensed_state="host_blocked", sensed_since=since, sensed_at=at, **over)
+
+
+def test_a_host_blocked_lane_reaches_the_owner_on_the_dialog_alerts_bound():
+    """The SAME bound as session_at_dialog (the DoD's words), not a second number to drift."""
+    short = _host_blocked(since=NOW - actions.AT_DIALOG_ALERT_SECONDS + 1)
+    out = decide(events=[{"type": "frozen", "id": "i5"}],
+                 dsk=disk(issues_state={"version": 1, "issues": {"i5": short}}))
+    assert only(out, "alert") == [], "one second short of the bound must stay quiet"
+
+    out = decide(events=[{"type": "frozen", "id": "i5"}],
+                 dsk=disk(issues_state={"version": 1, "issues": {"i5": _host_blocked()}}))
+    (a,) = only(out, "alert")
+    assert a["reasons"] == ["session_host_blocked:i5"]
+    assert has_notify(out)
+    assert "i5" in [x for x in out if x["act"] == "notify"][0]["headline"]
+    assert [x for x in only(out, "park") if x["id"] == "i5"] == [], "alert, but never park"
+
+
+def test_the_host_blocked_alert_says_what_the_host_reported_and_how_to_see_the_session():
+    out = decide(events=[{"type": "frozen", "id": "i5"}],
+                 dsk=disk(issues_state={"version": 1, "issues": {"i5": _host_blocked()}}))
+    body = _remedies(out)
+    assert "i5" in body
+    assert "session host" in body and "waiting on a person" in body
+    # the SUPPORTED way to bring that session to the screen: the engine's focus verb (#339), which
+    # the dashboard's button rides — never a host binary named to the owner
+    assert "superlooper focus-session --repo <path> --id i5" in body
+    assert "herdr" not in body.lower()
+    # It did not ask anything, so it must not be told to answer its own question: that is
+    # session_at_dialog's remedy, and the host's `blocked` is any prompt waiting on a person.
+    assert body != actions.alert_remedy("session_at_dialog:i5")
+    assert "OWN question" not in body
+
+
+def test_the_host_blocked_alert_clears_once_the_host_stops_reporting_blocked():
+    d = disk(alert={"reasons": ["session_host_blocked:i5"]},
+             issues_state={"version": 1, "issues": {"i5": ist("frozen", sensed_state=None,
+                                                             sensed_since=None)}})
+    out = decide(events=[{"type": "frozen", "id": "i5"}], dsk=d)
+    assert len(only(out, "clear_alert")) == 1
+
+
+def test_a_host_blocked_lane_is_re_sensed_and_never_parked_by_the_frozen_tier():
+    """Never parked for being blocked — while still re-sensed, which is what lets the reading end
+    (the #151 livelock rule: _record_sensed runs only from the recover)."""
+    d = disk(issues_state={"version": 1, "issues": {"i5": _host_blocked(retries=99)}})
+    out = decide(events=[{"type": "frozen", "id": "i5"}], dsk=d)
+    assert [a for a in only(out, "park") if a["id"] == "i5"] == []
+    r = [a for a in only(out, "recover") if a["id"] == "i5"]
+    assert len(r) == 1 and r[0]["tier"] == "frozen"
+    # fence: retries=99 is far past the cap, so this exact lane WITHOUT the reading parks
+    doomed = disk(issues_state={"version": 1, "issues": {"i5": ist("frozen", retries=99)}})
+    assert len(only(decide(events=[{"type": "frozen", "id": "i5"}], dsk=doomed), "park")) == 1
+
+
+def test_the_progress_ladder_never_parks_a_host_blocked_lane_at_its_cap():
+    """The OTHER road to a park. A lane that took turns has a progress clock, and the #157 ladder
+    parks it after PROBE_CAP probes — well before the frozen tier (15 + 2x5 min against 45). A host-
+    blocked lane must not be marched there: the ladder keeps re-sensing at its own cadence instead,
+    and the bounded ALERT is the escalation. (The runner refunds a probe the host refused as
+    blocked, so the count does not climb while blocked; this is decide's half of the same rule.)"""
+    def lane(**over):
+        return ist("running", progress_sig=_sig(), progress_since=NOW - 100000, probe_attempts=3,
+                   probe_sent_at=NOW - 10000, **over)
+    issues5 = [parsed(5, labels=("in-progress", "type:build"))]
+    blocked = lane(sensed_state="host_blocked", sensed_since=NOW - 60)
+    out = decide(dsk=disk(issues_state={"version": 1, "issues": {"i5": blocked}},
+                          status_clocks={"i5": clock()}), parsed_issues=issues5)
+    assert only(out, "park") == []
+    assert [a["id"] for a in only(out, "probe")] == ["i5"], "still re-sensed at the ladder's cadence"
+    # fence: the same lane without the reading parks at the cap — the assert above is what stops it
+    out = decide(dsk=disk(issues_state={"version": 1, "issues": {"i5": lane()}},
+                          status_clocks={"i5": clock()}), parsed_issues=issues5)
+    assert len(only(out, "park")) == 1
+
+
+def test_a_host_blocked_alert_needs_real_stamps_and_a_lane_still_being_read():
+    for since in (None, "garbage", NOW + 99999):
+        d = disk(issues_state={"version": 1, "issues": {"i5": _host_blocked(since=since)}})
+        assert only(decide(events=[{"type": "frozen", "id": "i5"}], dsk=d), "alert") == [], since
+    for at in (None, "garbage", NOW + 99999):
+        d = disk(issues_state={"version": 1, "issues": {"i5": _host_blocked(at=at)}})
+        assert only(decide(events=[{"type": "frozen", "id": "i5"}], dsk=d), "alert") == [], at
+    # Only `running` / `frozen` — the statuses a liveness tier still reads. Any other status has no
+    # session being read, so a confirmed old reading is history: it must not page (fresh review).
+    for status in ("merged", "parked", "ready", "gating", "holding", "exited", "awaiting_answer"):
+        d = disk(issues_state={"version": 1,
+                               "issues": {"i5": _host_blocked(status, since=NOW - 99999)}})
+        assert only(decide(dsk=d), "alert") == [], status
+    d = disk(issues_state={"version": 1, "issues": {"i5": _host_blocked("running")}})
+    assert len(only(decide(dsk=d), "alert")) == 1, "running is read, so it alerts"
+
+
+def test_a_host_blocked_alert_needs_a_look_at_or_past_the_bound_that_still_said_blocked():
+    """The bound is measured to the LATEST look, not to now: a lane last read as blocked 25 minutes
+    into its episode may have made progress since — it is paged only once a reading taken at or past
+    the bound still says blocked (fresh-agent review: a commit landing on the tick the bound passed
+    paged the owner about a lane that was working)."""
+    stale = _host_blocked("running", since=NOW - actions.AT_DIALOG_ALERT_SECONDS - 300,
+                          at=NOW - 600)
+    d = disk(issues_state={"version": 1, "issues": {"i5": stale}})
+    out = decide(dsk=d)
+    assert only(out, "alert") == []
+    assert [a["tier"] for a in only(out, "recover") if a["id"] == "i5"] == ["idle"], \
+        "it is re-read instead — the reading that can confirm the block or end it"
+
+
+def test_a_host_blocked_alert_points_at_its_lanes_issue():
+    assert actions.alert_issue_num(["session_host_blocked:i1031"]) == 1031
+
+
+def test_a_standing_host_blocked_reading_is_re_read_on_the_recovery_cadence():
+    """The idle peek fires ONCE per idle episode, so a running lane read as blocked by it would keep
+    that one reading until it froze — or forever, if a person unblocked it and it went back to work
+    without a progress clock. Only the next reading can end the episode, so decide asks for one."""
+    def lane(**over):
+        return ist("running", sensed_state="host_blocked", sensed_since=NOW - 900, **over)
+
+    def recovers(st_ist, **kw):
+        out = decide(dsk=disk(issues_state={"version": 1, "issues": {"i5": st_ist}}), **kw)
+        return [a for a in only(out, "recover") if a["id"] == "i5"]
+
+    assert recovers(lane(sensed_at=NOW - 60)) == [], "a fresh reading needs no re-read yet"
+    due = recovers(lane(sensed_at=NOW - actions.RECOVER_RETRY_SECONDS))
+    assert len(due) == 1 and due[0]["tier"] == "idle"
+    for unreadable in (None, "garbage", NOW + 99999):          # an unusable stamp: read now
+        assert len(recovers(lane(sensed_at=unreadable))) == 1, unreadable
+    # a lane the progress ladder sees as FRESH falls through to the same re-read
+    fresh = lane(sensed_at=NOW - actions.RECOVER_RETRY_SECONDS, progress_sig=_sig(),
+                 progress_since=NOW - 60)
+    out = decide(dsk=disk(issues_state={"version": 1, "issues": {"i5": fresh}},
+                          status_clocks={"i5": clock()}))
+    assert [a["tier"] for a in only(out, "recover") if a["id"] == "i5"] == ["idle"]
+    assert only(out, "probe") == []
+    # never during a wake grace (the idle/frozen tiers' own rule), and never for another reading
+    assert recovers(lane(sensed_at=NOW - 99999), wake_grace_until=NOW + 60) == []
+    for other in ("at_dialog", "logged_out", None):
+        assert recovers(ist("running", sensed_state=other, sensed_since=NOW - 900,
+                            sensed_at=NOW - 99999)) == [], other
+    # and it is the frozen tier's job once the lane freezes: exactly one recover, the frozen one
+    out = decide(events=[{"type": "frozen", "id": "i5"}],
+                 dsk=disk(issues_state={"version": 1, "issues": {
+                     "i5": ist("frozen", sensed_state="host_blocked", sensed_since=NOW - 900,
+                               sensed_at=NOW - 99999)}}))
+    assert [a["tier"] for a in only(out, "recover") if a["id"] == "i5"] == ["frozen"]
+
+
 # ====== night-batching (issue #164): opt-in since #492 — by default every hand-back texts at once ======
 # #164's founding standard was "nobody answers a 3am page": a routine owner-DECISION hand-back (park /
 # bounce / durable question) was BATCHED to the morning report during quiet hours instead of pushed,

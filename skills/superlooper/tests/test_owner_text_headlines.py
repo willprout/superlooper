@@ -92,7 +92,8 @@ def test_clauses_names_what_fits_and_counts_the_rest():
 # ============================ ALERT headlines and remedies ============================
 
 VARIANTS = sorted(k for k in actions.AUTH_DEATH_REMEDIES if k is not None)
-DYNAMIC = (["session_at_dialog:i12345", "session_logged_out:i12345", "park_label_stuck:i12345",
+DYNAMIC = (["session_at_dialog:i12345", "session_host_blocked:i12345",
+            "session_logged_out:i12345", "park_label_stuck:i12345",
             "launch_runaway:i12345", "update_errors:i12345", "runner_tick_errors:123456",
             "migration_hold:create:awaiting-answer", actions.ALERT_UNREADABLE]
            + ["session_logged_out:i12345:%s" % v for v in VARIANTS])
@@ -571,7 +572,8 @@ def test_runner_ops_lists_the_headline_for_every_alert_reason():
            / "runner-ops.md").read_text()
     for code, headline in actions.ALERT_HEADLINES.items():
         assert f"| `{code}` | {headline} |" in doc, code
-    for prefix in ("session_logged_out", "session_at_dialog", "park_label_stuck", "launch_runaway",
-                   "update_errors", "runner_tick_errors", "migration_hold"):
+    for prefix in ("session_logged_out", "session_at_dialog", "session_host_blocked",
+                   "park_label_stuck", "launch_runaway", "update_errors", "runner_tick_errors",
+                   "migration_hold"):
         assert f"| `{prefix}:" in doc, prefix
     assert actions.MIGRATION_HOLD_HEADLINE in doc
