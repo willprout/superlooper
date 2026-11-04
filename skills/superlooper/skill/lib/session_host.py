@@ -174,10 +174,11 @@ _WORKSPACE_GONE_CODES = re.compile(
 #      #513's six probes, which were enqueued in ~3s and answered with a nonce-valid ack.
 #
 # So the codes below are refused at steps 1-4 and NOWHERE ELSE. Everything else — the step-5 codes,
-# `server_unavailable` and `internal_error` (step 3's lookup can return them before the write, and
-# the lookups in step 5's waits can return them after it), a code this list does not know, and a
-# call that ended without the host's envelope at all — cannot prove non-delivery, so `send` reports
-# it as DeliveryUnproven. A code joins this set only against herdr's source, never by its wording.
+# the codes step 3's lookup shares with the lookups inside step 5's waits (`server_unavailable`,
+# `internal_error`, and `agent_target_ambiguous`, which `agent_wait_probe_error` passes through
+# unrenamed), a code this list does not know, and a call that ended without the host's envelope
+# at all — cannot prove non-delivery, so `send` reports it as DeliveryUnproven. A code joins this
+# set only against herdr's source, never by its wording.
 _REFUSED_BEFORE_SUBMISSION = frozenset({
     "unauthorized",            # the fence (vendor/herdr patch): refused before dispatch
     "server_not_running",      # src/cli.rs: no server at the socket, the request was never sent
@@ -185,11 +186,21 @@ _REFUSED_BEFORE_SUBMISSION = frozenset({
     "agent_not_found",         # step 3 / step 4's target resolution; inside the waits herdr
                                # reports a vanished agent as `agent_not_running` instead
                                # (`agent_wait_probe_error`), so this code never means "after"
-    "agent_target_ambiguous",  # step 4: the target named more than one agent
     "agent_not_ready",         # step 4: not a ready agent, or no longer the pane's foreground
     "empty_agent_prompt",      # step 4: refused before anything else
     "agent_prompt_failed",     # step 4: the write itself failed — no byte reached the pane
 })
+
+# Step 1's other shape. The CLI PINGS the server (`api-client:status`) before it sends any request
+# at all (src/cli.rs `send_request` -> `ensure_server_protocol_compatible` -> `ApiClient::status`),
+# and a refused ping does not come back as the JSON envelope: it propagates out of `main` as Rust
+# Debug text, rc=1. Measured, not inferred — a tokenless `agent prompt --wait` against a FENCED
+# host prints `Error: Custom { kind: Other, error: ErrorResponse(ErrorResponse { id:
+# "api-client:status", error: ErrorBody { code: "unauthorized", ... } }) }` (captured for #516;
+# reports/i305.md saw the same on the fleet). Keyed on the PING's id, not the code: whatever the
+# ping was refused for, the prompt request was never sent. The same Debug shape naming any other
+# request id proves nothing and stays unproven.
+_PING_REFUSED = re.compile(r'ErrorResponse\(ErrorResponse \{ id: "api-client:status"')
 
 # --------------------------------------------------------------------------- the fence (#305)
 # Token auth on the host's control socket, carried as a patch against the pinned release
@@ -672,15 +683,16 @@ def _refused_before_submission(reply):
     """Did this refusal of `agent prompt --wait` happen before anything was typed? (issue #516)
 
     Only a POSITIVE answer counts. The host SPOKE with a code `_REFUSED_BEFORE_SUBMISSION` lists,
-    or the binary never ran at all (the probe's `_RC_COULD_NOT_RUN`: nothing executed, so nothing
-    was typed). A call that ran and ended without the host's envelope — killed at our own bound
-    (`_RC_NO_ANSWER`), or answered with something that is not one — may have died anywhere,
-    including after the write, so it does not prove non-delivery.
+    the CLI's own pre-request ping was refused (`_PING_REFUSED`), or the binary never ran at all
+    (the probe's `_RC_COULD_NOT_RUN`: nothing executed, so nothing was typed). Any other call that
+    ran and ended without the host's envelope — killed at our own bound (`_RC_NO_ANSWER`), or
+    answered with something else — may have died anywhere, including after the write, so it does
+    not prove non-delivery.
     """
     if reply.ok:
         return False
     if not reply.spoke:
-        return reply.rc == _RC_COULD_NOT_RUN
+        return reply.rc == _RC_COULD_NOT_RUN or bool(_PING_REFUSED.search(reply.error or ""))
     code = (reply.error or "").split(":", 1)[0].strip().lower()
     return code in _REFUSED_BEFORE_SUBMISSION
 

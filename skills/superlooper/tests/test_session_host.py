@@ -464,7 +464,6 @@ _BEFORE_SUBMISSION = [
     ("server_not_running", "no herdr server is running at /tmp/herdr.sock"),  # CLI never connected
     ("protocol_mismatch", "client protocol 3 is newer than server protocol 2"),  # CLI's own guard
     ("agent_not_found", "agent target i304 not found"),                       # pre-prompt lookup
-    ("agent_target_ambiguous", "agent target i304 is ambiguous"),             # target resolution
     ("agent_not_ready", "agent i304 is no longer the pane foreground process"),
     ("empty_agent_prompt", "agent prompt must not be empty"),
     ("agent_prompt_failed", "channel closed"),                                # the write itself failed
@@ -479,6 +478,10 @@ _AFTER_OR_EITHER_SIDE = [
     ("agent_not_running", "agent is no longer running in the target pane"),
     ("server_unavailable", "timed out waiting for app response after 5000 ms"),  # either side
     ("internal_error", "failed to decode agent response"),                    # either side
+    # Either side too (fresh-agent review): the waits' own `agent_get` passes every code but
+    # not-found through unchanged (`agent_wait_probe_error`), so a duplicate name appearing
+    # mid-wait refuses with this AFTER the write.
+    ("agent_target_ambiguous", "agent target i304 is ambiguous"),
     ("a_code_herdr_has_not_shipped_yet", "something new"),                    # unknown: not proof
 ]
 
@@ -522,6 +525,37 @@ def test_the_before_submission_codes_are_exactly_the_ones_the_source_was_read_fo
     # The allow-list is the decision. Adding a code to it claims herdr refuses with it before
     # typing, so it is a change somebody argues for against herdr's source — never a side effect.
     assert session_host._REFUSED_BEFORE_SUBMISSION == frozenset(c for c, _ in _BEFORE_SUBMISSION)
+
+
+# The exact bytes the pinned CLI printed for a tokenless `agent prompt --wait` against a FENCED
+# throwaway host (captured for #516; reports/i305.md measured the same shape on the fleet). Not the
+# JSON envelope: the CLI pings the server before sending any request, and a refused ping comes back
+# through `main` as Rust Debug text, rc=1.
+_FENCED_PING_REFUSAL = (
+    'Error: Custom { kind: Other, error: ErrorResponse(ErrorResponse { id: "api-client:status", '
+    'error: ErrorBody { code: "unauthorized", message: "unauthorized: this socket requires a '
+    'token" } }) }\n')
+
+
+def test_a_fenced_socket_that_refused_the_clis_own_ping_carried_nothing():
+    # Fresh-agent review, P2: the allow-list's `unauthorized` never fires for this command, because
+    # the fence refuses the CLI's pre-request ping and that refusal is not an envelope. Read as
+    # "possibly delivered", a fleet whose token went missing would spend every one-shot nudge on a
+    # prompt herdr never typed.
+    fake = _healthy({("agent", "prompt"): (1, "", _FENCED_PING_REFUSAL)})
+    with pytest.raises(session_host.HostError) as caught:
+        _host(fake).send(_session(), "do the thing", delivery=FakeDelivery(False))
+    assert not isinstance(caught.value, session_host.DeliveryUnproven)
+    assert "unauthorized" in str(caught.value)
+
+
+def test_only_the_ping_refusal_counts_among_debug_text_errors():
+    # The ping is the one request the CLI sends BEFORE the prompt, so only its refusal proves
+    # nothing was typed. The same Debug shape naming any other request proves nothing.
+    other = _FENCED_PING_REFUSAL.replace("api-client:status", "cli:agent:prompt")
+    fake = _healthy({("agent", "prompt"): (1, "", other)})
+    with pytest.raises(session_host.DeliveryUnproven):
+        _host(fake).send(_session(), "do the thing", delivery=FakeDelivery(False))
 
 
 def test_a_host_binary_that_never_ran_carried_nothing():
