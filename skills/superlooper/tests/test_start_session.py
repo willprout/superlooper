@@ -172,7 +172,7 @@ def _stub_gh(tmp_path_factory, monkeypatch):
 
 
 def _start(tmp_path, *, agent="claude", model=None, effort=None, extra_env=None,
-           resume_brief=None, standalone=False):
+           resume_brief=None, standalone=False, iid="i1"):
     """Run start-session.sh i1 with a stub agent; return (CompletedProcess, run_root, args_file).
     model/effort default to unset (env var absent); pass "" to exercise the empty-string path.
     `resume_brief` seeds briefs/i1.resume.md — a resume launch REQUIRES it (the selection fails
@@ -183,9 +183,9 @@ def _start(tmp_path, *, agent="claude", model=None, effort=None, extra_env=None,
     run_root = tmp_path / "run"
     (run_root / "briefs").mkdir(parents=True)
     (run_root / "state").mkdir()
-    (run_root / "briefs" / "i1.md").write_text("do the thing")
+    (run_root / "briefs" / f"{iid}.md").write_text("do the thing")
     if resume_brief is not None:
-        (run_root / "briefs" / "i1.resume.md").write_text(resume_brief)
+        (run_root / "briefs" / f"{iid}.resume.md").write_text(resume_brief)
     stubdir = tmp_path / "stub"
     stubdir.mkdir()
     _x(str(stubdir / "claude"), STUB_AGENT)
@@ -223,7 +223,7 @@ def _start(tmp_path, *, agent="claude", model=None, effort=None, extra_env=None,
         env["SL_EFFORT"] = effort
     if extra_env:
         env.update(extra_env)
-    r = subprocess.run([START, "i1"], env=env, cwd=str(run_root),
+    r = subprocess.run([START, iid], env=env, cwd=str(run_root),
                        capture_output=True, text=True, timeout=30)
     return r, run_root, args_file
 
@@ -528,6 +528,74 @@ def test_the_session_id_is_claude_specific_and_never_reaches_codex(tmp_path):
     argv = _run_start(tmp_path, agent="codex",
                       extra_env={"SL_SESSION_ID": "d1e1e1e1-0000-4000-8000-000000000003"})
     assert "--session-id" not in argv and "--resume" not in argv
+
+
+# ---- the consult fork: --resume <approver> --fork-session --session-id <minted> (issue #538) ----
+#
+# #536 measured the shape on Claude Code 2.1.319: the two resume flags always go together (a bare
+# `--resume` would APPEND to the approver's own conversation), `--session-id` is accepted beside
+# `--fork-session` and names the fork, and the fork knob is refused alongside SL_RESUME.
+
+_PARENT = "1c1e6ffb-0d84-4f0d-b3e0-ae10c5fa781c"
+_MINTED = "d1e1e1e1-0000-4000-8000-0000000000c5"
+
+
+def test_a_consult_forks_the_approving_session_under_its_own_minted_id(tmp_path):
+    argv = _run_start(tmp_path, iid="c5", extra_env={"SL_FORK_PARENT": _PARENT,
+                                                    "SL_SESSION_ID": _MINTED})
+    assert _flag_value(argv, "--resume") == _PARENT
+    assert "--fork-session" in argv, "a resume without --fork-session appends to the parent"
+    assert _flag_value(argv, "--session-id") == _MINTED, "the fork must carry the runner's id"
+    assert argv[-1] == "do the thing"
+
+
+def test_a_fork_knob_on_anything_but_a_consult_is_refused(tmp_path):
+    """An ambient `export SL_FORK_PARENT=…` must never turn a WORKER launch into a fork."""
+    r, run_root, args_file = _start(tmp_path, extra_env={"SL_FORK_PARENT": _PARENT,
+                                                       "SL_SESSION_ID": _MINTED})
+    assert r.returncode != 0
+    assert not args_file.exists(), "the agent must never start"
+    assert "not a consult" in r.stderr
+    assert (run_root / "state" / "exited" / "i1").exists()
+
+
+def test_a_fork_is_never_also_a_revive(tmp_path):
+    r, _run_root, args_file = _start(tmp_path, iid="c5", resume_brief="preamble",
+                                     extra_env={"SL_FORK_PARENT": _PARENT,
+                                                "SL_SESSION_ID": _MINTED, "SL_RESUME": "1"})
+    assert r.returncode != 0
+    assert not args_file.exists()
+    assert "revive" in r.stderr
+
+
+def test_a_fork_with_no_minted_id_is_refused(tmp_path):
+    """Without --session-id the fork would name itself, and `state/sessions/<id>` would point at
+    nothing — the hook capture and a later revive both depend on the runner's id."""
+    r, _run_root, args_file = _start(tmp_path, iid="c5", extra_env={"SL_FORK_PARENT": _PARENT})
+    assert r.returncode != 0
+    assert not args_file.exists()
+
+
+def test_a_fork_parent_that_is_not_an_id_is_refused(tmp_path):
+    r, _run_root, args_file = _start(tmp_path, iid="c5",
+                                     extra_env={"SL_FORK_PARENT": "--dangerous; rm -rf",
+                                                "SL_SESSION_ID": _MINTED})
+    assert r.returncode != 0
+    assert not args_file.exists()
+
+
+def test_codex_cannot_fork_a_claude_session(tmp_path):
+    r, _run_root, args_file = _start(tmp_path, agent="codex", iid="c5",
+                                     extra_env={"SL_FORK_PARENT": _PARENT,
+                                                "SL_SESSION_ID": _MINTED})
+    assert r.returncode != 0
+    assert not args_file.exists()
+
+
+def test_an_empty_fork_knob_is_an_ordinary_launch(tmp_path):
+    argv = _run_start(tmp_path, extra_env={"SL_FORK_PARENT": "", "SL_SESSION_ID": _MINTED})
+    assert "--fork-session" not in argv and "--resume" not in argv
+    assert _flag_value(argv, "--session-id") == _MINTED
 
 
 def test_the_exit_hint_names_the_actual_session_to_resume(tmp_path):

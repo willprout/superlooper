@@ -1407,3 +1407,102 @@ def test_the_hook_script_still_lets_the_worker_ship_the_sanctioned_way(tmp_path)
         r = _run_hook(tmp_path, _pre("Bash", {"command": command}))
         assert r.returncode == 0, r.stderr
         assert _decision(r.stdout) is None, "the sanctioned path must be untouched: %r" % command
+
+
+# --------------------------- the consult `c<N>` (issue #538) ---------------------------
+#
+# A consult is a fork of the session that APPROVED an issue, launched by the runner to answer a
+# blocked worker's question first. #540 / #536 measured the hole a new id shape opens: an unknown
+# letter is denied NOTHING. So the seat arrives here in the same change as its launcher mode, and its
+# standing rule (consult-standing-rule.md) is held at the call where a hook can hold it: a consult
+# writes ONE file — its outcome — and posts, labels, edits and commits nothing.
+
+CONSULT_ENV = {"SL_ISSUE_ID": "c5", "SL_RUN_ROOT": "/runs/willprout"}
+_OUTCOME = "/runs/willprout/reports/c5.md"
+
+
+def _cbash(command):
+    return _pre("Bash", {"command": command})
+
+
+def test_a_consult_has_a_role():
+    assert wp._role("c5")[0] == "consult"
+
+
+def test_consult_ask_user_question_points_at_its_outcome_file():
+    reason = wp.run(_pre("AskUserQuestion", {"questions": []}), CONSULT_ENV)
+    assert reason
+    assert _OUTCOME in reason
+    assert "ESCALATE" in reason
+    assert "state/blocked" not in reason, "a consult holds no lane — the blocked file is a dead drop"
+
+
+def test_a_consult_can_never_claim_attendance():
+    assert wp.run(_pre("AskUserQuestion", {}), {**CONSULT_ENV, "SL_ATTENDED": "1"}) is not None
+
+
+@pytest.mark.parametrize("command", [
+    "gh issue edit 5 --add-label agent-ready",
+    "superlooper approve --repo . 5",
+    "pkill -f claude",
+    "gh pr merge 9 --squash",
+])
+def test_a_consult_gets_every_shared_deny(command):
+    assert wp.run(_cbash(command), CONSULT_ENV) is not None
+
+
+@pytest.mark.parametrize("command", [
+    "gh issue comment 5 --body 'answer: B'",
+    "gh issue edit 5 --remove-label in-progress",
+    "gh issue close 5",
+    "gh pr comment 9 --body x",
+    "gh label create foo",
+    "gh api repos/o/r/issues/5/comments -f body=x",
+    "gh api -X PATCH repos/o/r/issues/5 -f title=x",
+    "cd /repo && git commit -am wip",
+    "git push origin HEAD",
+    "git checkout -b mine",
+    "git switch main",
+    "git reset --hard origin/main",
+    "git stash",
+])
+def test_a_consult_posts_labels_edits_and_commits_nothing(command):
+    reason = wp.run(_cbash(command), CONSULT_ENV)
+    assert reason, command
+    assert _OUTCOME in reason
+
+
+@pytest.mark.parametrize("command", [
+    "git fetch origin",
+    "git log --oneline -5 origin/main",
+    "git show origin/main:README.md",
+    "git diff origin/main...origin/sl/i5-x",
+    "gh issue view 5 --json comments",
+    "gh pr view 9 --json state",
+    "gh pr diff 9",
+    "gh api repos/o/r/issues/5/comments",
+    "gh api -X GET repos/o/r/pulls/9",
+    "gh issue comment --help",
+    "cat > /runs/willprout/reports/c5.md.tmp <<'X'\nOUTCOME: ESCALATE\nEND\nX\nmv /runs/willprout/reports/c5.md.tmp /runs/willprout/reports/c5.md",
+])
+def test_a_consult_may_read_everything_and_write_its_outcome(command):
+    assert wp.run(_cbash(command), CONSULT_ENV) is None, command
+
+
+@pytest.mark.parametrize("tool", ["Write", "Edit", "MultiEdit", "NotebookEdit"])
+def test_a_consult_edits_no_file_but_its_outcome(tool):
+    key = "notebook_path" if tool == "NotebookEdit" else "file_path"
+    assert wp.run(_pre(tool, {key: "/repo/lib/x.py"}), CONSULT_ENV) is not None
+    assert wp.run(_pre(tool, {key: _OUTCOME}), CONSULT_ENV) is None
+    assert wp.run(_pre(tool, {key: _OUTCOME + ".tmp"}), CONSULT_ENV) is None
+    # ...and not some OTHER consult's, nor a worker's report
+    assert wp.run(_pre(tool, {key: "/runs/willprout/reports/c6.md"}), CONSULT_ENV) is not None
+    assert wp.run(_pre(tool, {key: "/runs/willprout/reports/i5.md"}), CONSULT_ENV) is not None
+    assert wp.run(_pre(tool, {key: "/runs/willprout/reports/../x/c5.md"}), CONSULT_ENV) is not None
+
+
+def test_the_consult_write_deny_never_reaches_a_worker():
+    """The worker's job IS to edit, commit and post — the consult duty is the consult's alone."""
+    assert wp.run(_cbash("git commit -am wip"), WORKER_ENV) is None
+    assert wp.run(_cbash("gh issue comment 5 --body hi"), WORKER_ENV) is None
+    assert wp.run(_pre("Write", {"file_path": "/repo/x.py"}), WORKER_ENV) is None

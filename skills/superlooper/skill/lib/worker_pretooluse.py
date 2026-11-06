@@ -64,6 +64,12 @@ its OWN AskUserQuestion fallback (_ROLES):
                        escalation sheet its brief names. Never the worker's blocked file either,
                        and for the same reason: a flight holds no lane, so nothing watches one for
                        a question and a dialog here waits for a reader that does not exist.
+  * `c<N>` CONSULT  -> a fork of the session that approved issue N (#538), asked a blocked
+                       worker's question first. It writes ONE file, its outcome under <state
+                       home>/reports/, and anything it cannot settle is an ESCALATE in that file.
+                       It is also the one role with a duty of its own (duty 7, below): it posts,
+                       labels, edits and commits nothing, because its standing rule says the RUNNER
+                       acts on its outcome and the consult acts on nothing.
 
 THE THIRD SEAT IS NOT OPTIONAL, and it is the reason this list must be widened the same day a
 launcher gains an id shape. #448 made `t<N>` launchable; until this role existed, `_role("t3")`
@@ -229,6 +235,26 @@ def _triage_ask_reason(state_home, issue_id):
         % _triage_runs_dir(state_home))
 
 
+def _consult_outcome_path(state_home, issue_id):
+    """The consult's one writable file, spelled out here for the reason the triage runs dir below
+    is: this module fails OPEN and imports nothing it can avoid. `tests/test_consult.py` pins it
+    against the path the runner reads."""
+    return os.path.join(state_home, "reports", "%s.md" % issue_id)
+
+
+def _consult_ask_reason(state_home, issue_id):
+    # A consult holds no lane and is never resumed with an answer: the runner reads its outcome file
+    # and ends it. So an unanswerable question is exactly what ESCALATE exists for — its standing
+    # rule's own word for "this is the owner's decision".
+    return _ASK_PREFIX % "consult" + (
+        "The runner launched you, not a person: you are a fork of the session that approved this "
+        "issue, asked a worker's question first. Nobody watches a c<N> for a dialog. If you cannot "
+        "answer the question from what the owner wanted when the work was shaped, that IS your "
+        "answer: write `OUTCOME: ESCALATE` with your REASONING and RECOMMENDATION, ending with a "
+        "line that says only END, to your outcome file at %s — then stop. The question goes to "
+        "the owner with your reasoning attached." % _consult_outcome_path(state_home, issue_id))
+
+
 # The flight's run-log folder, spelled out rather than imported from `lib/triage.py`, and both
 # halves of that are deliberate (fresh-agent review, P1 + P2).
 #
@@ -257,13 +283,15 @@ def _triage_runs_dir(state_home):
 # only, deliberately: `str.isdigit()` would also accept unicode digits that no launcher can produce.
 _ROLES = {"i": ("worker", _worker_ask_reason),
           "d": ("debugger", _debugger_ask_reason),
-          "t": ("triage", _triage_ask_reason)}
-_ID_RE = re.compile(r"^([idt])([0-9]+)$")
+          "t": ("triage", _triage_ask_reason),
+          # (#538) the consult, `^c[0-9]+$` in lib/launch.py — arriving in the same change.
+          "c": ("consult", _consult_ask_reason)}
+_ID_RE = re.compile(r"^([idtc])([0-9]+)$")
 
 
 def _role(issue_id):
-    """('worker'|'debugger'|'triage', reason_fn) for a loop session id, else None. None means a
-    session whose escalation protocol we do not know — we deny it nothing (fail open)."""
+    """('worker'|'debugger'|'triage'|'consult', reason_fn) for a loop session id, else None. None
+    means a session whose escalation protocol we do not know — we deny it nothing (fail open)."""
     m = _ID_RE.match(issue_id) if isinstance(issue_id, str) else None
     return _ROLES[m.group(1)] if m else None
 
@@ -1169,6 +1197,115 @@ def _attended(env, role):
     return role == "debugger" and (env.get("SL_ATTENDED") or "").strip().lower() in _TRUE
 
 
+# --------------------------- duty 7: the consult writes ONE file (issue #538) ---------------------------
+#
+# The consult's standing rule (`consult-standing-rule.md`): "The fork never applies `agent-ready`,
+# moves labels or posts anything itself; the runner does that from the outcome file. The fork never
+# edits the approved Goal or Definition of done, never touches code." The approval-label half is the
+# shared duty above, held for every role. This is the rest of it, for the consult ALONE — a worker's
+# whole job is to edit, commit and post.
+#
+# Held at the call (the point-of-error principle, #215/#225) because a consult runs in the OWNER'S
+# OWN working tree — the approving session's start directory — so a stray `git checkout` or edit
+# there lands on the very checkout the owner is typing in.
+#
+# DELIBERATELY NARROW, like every matcher here: it denies the WRITE verbs of `gh` and `git` by name,
+# plus the file-editing tools aimed anywhere but the consult's own outcome file. Reading is never
+# touched — `git fetch`, `git show origin/main:…`, `gh pr view`, a `gh api` GET — because the rule
+# REQUIRES the consult to re-check the present before deciding. Accepted misses, the same posture
+# as the kill matcher's: a shell redirect writes a file this cannot see (`cat > x`), and a call
+# hidden behind a quote (`sh -c '…'`) is not parsed. The brief and the rule cover those in words.
+_CONSULT_GH_WRITES = {
+    "issue": frozenset(("comment", "edit", "close", "reopen", "create", "delete", "lock", "unlock",
+                        "pin", "unpin", "transfer", "develop")),
+    "pr": frozenset(("comment", "edit", "close", "reopen", "create", "merge", "ready", "review",
+                     "checkout", "lock", "unlock", "update-branch")),
+    "label": frozenset(("create", "edit", "delete", "clone")),
+}
+# `gh api` writes when it is told a write method, or when it is handed a body: with `-f`/`-F`/
+# `--input` and no `-X`, gh itself defaults the method to POST.
+_GH_BODY_FLAGS = ("-f", "-F", "--field", "--raw-field", "--input")
+_CONSULT_GIT_WRITES = frozenset((
+    "add", "am", "apply", "checkout", "cherry-pick", "clean", "commit", "merge", "mv", "pull",
+    "push", "rebase", "reset", "restore", "revert", "rm", "stash", "switch", "tag", "worktree"))
+# git's own options that take a value before the subcommand (`git -C /repo commit`).
+_GIT_GLOBAL_WITH_VALUE = frozenset(("-C", "-c", "--git-dir", "--work-tree", "--namespace"))
+_FILE_TOOLS = {"Write": "file_path", "Edit": "file_path", "MultiEdit": "file_path",
+               "NotebookEdit": "notebook_path"}
+
+_CONSULT_WRITE_REASON = (
+    "A consult writes exactly ONE file — its outcome file at %s — and nothing else: no comment, "
+    "no label, no issue edit, no file edit, no commit, push, checkout or stash, here or on GitHub. "
+    "You are running in the owner's own working tree, and the RUNNER acts on your outcome file "
+    "(the consult standing rule, consult-standing-rule.md). Reading is always fine — fetch, show, "
+    "view, diff. If something needs doing, say so in your outcome: ESCALATE, with your reasoning "
+    "and recommendation."
+)
+
+
+def _git_verb(tokens, start, end):
+    i = start
+    while i < end:
+        tok = tokens[i]
+        if tok in _GIT_GLOBAL_WITH_VALUE:
+            i += 2
+            continue
+        if tok.startswith("-"):
+            i += 1
+            continue
+        return tok
+    return None
+
+
+def _consult_bash_write(tokens):
+    for start, end in _invocations(tokens, "gh"):
+        if _is_help(tokens, start, end):
+            continue
+        verb = _gh_verb_start(tokens, start, end)
+        args = tokens[verb:end]
+        if len(args) >= 2 and args[1] in _CONSULT_GH_WRITES.get(args[0], ()):
+            return True
+        if args and args[0] == "api":
+            method = _api_method(tokens, verb, end)
+            if method is not None:
+                if method not in _READ_METHODS:
+                    return True
+            elif any(t in _GH_BODY_FLAGS or t.startswith(("--field=", "--raw-field=", "--input="))
+                     for t in tokens[verb + 1:end]):
+                return True
+    for start, end in _invocations(tokens, "git"):
+        if _git_verb(tokens, start, end) in _CONSULT_GIT_WRITES:
+            return True
+    return False
+
+
+def _consult_may_write(path, state_home, issue_id):
+    """Is `path` the consult's own outcome file (or a temp sibling it moves into place)?"""
+    if not isinstance(path, str) or not path:
+        return False
+    if ".." in path.replace("\\", "/").split("/"):
+        return False
+    target = os.path.normpath(path)
+    outcome = os.path.normpath(_consult_outcome_path(state_home, issue_id))
+    return target == outcome or (os.path.dirname(target) == os.path.dirname(outcome)
+                                 and os.path.basename(target).startswith(
+                                     os.path.basename(outcome) + "."))
+
+
+def _consult_deny(tool_name, tool_input, state_home, issue_id):
+    """Duty 7's verdict for one call by a consult: a deny reason, or None."""
+    reason = _CONSULT_WRITE_REASON % _consult_outcome_path(state_home, issue_id)
+    if tool_name in _FILE_TOOLS:
+        path = tool_input.get(_FILE_TOOLS[tool_name]) if isinstance(tool_input, dict) else None
+        return None if _consult_may_write(path, state_home, issue_id) else reason
+    if tool_name == "Bash":
+        command = tool_input.get("command") if isinstance(tool_input, dict) else None
+        tokens = _split_shell(command)
+        if tokens and _consult_bash_write(tokens):
+            return reason
+    return None
+
+
 # --------------------------- the decision ---------------------------
 
 def decide(tool_name, tool_input, state_home, issue_id, ask_reason, attended=False,
@@ -1205,7 +1342,7 @@ def decide(tool_name, tool_input, state_home, issue_id, ask_reason, attended=Fal
 def run(payload, env):
     """Decide the PreToolUse outcome for one loop session. Returns the deny-reason string, or None
     to ALLOW. No-ops (returns None) outside the session ids the loop's own launchers produce —
-    `i<N>`/`d<N>`/`t<N>`, so an ad-hoc or owner's-own session is untouched — and for Codex, and for
+    `i<N>`/`d<N>`/`t<N>`/`c<N>`, so an ad-hoc or owner's-own session is untouched — and for Codex, and for
     any non-PreToolUse payload, so the hook is safe to register globally."""
     if (env.get("SL_AGENT") or "claude").strip() == "codex":
         return None                      # Codex has no PreToolUse event; Claude-only (spike verdict)
@@ -1216,9 +1353,15 @@ def run(payload, env):
         return None                      # not a loop session (ad-hoc / anything else)
     if not isinstance(payload, dict) or payload.get("hook_event_name") != "PreToolUse":
         return None
-    return decide(payload.get("tool_name"), payload.get("tool_input"), state_home, issue_id,
-                  ask_reason=role[1], attended=_attended(env, role[0]),
-                  contract=lambda: repo_contract(state_home, issue_id, payload.get("cwd")))
+    verdict = decide(payload.get("tool_name"), payload.get("tool_input"), state_home, issue_id,
+                     ask_reason=role[1], attended=_attended(env, role[0]),
+                     contract=lambda: repo_contract(state_home, issue_id, payload.get("cwd")))
+    if verdict is None and role[0] == "consult":
+        # Duty 7 runs AFTER the shared duties, so a consult reaching for `agent-ready` is told the
+        # approval reason (the one every role hears) rather than the narrower consult one.
+        verdict = _consult_deny(payload.get("tool_name"), payload.get("tool_input"), state_home,
+                                issue_id)
+    return verdict
 
 
 # --------------------------- the turn ---------------------------

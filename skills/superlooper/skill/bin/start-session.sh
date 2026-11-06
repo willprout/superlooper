@@ -408,6 +408,35 @@ EFFORT="${SL_EFFORT:-}"
 # id is deliberately not threaded into that branch.
 SESSION_ID="${SL_SESSION_ID:-}"
 RESUME="${SL_RESUME:-}"
+# ---- THE CONSULT FORK (issue #538) ----
+# A consult (`c<N>`) is a FORK of the session that approved its issue: `--resume <approver>
+# --fork-session --session-id <minted>`. Measured by the #536 spike on the pinned build: the fork
+# takes the runner-minted id (so `state/sessions/<id>`, the host's hook capture and a later revive
+# all name the FORK, never the parent), and the parent transcript is untouched in content and mtime.
+# The two resume flags ALWAYS go together — a bare `--resume <approver>` would append to the
+# owner's own conversation — and every refusal below fails CLOSED, before the agent starts:
+#   * only a consult id may fork, so an ambient `export SL_FORK_PARENT=…` sourced by the pane's rc
+#     files can never turn a worker launch into a fork (lib/launch.py pins the knob empty too);
+#   * a fork is never also a revive (SL_RESUME) — that would be two different conversations;
+#   * a fork needs the runner's minted id, and the parent must be id-shaped (it becomes argv);
+#   * forking is a Claude Code capability, so another agent refuses rather than guessing.
+FORK_PARENT="${SL_FORK_PARENT:-}"
+if [ -n "$FORK_PARENT" ]; then
+  refuse_fork() {
+    echo "[$ID] CONSULT FORK REFUSED: $1 — not starting the agent" >&2
+    write_exited 1
+    exit 1
+  }
+  _sl_consult_re='^c[0-9]+$'
+  _sl_session_re='^[0-9A-Za-z][0-9A-Za-z-]{7,63}$'
+  [[ "$ID" =~ $_sl_consult_re ]] || \
+    refuse_fork "SL_FORK_PARENT is set but $ID is not a consult (c<N>) — only a consult forks a session"
+  [[ "$FORK_PARENT" =~ $_sl_session_re ]] || refuse_fork "SL_FORK_PARENT is not a session id"
+  if truthy "$RESUME"; then refuse_fork "a fork is never also a revive (SL_RESUME is set)"; fi
+  [ -n "$SESSION_ID" ] || refuse_fork "no runner-minted session id for the fork (SL_SESSION_ID)"
+  [ "$AGENT" = "claude" ] || \
+    refuse_fork "forking a session is a Claude Code capability; agent '$AGENT' cannot fork one"
+fi
 
 toml_string() {
   local s="${1:-}"
@@ -616,7 +645,10 @@ case "$AGENT" in
     # the flag takes an OPTIONAL value, so with nothing after it claude opens its interactive
     # session PICKER and an unattended launch sits at that menu until the freeze-net times out. No
     # id => neither flag, and the session behaves exactly as it did before #298.
-    if [ -n "$SESSION_ID" ]; then
+    if [ -n "$FORK_PARENT" ]; then
+      # Validated above: a consult id, an id-shaped parent, no revive, a minted id of its own.
+      CLAUDE_ARGS+=(--resume "$FORK_PARENT" --fork-session --session-id "$SESSION_ID")
+    elif [ -n "$SESSION_ID" ]; then
       if truthy "$RESUME"; then
         CLAUDE_ARGS+=(--resume "$SESSION_ID")
       else
