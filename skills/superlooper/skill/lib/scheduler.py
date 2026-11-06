@@ -319,10 +319,14 @@ def _plan(parsed_issues, lane_state, config, usage, closed_nums, frozen, territo
     # not a private re-implementation of half of it. The usage half is already settled by the
     # early-out above (which must stay: it also means "no holds"), so this re-asks it per candidate
     # for free; the point is that ONE predicate answers for both kinds of launch.
+    # A candidate marked `resume` (an answered consult's relaunch, #538) is a RESTART of a session
+    # this loop already approved and launched, so it is asked the restart form of the same gate —
+    # the one change `resume` makes is which label counts as the approval (issues.eligible).
     candidates = [p for p in parsed_issues
                   if p.get("id") not in running_ids
                   and p.get("id") not in claimed_ids
-                  and launch_ok(p, closed_nums, frozen, usage, config=config)]
+                  and launch_ok(p, closed_nums, frozen, usage, resume=p.get("resume") is True,
+                                config=config)]
     candidates.sort(key=lambda p: issues.sort_key(p, p.get("requeue_front", False)))
 
     selected_ids = set(running_ids) | set(claimed_ids)

@@ -891,3 +891,40 @@ def test_a_config_dir_the_pane_shell_injects_is_refused_not_adopted(rig):
     assert r.returncode == 7, f"rc={r.returncode}\n{r.stderr}"
     assert "was not assigned" in r.stderr
     assert not (rig["stub"] / "claude_env").exists()
+
+
+# ------------------------------------------------------- the c<N> consult class (issue #538)
+
+_PARENT = "1c1e6ffb-0d84-4f0d-b3e0-ae10c5fa781c"
+
+
+def test_the_consult_mode_forks_in_the_approvers_directory_through_the_real_cli(rig):
+    """The whole consult launch through `launch-session.py --consult`: the approver's directory is
+    the pane's cwd, the parent rides as SL_FORK_PARENT, and the checkout is not touched."""
+    (rig["run_root"] / "briefs" / "c5.md").write_text("consult the approver")
+    before = _tree_snapshot(rig["repo"])
+    r = _launch(rig, args=("--consult", "c5"),
+                extra_env={"SL_CONSULT_HOME": str(rig["repo"]), "SL_FORK_PARENT": _PARENT})
+    assert r.returncode == 0, f"rc={r.returncode}\n{r.stderr}"
+    assert (rig["stub"] / "cwd").read_text() == os.path.realpath(str(rig["repo"]))
+    env = _pane_env(rig)
+    assert env["SL_FORK_PARENT"] == _PARENT
+    assert env["SL_ISSUE_ID"] == "c5"
+    assert not (rig["run_root"] / "worktrees").exists()
+    assert _tree_snapshot(rig["repo"]) == before
+
+
+def test_the_consult_mode_refuses_an_issue_id(rig):
+    r = _launch(rig, args=("--consult", "i1"),
+                extra_env={"SL_CONSULT_HOME": str(rig["repo"]), "SL_FORK_PARENT": _PARENT})
+    assert r.returncode == 1
+    assert "consult mode expects a consult id" in r.stderr
+    assert not (rig["stub"] / "pane.env").exists()
+
+
+def test_a_worker_launch_never_inherits_an_ambient_fork_knob(rig):
+    """#536: pin the knob empty in every worker launch, so an export in the runner's shell can
+    never turn a worker into a fork of somebody's conversation."""
+    r = _launch(rig, args=("i1",), extra_env={"SL_FORK_PARENT": _PARENT})
+    assert r.returncode == 0, r.stderr
+    assert _pane_env(rig)["SL_FORK_PARENT"] == "", "the knob is read for --consult alone"

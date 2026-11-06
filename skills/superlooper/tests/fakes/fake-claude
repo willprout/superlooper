@@ -31,6 +31,12 @@ Scenarios:
                   the test asserts the RUNNER does the memo comment + label mechanics.
   vanish          exit instantly with no markers (start-session.sh writes `exited` — the silent
                   death the relaunch ladder must cap and park).
+  consult         (#538, for a `c<N>` id) play a FORK of the approving session: record the argv
+                  it was started with (`argv.c<N>` beside the scenario file, so a test can see the
+                  `--resume <parent> --fork-session` shape), read its outcome path FROM THE BRIEF,
+                  write the spec's "outcome" text there atomically, then linger at the prompt
+                  like a real session until the runner ends it. "outcome": null writes nothing
+                  (the bounded-wait fallback).
 
 Shared params (all optional): "edit" ({"file","append"} or {"file","line","text"} — same-line
 edits are how two issues manufacture a REAL merge conflict), "question", "memo", "answer",
@@ -442,8 +448,10 @@ def scenario_blocked(spec, contract, brief):
     # On the RELAUNCH (#163), the owner's answer to my predecessor's question is embedded in my
     # brief. That is the signal to STOP asking and finish the work — and it proves the Q&A round-trip
     # reached the fresh session (the DoD's "fresh relaunch with the Q&A present").
-    if "Owner's answers to your predecessor's questions" in brief:
-        log("relaunch: the owner's answer is in my brief — proceeding to finish")
+    # (#538) The header reads "Answers to your predecessor's questions" when the approving session
+    # answered — matched case-blind so both the owner's and the consult's answer resume the work.
+    if "answers to your predecessor's questions" in brief.lower():
+        log("relaunch: an answer is in my brief — proceeding to finish")
         worker_flow(spec, contract)
         return
     # First launch: commit + PUSH the work-in-progress (durable on origin), write the structured
@@ -457,6 +465,31 @@ def scenario_blocked(spec, contract, brief):
                   "RECOMMENDATION: A"))
     activity()
     log("structured question written to the blocked file; exiting cleanly")
+
+
+def scenario_consult(spec, brief):
+    """A fork of the approving session (#538). Everything it needs comes from the BRIEF — like
+    every fake here, a fork that knew its outcome path any other way would hide a broken packet."""
+    activity()
+    d = env("SIM_SCENARIO_DIR")
+    if d:
+        with open(os.path.join(d, "argv.%s" % ID), "w") as f:
+            json.dump(sys.argv[1:-1], f)                # everything but the brief itself
+    m = re.search(r"([^\s`]*/reports/c\d+\.md)", brief)
+    if not m:
+        log("consult brief is missing its outcome path")
+        sys.exit(1)
+    outcome = spec.get("outcome")
+    if outcome is not None:
+        path = m.group(1)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path + ".tmp", "w") as f:
+            f.write(outcome)
+        os.replace(path + ".tmp", path)               # atomic, as the brief instructs
+        log("consult outcome written")
+    activity()
+    # A real fork does not exit on its own: it waits at the prompt until the runner ends it.
+    wait_until(lambda: False, "the runner to end this consult")
 
 
 def scenario_bounce(spec, contract):
@@ -561,6 +594,9 @@ def main():
         scenario_resolve_conflict(spec, brief)
         return
     if name == "vanish":
+        return
+    if name == "consult":
+        scenario_consult(spec, brief)               # a fork has no worker contract to parse
         return
     contract = parse_brief(brief)
     if name in ("happy", "conflict"):

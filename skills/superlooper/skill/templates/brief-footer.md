@@ -22,10 +22,11 @@ BEFORE you file, read the repo's pinned **limitations ledger** (the open issue l
 session is a session that dies). Write your question to {blocked_path} as three parts — `QUESTION:`
 the one specific decision, `OPTIONS:` the choices you see, and `RECOMMENDATION:` the one you would
 take if forced — then commit and push your work-in-progress on `{branch}` (`git push -u origin
-HEAD`) and END your session. The runner posts your question as a durable comment on issue
-#{issue_num}, releases your lane, and closes your window; when {operator} answers, a FRESH session
-resumes this issue with your question and his answer in its brief, reusing your pushed branch if it
-still applies cleanly. You get at most TWO questions on one issue — a third hands the issue to
+HEAD`) and END your session. The runner releases your lane and closes your window, asks the
+session that approved this issue first when it can, and otherwise posts your question as a durable
+comment on issue #{issue_num} for {operator}; once it is answered, a FRESH session resumes this
+issue with your question and the answer (and who gave it) in its brief, reusing your pushed branch
+if it still applies cleanly. You get at most TWO questions on one issue — a third hands the issue to
 {operator} as a scoping problem. If you can safely proceed on one reasonable assumption,
 {assumption_hint}
 

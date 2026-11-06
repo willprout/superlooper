@@ -1953,3 +1953,12 @@ def test_an_over_long_session_id_costs_a_sample_not_the_tick():
                     auth_probe=_AUTH_UNKNOWN)
     out = decide(parsed_issues=[parsed(5), parsed(6)], dsk=dsk, usage=_dark_meter())
     assert AUTH_DEATH not in _reasons(out), "one usable sample is not a streak"
+
+
+def test_a_verified_consult_launch_is_a_delivery_that_ends_the_streak(rig):
+    """#538: a consult runs the same launcher for a `c<N>` fork. A verified one is a session this
+    machine started, so it must clear the attempt streak exactly as a worker launch does."""
+    rig.r.tick(now=NOW)
+    _oop(rig, "watchdog", "launch_failed", "d26", ts=NOW + 1, rc=5, signals=["alert"])
+    _mine(rig, "consult_start", "ok", "i5", ts=NOW + 2, num=5)
+    assert _streak(rig) == {"samples": {}, "delivered": True}

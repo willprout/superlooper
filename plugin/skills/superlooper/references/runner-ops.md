@@ -369,6 +369,8 @@ Sections:
 - **Parked / needs-owner** — with the memo comment for each, so you can act without digging.
 - **Bounces** — issues a worker bounced on premise drift, each with its proposed amendment.
 - **Owner questions** — durable questions workers handed you overnight (see "Answering a question").
+- **Approver consults** — every question a fork of its approving session answered, escalated to you,
+  or could not take (and why), each linked to its issue. Absent on a night with none.
 - **Conflict regenerations this week** — the tuning metric: if this climbs, tighten `affinity` or
   reduce `lanes`; if it's always zero, you can loosen. This is how you turn the parallelism dial.
 - **Wanders** — PRs whose actual diff touched areas the issue didn't declare in `touches:`.
@@ -383,7 +385,8 @@ Sections:
 A quiet night renders "nothing happened, queue empty" honestly — no news is real news.
 
 **The text goes out only on news.** News is something the report counts: a merge, a park or
-needs-owner hand-back, a bounce, an owner question, a conflict regeneration since the last report, a
+needs-owner hand-back, a bounce, an owner question, an approver consult, a conflict regeneration
+since the last report, a
 wander, an unattended debugger, a runner resurrection, a triage-flight verdict, a held launch queue,
 or a standing hold or merge freeze past its age threshold. A queue of approved issues waiting is not
 news — six issues sitting there is something the dashboard shows, not something that happened. A
@@ -469,6 +472,18 @@ writes its question to a file, **pushes its work-in-progress**, and **ends its t
 then posts the question as a **durable GitHub comment**, closes the window, and **releases the lane**
 — the issue moves to `awaiting-answer` and occupies nothing while it waits. The worktree is
 preserved, and the branch is on origin either way, so no live window is the only copy of anything.
+
+**The approving session is asked first (#538).** When the issue was approved with
+`superlooper approve` from a session on this machine whose transcript is still here, the runner
+first launches a fork of that session (`c<N>`, in that session's own directory) and gives it the
+issue, its thread, the question, the branch and PR, and every earlier handback. The issue sits in
+`consulting` meanwhile, holding no lane. If the fork **answers**, the runner posts the answer marked
+as the approving session's (never yours) and relaunches the worker with nobody applying
+`agent-ready` — you only see it in the morning report's **Approver consults** section and on the
+issue. If it **escalates**, or there is no stamp, no transcript, the fork fails to launch, it
+writes nothing within 20 minutes, or a usage ceiling or launch hold keeps it from starting for 20
+minutes, the question reaches you exactly as below, an escalation carrying the fork's reasoning and
+recommendation. The rule is `consult-standing-rule.md`.
 
 Your side is one touch: **answer in a comment, then re-apply `agent-ready`.** That relaunches a
 fresh session whose brief embeds the question and your answer verbatim, reusing the pushed WIP (or,

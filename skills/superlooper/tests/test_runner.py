@@ -8714,3 +8714,492 @@ def test_a_childs_stdout_is_never_welded_onto_its_first_stderr_line(rig, monkeyp
     assert "worktree ready" in text
     assert "MallocStackLogging" not in text
     assert text.splitlines()[0] == "worktree ready"     # its own line, not a welded sentence
+
+
+# =========================== the approver consult (#538) ===========================
+
+import approval as approval_mod
+import consult as consult_mod
+
+_SESSION = "1c1e6ffb-0d84-4f0d-b3e0-ae10c5fa781c"
+_Q = "QUESTION: approach A or B?\nOPTIONS:\n- A\n- B\nRECOMMENDATION: A"
+
+
+def _stamp_comment(rig, num, host="Williams-Mini", cwd=None, session=_SESSION, extra=()):
+    cwd = cwd if cwd is not None else str(rig.repo)
+    body = approval_mod.audit_comment("William", "2026-11-06",
+                                      approval_mod.Stamp(session, host, cwd))
+    _seed_gh_comments(rig, num, [body, *extra])
+
+
+def _consultable(rig, transcript=True, host="Williams-Mini"):
+    rig.r._hostname = lambda: host
+    rig.r._transcript_exists = lambda sid: transcript and sid == _SESSION
+
+
+def _blocked_worker(rig, iid="i5", **fields):
+    seed_issue(rig, iid, **{"status": "running", "branch": "sl/i5-x", "questions_asked": 0,
+                            **fields})
+    (rig.home / "state" / "blocked" / iid).write_text(_Q)
+    (rig.home / "state" / "panes" / iid).write_text("w1:p1")
+
+
+# --------------------------- the view: can this question be consulted? ---------------------------
+
+def test_the_view_finds_an_eligible_approver(rig):
+    _blocked_worker(rig)
+    _stamp_comment(rig, 5)
+    _consultable(rig)
+    check = rig.r.disk_view(NOW)["consult_checks"]["i5"]
+    assert check == {"state": "eligible", "session": _SESSION, "host": "Williams-Mini",
+                     "cwd": str(rig.repo)}
+
+
+@pytest.mark.parametrize("setup,reason", [
+    (lambda rig: _seed_gh_comments(rig, 5, ["Approved by William in conversation, 2026-11-06."]),
+     consult_mod.NO_STAMP),
+    (lambda rig: _stamp_comment(rig, 5, host="Some-Other-Mac"), consult_mod.OTHER_MACHINE),
+])
+def test_the_view_names_why_a_question_cannot_be_consulted(rig, setup, reason):
+    _blocked_worker(rig)
+    setup(rig)
+    _consultable(rig)
+    check = rig.r.disk_view(NOW)["consult_checks"]["i5"]
+    assert check["state"] == "fallback" and check["reason"] == reason
+
+
+def test_the_view_says_when_the_transcript_is_not_on_this_machine(rig):
+    _blocked_worker(rig)
+    _stamp_comment(rig, 5)
+    _consultable(rig, transcript=False)
+    check = rig.r.disk_view(NOW)["consult_checks"]["i5"]
+    assert check == {"state": "fallback", "reason": consult_mod.NO_TRANSCRIPT,
+                     "detail": "session %s" % _SESSION}
+
+
+def test_a_refused_stamp_read_is_never_read_as_no_stamp(rig, monkeypatch):
+    _blocked_worker(rig)
+    _consultable(rig)
+    monkeypatch.setenv("GH_FAIL", "1")
+    check = rig.r.disk_view(NOW)["consult_checks"]["i5"]
+    assert check["reason"] == consult_mod.STAMP_UNREAD
+
+
+def test_the_view_never_looks_at_a_bounce_or_a_posted_question(rig):
+    _blocked_worker(rig, question_posted=True)
+    seed_issue(rig, "i6", status="running")
+    (rig.home / "state" / "blocked" / "i6").write_text("BOUNCED: gone")
+    _stamp_comment(rig, 5)
+    _consultable(rig)
+    assert rig.r.disk_view(NOW)["consult_checks"] == {}
+
+
+def test_the_view_reads_the_consults_outcome_and_exit_by_exact_name(rig):
+    seed_issue(rig, "i5", status="consulting")
+    (rig.home / "reports").mkdir(exist_ok=True)
+    (rig.home / "reports" / "c5.md").write_text("OUTCOME: ESCALATE\nEND\n")
+    (rig.home / "reports" / "c6.md.tmp").write_text("OUTCOME: ANSWER\nANSWER: x\nEND\n")
+    (rig.home / "state" / "exited" / "c5").write_text("1 rc=0")
+    view = rig.r.disk_view(NOW)
+    assert view["consult_outcomes"] == {"i5": "OUTCOME: ESCALATE\nEND\n"}
+    assert view["consult_exited"] == {"i5": "1 rc=0"}
+    assert "c5" not in view["reports"], "a consult's outcome is never a worker's report"
+
+
+# --------------------------- consult_start ---------------------------
+
+def _start(rig, **over):
+    a = {"act": "consult_start", "id": "i5", "num": 5, "question": _Q,
+         "stamp": {"session": _SESSION, "host": "Williams-Mini", "cwd": str(rig.repo)}}
+    a.update(over)
+    return rig.r._execute(a, NOW)
+
+
+def test_consult_start_forks_the_approver_and_frees_the_lane(rig):
+    _blocked_worker(rig)
+    _stamp_comment(rig, 5, extra=[{"body": "<!-- superlooper-question -->\nan older question"}])
+    journal.append(str(rig.home), {"act": "park", "id": "i5", "num": 5, "outcome": "ok",
+                                   "cause": "exited", "memo": "an earlier crash"}, NOW - 9000)
+    assert _start(rig) == "ok"
+    (call,) = [c for c in rig.calls if "--consult" in c["args"]]
+    assert call["args"][-2:] == ["--consult", "c5"]
+    assert call["env"]["SL_FORK_PARENT"] == _SESSION
+    assert call["env"]["SL_CONSULT_HOME"] == str(rig.repo)
+    brief_text = (rig.home / "briefs" / "c5.md").read_text()
+    assert "QUESTION: approach A or B?" in brief_text
+    assert "an earlier crash" in brief_text, "the handback history rides in the packet"
+    assert "an older question" in brief_text, "and so does the comment thread"
+    assert str(rig.home / "reports" / "c5.md") in brief_text
+    st = issue_state(rig, "i5")
+    assert st["status"] == "consulting"
+    assert st["pending_question"] == _Q
+    assert st["consult"]["id"] == "c5" and st["consult"]["state"] == "running"
+    assert st["consult"]["session"] == _SESSION and st["consult"]["started_at"] == NOW
+    assert not (rig.home / "state" / "blocked" / "i5").exists()
+    assert not (rig.home / "state" / "panes" / "i5").exists(), "the worker's window is closed"
+    assert [m for m in mutations(rig) if m["kind"] in ("comment", "set_labels")] == [], \
+        "nothing is posted and no label moves until the consult decides"
+
+
+def test_every_worker_launch_pins_the_fork_knobs_empty(rig):
+    env = rig.r._worker_env("i5")
+    assert env["SL_FORK_PARENT"] == "" and env["SL_CONSULT_HOME"] == ""
+
+
+def test_a_consult_that_fails_to_launch_falls_back_with_the_reason(rig):
+    _blocked_worker(rig)
+    _stamp_comment(rig, 5)
+    rig.rc_queue.append(2)
+    _start(rig)
+    st = issue_state(rig, "i5")
+    assert st["status"] == "consulting"
+    assert st["consult"]["state"] == "fallback"
+    assert st["consult"]["reason"] == consult_mod.LAUNCH_FAILED
+    assert "rc=2" in st["consult"]["detail"]
+
+
+# --------------------------- consult_answer ---------------------------
+
+def _consulting(rig, **fields):
+    seed_issue(rig, "i5", status="consulting", branch="sl/i5-x", pending_question=_Q,
+               questions_asked=0, consult={"id": "c5", "state": "running", "session": _SESSION,
+                                           "started_at": NOW - 60, "question": _Q}, **fields)
+    (rig.home / "reports").mkdir(exist_ok=True)
+    (rig.home / "reports" / "c5.md").write_text("OUTCOME: ANSWER\nANSWER: Take A.\nEND\n")
+    (rig.home / "state" / "panes" / "c5").write_text("w2:p1")
+
+
+def test_consult_answer_posts_the_marked_answer_and_requeues_without_agent_ready(rig):
+    _consulting(rig)
+    out = rig.r._execute({"act": "consult_answer", "id": "i5", "num": 5, "answer": "Take A.",
+                          "reasoning": "ruled 11-04"}, NOW)
+    assert out == "ok"
+    ms = mutations(rig)
+    (comment,) = [m for m in ms if m["kind"] == "comment"]
+    assert comment["body"].startswith(consult_mod.MARKER)
+    assert "Take A." in comment["body"] and "not by" in comment["body"]
+    assert not [m for m in ms if m["kind"] == "set_labels" and "agent-ready" in str(m.get("add"))]
+    st = issue_state(rig, "i5")
+    assert st["status"] == "ready" and st["requeue_front"] is True
+    assert st["consult_relaunch"] is True
+    assert st["questions_asked"] == 1, "the two-question cap counts a consult's answer too"
+    assert st["qa_log"][-1] == {"question": _Q, "answer": "Take A.", "by": "consult",
+                                "session": _SESSION}
+    assert st["pending_question"] is None
+    assert not (rig.home / "reports" / "c5.md").exists()
+    assert not (rig.home / "state" / "panes" / "c5").exists(), "the consult session is ended"
+    (rec,) = [r for r in journal.read(str(rig.home)) if r.get("act") == "consult_outcome"]
+    assert rec["outcome_kind"] == "answered" and rec["num"] == 5
+
+
+def test_consult_answer_retries_a_failed_comment_and_never_double_posts(rig, monkeypatch):
+    _consulting(rig)
+    monkeypatch.setenv("GH_FAIL", "1")
+    out = rig.r._execute({"act": "consult_answer", "id": "i5", "num": 5, "answer": "Take A.",
+                          "reasoning": ""}, NOW)
+    assert "retry" in out
+    assert issue_state(rig, "i5")["status"] == "consulting"
+    assert (rig.home / "reports" / "c5.md").exists(), "the outcome survives for the retry"
+
+
+# --------------------------- the question to the owner, after a consult ---------------------------
+
+def test_an_escalated_question_carries_the_consults_reasoning(rig):
+    _consulting(rig)
+    rig.r._execute({"act": "post_question", "id": "i5", "num": 5, "question": _Q,
+                    "consult": {"outcome": "escalated", "reasoning": "never discussed",
+                                "recommendation": "take B", "session": _SESSION}}, NOW)
+    (comment,) = [m for m in mutations(rig) if m["kind"] == "comment"]
+    assert comment["body"].startswith("<!-- superlooper-question -->")
+    assert "never discussed" in comment["body"] and "take B" in comment["body"]
+    assert issue_state(rig, "i5")["status"] == "awaiting_answer"
+    assert not (rig.home / "reports" / "c5.md").exists()
+    assert not (rig.home / "state" / "panes" / "c5").exists(), "the consult session is ended"
+    (rec,) = [r for r in journal.read(str(rig.home)) if r.get("act") == "consult_outcome"]
+    assert rec["outcome_kind"] == "escalated"
+
+
+def test_a_fallen_back_question_is_todays_question_with_the_reason_journaled(rig):
+    _blocked_worker(rig)
+    rig.r._execute({"act": "post_question", "id": "i5", "num": 5, "question": _Q,
+                    "consult": {"outcome": "fell_back", "reason": consult_mod.NO_STAMP}}, NOW)
+    (comment,) = [m for m in mutations(rig) if m["kind"] == "comment"]
+    assert comment["body"] == rig.r._render_question(_Q), "exactly as today"
+    (rec,) = [r for r in journal.read(str(rig.home)) if r.get("act") == "consult_outcome"]
+    assert rec["outcome_kind"] == "fell_back" and rec["reason"] == consult_mod.NO_STAMP
+
+
+def test_an_answered_consult_relaunch_clears_its_flag_on_delivery(rig):
+    seed_issue(rig, "i5", status="ready", branch="sl/i5-x", consult_relaunch=True,
+               qa_log=[{"question": _Q, "answer": "Take A.", "by": "consult",
+                        "session": _SESSION}])
+    rig.r._parsed_by_id["i5"] = {"num": 5, "id": "i5", "title": "t", "type": "build",
+                                 "labels": ["in-progress", "type:build"], "touches": []}
+    rig.r._raw_by_id["i5"] = {"body": "## Goal\nx\n"}
+    assert rig.r._execute({"act": "launch", "id": "i5", "num": 5, "branch": "sl/i5-x",
+                           "touches": [], "soft_overlap": False, "orphan": False}, NOW) == "ok"
+    assert issue_state(rig, "i5")["consult_relaunch"] is False
+    text = (rig.home / "briefs" / "i5.md").read_text()
+    assert "approving session" in text and _SESSION in text
+
+
+# --------------------------- DoD: each fallback, through real ticks, with its reason journaled -----
+
+def _question_comments(rig):
+    return [m for m in mutations(rig) if m["kind"] == "comment"
+            and m["body"].startswith(runner_mod.QUESTION_MARKER)]
+
+
+def _fell_back(rig):
+    return [r for r in journal.read(str(rig.home))
+            if r.get("act") == "consult_outcome" and r.get("outcome_kind") == "fell_back"]
+
+
+def _ticks_until_posted(rig, now=NOW, step=20, limit=4):
+    for i in range(limit):
+        rig.r.tick(now + i * step)
+        if _question_comments(rig):
+            return now + i * step
+    return None
+
+
+def test_fallback_no_stamp_posts_todays_question_and_journals_why(rig):
+    _blocked_worker(rig)
+    _seed_gh_comments(rig, 5, ["Approved by William in conversation, 2026-11-06."])
+    _consultable(rig)
+    assert _ticks_until_posted(rig) is not None
+    (c,) = _question_comments(rig)
+    assert c["body"] == rig.r._render_question(_Q), "the owner gets exactly today's question"
+    assert not [x for x in rig.calls if "--consult" in x["args"]], "nothing was launched"
+    (rec,) = _fell_back(rig)
+    assert rec["reason"] == consult_mod.NO_STAMP and rec["num"] == 5
+
+
+def test_fallback_transcript_not_on_this_machine(rig):
+    _blocked_worker(rig)
+    _stamp_comment(rig, 5)
+    _consultable(rig, transcript=False)
+    assert _ticks_until_posted(rig) is not None
+    assert not [x for x in rig.calls if "--consult" in x["args"]]
+    (rec,) = _fell_back(rig)
+    assert rec["reason"] == consult_mod.NO_TRANSCRIPT
+
+
+def test_fallback_the_fork_fails_to_launch(rig):
+    _blocked_worker(rig)
+    _stamp_comment(rig, 5)
+    _consultable(rig)
+    rig.rc_queue.append(2)                        # the consult's own launch is the first to run
+    assert _ticks_until_posted(rig) is not None
+    assert [x for x in rig.calls if "--consult" in x["args"]], "the fork was attempted"
+    assert issue_state(rig, "i5")["status"] == "awaiting_answer"
+    (rec,) = _fell_back(rig)
+    assert rec["reason"] == consult_mod.LAUNCH_FAILED and "rc=2" in rec["detail"]
+
+
+def test_fallback_the_fork_writes_no_outcome_within_the_bound(rig):
+    _blocked_worker(rig)
+    _stamp_comment(rig, 5)
+    _consultable(rig)
+    rig.r.tick(NOW)
+    assert issue_state(rig, "i5")["status"] == "consulting"
+    rig.r.tick(NOW + consult_mod.TIMEOUT_SECONDS - 30)
+    assert _question_comments(rig) == [], "inside the bound the consult is left to decide"
+    rig.r.tick(NOW + consult_mod.TIMEOUT_SECONDS + 1)
+    assert len(_question_comments(rig)) == 1
+    assert issue_state(rig, "i5")["status"] == "awaiting_answer"
+    (rec,) = _fell_back(rig)
+    assert rec["reason"] == consult_mod.TIMEOUT
+
+
+def test_the_cap_holds_whoever_answered(rig):
+    """Two questions answered — one by the approving session, one by the owner — and the third
+    parks, never a third consult."""
+    _blocked_worker(rig, questions_asked=2,
+                    qa_log=[{"question": "q1", "answer": "a1", "by": "consult"},
+                            {"question": "q2", "answer": "a2"}])
+    _stamp_comment(rig, 5)
+    _consultable(rig)
+    rig.r.tick(NOW)
+    assert not [x for x in rig.calls if "--consult" in x["args"]]
+    assert issue_state(rig, "i5")["status"] in ("needs_william", "parked")
+
+
+def test_the_packet_carries_the_issues_earlier_handbacks_and_how_each_was_resolved(rig):
+    """DoD: an issue with prior history passes it to the consult — every earlier question and
+    answer, park, freeze and bounce, and what resolved it. #536 measured why: a fork remembers only
+    the approver's latest compaction onward, so older history reaches it through the packet alone."""
+    _blocked_worker(rig, qa_log=[{"question": "QUESTION: which table?", "answer": "the new one"}],
+                    questions_asked=1)
+    _stamp_comment(rig, 5)
+    for i, (act, kw) in enumerate([
+            ("post_question", {"question": "QUESTION: which table?"}),
+            ("answer_relaunch", {}),
+            ("recover", {"tier": "frozen"}),
+            ("park", {"cause": "exited", "memo": "relaunched twice, no report"}),
+            ("reapprove", {}),
+            ("bounce", {"memo": "BOUNCED: the endpoint moved"})]):
+        journal.append(str(rig.home), {"act": act, "id": "i5", "num": 5, "outcome": "ok", **kw},
+                       NOW - 10_000 + i)
+    journal.append(str(rig.home), {"act": "park", "id": "i9", "num": 9, "outcome": "ok",
+                                   "memo": "SOMEONE ELSE'S PARK"}, NOW - 5000)
+    _start(rig)
+    text = (rig.home / "briefs" / "c5.md").read_text()
+    history = text.split("## Its handback history")[1].split("## Your outcome")[0]
+    for needle in ("asked the owner a question: QUESTION: which table?",
+                   "the owner answered and re-approved",
+                   "relaunched after its session froze",
+                   "relaunched twice, no report",
+                   "the owner re-approved it",
+                   "the endpoint moved",
+                   "Answered by %s:** the new one" % rig.r._operator()):
+        assert needle in history, needle
+    assert "SOMEONE ELSE'S PARK" not in text
+    order = [history.index(n) for n in ("which table?", "session froze", "no report",
+                                        "re-approved it", "endpoint moved")]
+    assert order == sorted(order), "oldest first, so each handback reads with its resolution"
+
+
+
+# ---- review round 1 (#538) ----
+
+def test_the_view_checks_a_question_from_a_frozen_or_exited_lane_too(rig):
+    for status in ("frozen", "exited"):
+        _blocked_worker(rig, status=status)
+        _stamp_comment(rig, 5)
+        _consultable(rig)
+        assert rig.r.disk_view(NOW)["consult_checks"]["i5"]["state"] == "eligible", status
+
+
+def test_a_held_consult_is_not_re_read_from_github_every_tick(rig, monkeypatch):
+    stamp = {"session": _SESSION, "host": "Williams-Mini", "cwd": str(rig.repo)}
+    _blocked_worker(rig, consult_held={"question": _Q, "reason": "usage", "since": NOW,
+                                       "stamp": stamp})
+    _consultable(rig)
+    monkeypatch.setenv("GH_FAIL", "1")                      # a read now would come back refused
+    assert rig.r.disk_view(NOW)["consult_checks"]["i5"] == {"state": "eligible", **stamp}
+
+
+def test_consult_held_stamps_its_clock_once_per_question(rig):
+    _blocked_worker(rig)
+    stamp = {"session": _SESSION, "host": "Williams-Mini", "cwd": str(rig.repo)}
+    rig.r._execute({"act": "consult_held", "id": "i5", "num": 5, "question": _Q,
+                    "reason": "usage", "stamp": stamp}, NOW)
+    rig.r._execute({"act": "consult_held", "id": "i5", "num": 5, "question": _Q,
+                    "reason": "launch hold", "stamp": stamp}, NOW + 500)
+    held = issue_state(rig, "i5")["consult_held"]
+    assert held["since"] == NOW and held["reason"] == "launch hold" and held["stamp"] == stamp
+
+
+def test_a_refused_thread_read_is_named_in_the_packet_never_read_as_no_comments(rig, monkeypatch):
+    _blocked_worker(rig)
+    import gh as gh_mod
+    monkeypatch.setattr(gh_mod, "issue_comments",
+                        lambda num: gh_mod.CommentRead(comments=[], ok=False))
+    _start(rig)
+    text = (rig.home / "briefs" / "c5.md").read_text()
+    assert "could not be read" in text and "_No comments._" not in text
+
+
+def test_an_answer_settles_before_its_outcome_file_is_consumed(rig, monkeypatch):
+    """A crash between the two must leave the ANSWER on disk, never a consult whose outcome is gone
+    and whose timeout would page the owner for a question already answered."""
+    _consulting(rig)
+    seen = {}
+    real_end = rig.r._end_consult
+
+    def end(cid):
+        seen["status"] = issue_state(rig, "i5")["status"]
+        real_end(cid)
+    rig.r._end_consult = end
+    rig.r._execute({"act": "consult_answer", "id": "i5", "num": 5, "answer": "Take A.",
+                    "reasoning": ""}, NOW)
+    assert seen["status"] == "ready"
+
+
+def test_an_answer_resets_the_post_once_stamp_for_the_next_question(rig):
+    _consulting(rig, question_posted=True)
+    rig.r._execute({"act": "consult_answer", "id": "i5", "num": 5, "answer": "Take A.",
+                    "reasoning": ""}, NOW)
+    assert issue_state(rig, "i5")["question_posted"] is False
+
+
+def test_the_consult_ends_the_moment_its_question_reaches_the_owner(rig, monkeypatch):
+    """Even when the label move then fails: a live fork must not get to answer a question the owner
+    already holds."""
+    _consulting(rig)
+    rig.r._end_consult = lambda cid: rig.calls.append({"args": ["END", cid], "env": {}})
+    real = runner_mod.gh.set_labels
+    monkeypatch.setattr(runner_mod.gh, "set_labels", lambda *a, **k: False)
+    out = rig.r._execute({"act": "post_question", "id": "i5", "num": 5, "question": _Q,
+                          "consult": {"outcome": "fell_back", "reason": consult_mod.TIMEOUT}}, NOW)
+    assert "label move failed" in out
+    assert {"args": ["END", "c5"], "env": {}} in rig.calls
+    monkeypatch.setattr(runner_mod.gh, "set_labels", real)
+
+
+def test_absorbing_a_close_mid_consult_ends_the_consult(rig):
+    _consulting(rig)
+    rig.r._execute({"act": "absorb_close", "id": "i5", "num": 5}, NOW)
+    assert not (rig.home / "state" / "panes" / "c5").exists()
+    assert not (rig.home / "reports" / "c5.md").exists()
+
+
+def test_a_second_consult_on_the_same_issue_ends_any_stale_one_first(rig):
+    _blocked_worker(rig, consult={"id": "c5", "state": "answered", "question": "q1"})
+    _stamp_comment(rig, 5)
+    (rig.home / "state" / "panes" / "c5").write_text("w9:p9")      # a fork that outlived its answer
+    real_end = rig.r._end_consult
+
+    def end(cid):
+        rig.calls.append({"args": ["END", cid], "env": {}})
+        real_end(cid)
+    rig.r._end_consult = end
+    assert _start(rig) == "ok"
+    launch_i = next(i for i, c in enumerate(rig.calls) if "--consult" in c["args"])
+    end_i = rig.calls.index({"args": ["END", "c5"], "env": {}})
+    assert end_i < launch_i, "the stale fork is ended before the new one launches"
+    assert not (rig.home / "state" / "panes" / "c5").exists()
+
+
+def test_a_runner_restarted_mid_consult_picks_the_consult_back_up(rig):
+    _blocked_worker(rig)
+    _stamp_comment(rig, 5)
+    _consultable(rig)
+    rig.r.tick(NOW)
+    assert issue_state(rig, "i5")["status"] == "consulting"
+    reborn = runner_mod.Runner(repo=str(rig.repo), config=rig.r.config, state_home=str(rig.home),
+                               pane="pane-1", run_script=rig.r._run_script,
+                               fetch_usage=rig.r._fetch_usage)
+    reborn._anchor_status = rig.r._anchor_status
+    reborn._session_host = rig.r._session_host
+    (rig.home / "reports" / "c5.md").write_text("OUTCOME: ANSWER\nANSWER:\nTake A.\nEND\n")
+    reborn.tick(NOW + 30)
+    st = issue_state(rig, "i5")
+    assert st["status"] in ("ready", "running") and st["qa_log"][-1]["by"] == "consult"
+
+
+
+# ---- review round 2 (#538) ----
+
+def test_a_held_fallback_clears_its_hold_record(rig):
+    _blocked_worker(rig, consult_held={"question": _Q, "reason": "usage", "since": NOW - 9999,
+                                       "stamp": {"session": _SESSION}})
+    rig.r._execute({"act": "post_question", "id": "i5", "num": 5, "question": _Q,
+                    "consult": {"outcome": "fell_back", "reason": consult_mod.HELD}}, NOW)
+    assert issue_state(rig, "i5").get("consult_held") is None
+
+
+def test_an_answer_is_journaled_before_the_consult_is_ended(rig):
+    _consulting(rig)
+    seen = {}
+    real_end = rig.r._end_consult
+
+    def end(cid):
+        seen["journaled"] = any(r.get("act") == "consult_outcome"
+                                for r in journal.read(str(rig.home)))
+        real_end(cid)
+    rig.r._end_consult = end
+    rig.r._execute({"act": "consult_answer", "id": "i5", "num": 5, "answer": "Take A.",
+                    "reasoning": ""}, NOW)
+    assert seen["journaled"] is True

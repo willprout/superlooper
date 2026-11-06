@@ -7,6 +7,8 @@ Three modes — the first two unchanged from the cmux launcher this replaces:
     launch-session.py --cwd <dir> <d-id>    debugger: launch in an existing dir (no worktree)
     launch-session.py --triage <t-id>       triage:   the flight (#448) — the repo's own checkout,
                                                       or SL_TRIAGE_HOME=worktree for a detached one
+    launch-session.py --consult <c-id>      consult:  a fork of the approving session (#538), in
+                                                      SL_CONSULT_HOME, forking SL_FORK_PARENT
 
 The triage mode takes a FLAG rather than being inferred from the id, because its default home
 creates nothing and takes no directory — so on the old "``--cwd`` selects the mode" rule it would
@@ -46,11 +48,12 @@ def _int(value, default):
         return default
 
 
-_USAGE = ("usage: launch-session.py <i-id>  (or --cwd <dir> <d-id>, or --triage <t-id>)")
+_USAGE = ("usage: launch-session.py <i-id>  (or --cwd <dir> <d-id>, or --triage <t-id>, "
+          "or --consult <c-id>)")
 
 
 def _spec(argv):
-    """Parse the three modes into a Spec, or return None (usage went to stderr)."""
+    """Parse the four modes into a Spec, or return None (usage went to stderr)."""
     cwd = None
     mode = ""
     if argv[:1] == ["--cwd"]:
@@ -63,6 +66,11 @@ def _spec(argv):
             print("usage: launch-session.py --triage <t-id>", file=sys.stderr)
             return None
         mode, iid = launch.TRIAGE, argv[1]
+    elif argv[:1] == ["--consult"]:
+        if len(argv) < 2 or not argv[1]:
+            print("usage: launch-session.py --consult <c-id>", file=sys.stderr)
+            return None
+        mode, iid = launch.CONSULT, argv[1]
     elif len(argv) >= 1 and argv[0]:
         iid = argv[0]
     else:
@@ -88,6 +96,11 @@ def _spec(argv):
         # quiet fallback in the process boundary would launch the flight against the wrong one.
         # Empty means "say nothing", and the Spec default (checkout) then stands.
         triage_home=env.get("SL_TRIAGE_HOME") or launch.Spec.triage_home,
+        # The consult's two knobs (#538) are read for `--consult` ALONE: an ambient export in the
+        # runner's shell must never turn another class into a fork (lib/launch.py refuses a parent
+        # on any other class, and names the knob empty in every pane it builds).
+        consult_home=env.get("SL_CONSULT_HOME", "") if mode == launch.CONSULT else "",
+        fork_parent=env.get("SL_FORK_PARENT", "") if mode == launch.CONSULT else "",
         engine_bin=_HERE,
         agent=env.get("SL_AGENT") or "claude",
         model=env.get("SL_MODEL", ""),

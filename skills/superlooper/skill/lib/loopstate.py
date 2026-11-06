@@ -29,6 +29,11 @@ LOCK_STALE_SECONDS = 120
 #   awaiting_answer - worker exited cleanly on an owner-decision question (durable GitHub comment);
 #              the lane is RELEASED and the window CLOSED — nothing relaunches until the owner
 #              answers (re-applies agent-ready). Exempt from every liveness/recovery path (#163).
+#   consulting - (#538) a worker exited cleanly on a question, and a fork of the session that
+#              APPROVED the issue is considering it before the owner is asked. Like awaiting_answer
+#              it holds NO lane and no worker window; the fork's one outcome file moves it — an
+#              ANSWER back to `ready` (relaunched on the runner's own `in-progress` stamp, with
+#              `consult_relaunch`), an ESCALATE or any failure to decide on to `awaiting_answer`.
 #   frozen   - activity stale past FREEZE_SECONDS; in the recovery ladder
 #   exited   - the Claude process returned to the shell; awaiting relaunch
 #   gating   - finished (report exists); the mechanical ship gate is running
@@ -43,7 +48,7 @@ LOCK_STALE_SECONDS = 120
 # the issue to `awaiting_answer` in the same tick, so nothing ever occupies a "blocked" state. The
 # member survived #163's wiring removal as a writerless enum value — an invitation for a future
 # edit to re-introduce the live-frozen-session model this repo removed on purpose.
-VALID = ["ready", "running", "awaiting_answer", "frozen", "exited",
+VALID = ["ready", "running", "awaiting_answer", "consulting", "frozen", "exited",
          "gating", "holding", "merged", "parked", "needs_william", "bounced"]
 
 # One issue's initial state TEMPLATE. `launches` is stamped mechanically by the launcher at
@@ -57,7 +62,10 @@ VALID = ["ready", "running", "awaiting_answer", "frozen", "exited",
 # Durable-question fields (#163): `questions_asked` is the per-issue question count (capped at 2 — a
 # third is a scoping park); `pending_question` holds the question the owner has not yet answered;
 # `qa_log` is the answered [{question, answer}] history embedded into every relaunch brief so a fresh
-# session inherits the full decision trail.
+# session inherits the full decision trail. An entry the approving session's consult answered (#538)
+# also carries `by: "consult"` and the `session` it forked, so the brief attributes it to that
+# session and never to the owner. `consult` (absent until a consult runs) is the current question's
+# consult record: {id, state, session, host, cwd, started_at, question, reason?, detail?}.
 DEFAULT_ISSUE = {"status": "ready", "branch": None, "lane": None,
                  "launches": 0, "retries": 0, "conflicts": 0,
                  "requeue_front": False, "declared_touches": [], "pr": None,

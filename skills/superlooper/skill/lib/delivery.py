@@ -193,6 +193,32 @@ def records(run_root, iid, agent="claude", env=None, tail_bytes=TAIL_BYTES):
 HEAD_BYTES = 64 * 1024
 
 
+def transcript_exists(session_id, env=None, agent="claude"):
+    """Is conversation `session_id` on THIS machine, where a session the fleet launches would look?
+    (issue #538)
+
+    The consult forks the session that approved an issue, so before launching anything the runner
+    asks whether there is a transcript to fork — #536 measured the alternative: `--resume` of a
+    missing id prints to STDOUT, exits 1 within a second, and the launch path has already reported a
+    verified delivery. Asking first is what lets "no transcript" fall back to the owner cleanly
+    instead of reading as a launch that failed.
+
+    The root is `transcript_root` — the FLEET's config dir, not this process's own — because the
+    fork is started by the fleet's launch path: if the fleet ever moves to its own config dir
+    (#300/#314), a fork launched there cannot see the owner's transcripts, and this answers False
+    so every consult falls back to the owner rather than launching into a missing parent.
+
+    False for every failure, and for an agent this module cannot read a transcript for."""
+    if agent not in AGENTS:
+        return False
+    if not isinstance(session_id, str) or not session_id.strip():
+        return False
+    root = transcript_root(env)
+    if not root:
+        return False
+    return bool(Transcript(root=root, session_id=session_id.strip(), text="")._path())
+
+
 def own_projects_root(env=None):
     """Where THIS process's own agent keeps its transcripts — the caller's own session, not a
     worker's: the config dir the agent itself was started under (`identity.CONFIG_DIR_VAR`), else

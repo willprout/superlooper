@@ -86,6 +86,11 @@ OPS_DOCS = (
     # cites `approval-protocol.md` as a sibling, which only resolves if both land in one directory.
     ("plugin/skills/superlooper/references/triage-standing-rule.md",
      "superlooper/references/triage-standing-rule.md"),
+    # The consult's standing rule (#538): what a `c<N>` fork of the approving session may answer
+    # on the owner's behalf, and what it must escalate. The consult's brief names this mirror as
+    # its fallback copy, so it must land beside the approval protocol it cites.
+    ("plugin/skills/superlooper/references/consult-standing-rule.md",
+     "superlooper/references/consult-standing-rule.md"),
     # The debugger playbook, whole. The entry page routes to all four references; the unattended
     # contract is the one a watchdog-launched session is held to.
     ("plugin/skills/sl-debugger/SKILL.md", "sl-debugger/PLAYBOOK.md"),

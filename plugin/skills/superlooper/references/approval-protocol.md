@@ -62,7 +62,7 @@ started in. The owner's ruling (2026-11-04) is that when the loop needs to consu
 issue, it consults the session that *approved* it, not the one that wrote it. The approving
 orchestrator holds the project-wide context of what William wants; a build session that filed a
 follow-up may not. The engine's reader for the stamp is `approval.read`
-(`skills/superlooper/skill/lib/approval.py`), which the consult work will call. It trusts only
+(`skills/superlooper/skill/lib/approval.py`), which the consult (`consult-standing-rule.md`) calls. It trusts only
 comments the repo owner's account wrote, and only ones shaped like this audit comment. It takes the
 newest stamp, and an unstamped approval never clears an earlier stamp.
 
@@ -96,6 +96,16 @@ The worked example, and the only one that exists today:
 Any future standing rule follows the same shape: William defines it, it is scoped narrowly, and it
 gets its own distinct label. An agent never invents a standing rule, and never reaches for
 `agent-ready` as a shortcut for one.
+
+**The approver consult (`consult-standing-rule.md`, #538)** is a standing rule of a different
+shape, because it never puts an issue into the queue: it answers a question on an issue William
+already approved. When a worker asks, a fork of the session that approved the issue is asked first,
+and on an ANSWER the worker is relaunched with **nobody applying `agent-ready`** — the relaunch rides
+the runner's own `in-progress` stamp, the approval the loop already acted on. Its audit trail is
+its own: the answer is posted under a distinct `<!-- superlooper-consult -->` marker that says it is
+the approving session's word and not William's, and every consult appears in the morning report.
+Anything that would change the approved Goal, Definition of done or Boundaries is escalated to
+William, never answered.
 
 ## Pre-authorizing a foreseeable owner-gate stop (issue #165)
 

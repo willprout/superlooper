@@ -6775,3 +6775,277 @@ def test_a_published_view_is_evidence_only_if_its_runner_saw_github_answer():
     for doc in ({"issues": {"i9": row}, "polled_at": None},        # published before any poll landed
                 {"issues": {"i9": row}}, {"issues": [], "polled_at": NOW}, None, [], "x"):
         assert actions.published_work_demand(doc, None) is None, doc
+
+
+# =========================== the approver consult (#538) ===========================
+#
+# A worker's question goes FIRST to a fork of the session that approved the issue. The runner reads
+# whether that is possible into the view (`consult_checks`: the approver stamp, this machine, the
+# transcript), and decide routes on it; a view without the key is the pre-#538 behaviour exactly.
+
+import consult as consult_mod
+
+_STAMP = {"session": "1c1e6ffb-0d84-4f0d-b3e0-ae10c5fa781c", "host": "Williams-Mini",
+          "cwd": "/Users/w/Projects/superlooper"}
+_Q = "QUESTION: approach A or B?\nOPTIONS: A, B\nRECOMMENDATION: A"
+
+
+def _blocked(check=None, iid="i7", **ist_over):
+    over = {"blocked": {iid: _Q},
+            "issues_state": {"version": 1, "issues": {iid: ist("running", **ist_over)}}}
+    if check is not None:
+        over["consult_checks"] = {iid: check}
+    return disk(**over)
+
+
+def _consulting(outcome=None, exited=False, started=NOW - 60, state="running", **ist_over):
+    rec = {"id": "c7", "state": state, "session": _STAMP["session"], "started_at": started,
+           "question": _Q}
+    rec.update(ist_over.pop("rec", {}))
+    over = {"issues_state": {"version": 1, "issues": {"i7": ist(
+        "consulting", pending_question=_Q, consult=rec, **ist_over)}}}
+    if outcome is not None:
+        over["consult_outcomes"] = {"i7": outcome}
+    if exited:
+        over["consult_exited"] = {"i7": "1750000000 rc=0"}
+    return disk(**over)
+
+
+def test_an_eligible_question_launches_a_consult_and_tells_nobody_yet():
+    out = decide(parsed_issues=[parsed(7, labels=("in-progress", "type:build"))],
+                 dsk=_blocked({"state": "eligible", **_STAMP}))
+    (c,) = only(out, "consult_start")
+    assert c["id"] == "i7" and c["num"] == 7 and c["question"] == _Q
+    assert c["stamp"] == _STAMP
+    assert only(out, "post_question") == []
+    assert not has_notify(out), "the owner is not paged for a question the approver may answer"
+
+
+def test_no_consult_key_in_the_view_is_todays_question_exactly():
+    out = decide(dsk=_blocked())
+    assert only(out, "consult_start") == []
+    (q,) = only(out, "post_question")
+    assert q == {"act": "post_question", "id": "i7", "num": 7, "question": _Q}
+    assert has_notify(out)
+
+
+@pytest.mark.parametrize("reason", [consult_mod.NO_STAMP, consult_mod.OTHER_MACHINE,
+                                    consult_mod.NO_TRANSCRIPT, consult_mod.STAMP_UNREAD])
+def test_an_ineligible_question_falls_back_to_the_owner_with_its_reason(reason):
+    out = decide(dsk=_blocked({"state": "fallback", "reason": reason, "detail": "d"}))
+    assert only(out, "consult_start") == []
+    (q,) = only(out, "post_question")
+    assert q["question"] == _Q
+    assert q["consult"] == {"outcome": "fell_back", "reason": reason, "detail": "d"}
+    assert has_notify(out)
+
+
+def test_a_question_already_posted_never_starts_a_consult():
+    out = decide(dsk=_blocked({"state": "eligible", **_STAMP}, question_posted=True))
+    assert only(out, "consult_start") == []
+    assert len(only(out, "post_question")) == 1 and not has_notify(out)
+
+
+def test_the_two_question_cap_parks_before_any_consult():
+    out = decide(dsk=_blocked({"state": "eligible", **_STAMP}, questions_asked=2))
+    assert only(out, "consult_start") == [] and only(out, "post_question") == []
+    assert len(only(out, "park")) == 1
+
+
+def test_a_consult_waits_for_usage_like_any_session():
+    over = usage_ok()
+    over["five_hour_pct"] = 99.0
+    out = decide(usage=over, dsk=_blocked({"state": "eligible", **_STAMP}))
+    assert only(out, "consult_start") == []
+    assert only(out, "post_question") == []
+    (h,) = only(out, "consult_held")
+    assert h["id"] == "i7" and "usage" in h["reason"]
+
+
+def test_a_held_consult_is_journaled_once_per_reason():
+    over = usage_ok()
+    over["five_hour_pct"] = 99.0
+    held = actions._consult_hold_reason(False, False)
+    out = decide(usage=over, dsk=_blocked({"state": "eligible", **_STAMP},
+                                          consult_held={"question": _Q, "reason": held,
+                                                        "since": NOW - 60}))
+    assert only(out, "consult_held") == [] and only(out, "consult_start") == []
+
+
+def test_a_consult_waits_while_launches_are_held():
+    out = decide(dsk=disk(**{**_blocked({"state": "eligible", **_STAMP}), "display_asleep": True}))
+    assert only(out, "consult_start") == []
+    assert len(only(out, "consult_held")) == 1
+
+
+def test_a_consulting_issue_holds_no_lane():
+    st = {"version": 1, "issues": {"i7": ist("consulting")}}
+    assert actions.lane_state_from(st) == []
+    assert actions.territory_claims_from(st) == []
+
+
+def test_a_consult_never_takes_a_build_lane_from_queued_work():
+    dsk = _consulting()
+    out = decide(config=cfg(lanes=1), lane_state=actions.lane_state_from(dsk["issues_state"]),
+                 parsed_issues=[parsed(7, labels=("in-progress", "type:build")), parsed(9)],
+                 dsk=dsk)
+    assert [l["id"] for l in only(out, "launch")] == ["i9"]
+
+
+def test_a_running_consult_is_left_alone():
+    out = decide(dsk=_consulting())
+    assert [a for a in out if a.get("id") == "i7"] == []
+
+
+def test_an_answer_relaunches_through_consult_answer():
+    out = decide(dsk=_consulting("OUTCOME: ANSWER\nANSWER:\nTake A.\nREASONING:\nruled 11-04\nEND\n"))
+    (a,) = only(out, "consult_answer")
+    assert a["id"] == "i7" and a["answer"] == "Take A." and a["reasoning"] == "ruled 11-04"
+    assert only(out, "post_question") == [] and not has_notify(out)
+
+
+def test_a_half_written_outcome_is_waited_for():
+    out = decide(dsk=_consulting("OUTCOME: ANSWER\nANSWER:\nTake"))
+    assert only(out, "consult_answer") == [] and only(out, "post_question") == []
+
+
+def test_an_escalation_goes_to_the_owner_with_the_reasoning_and_recommendation():
+    out = decide(dsk=_consulting("OUTCOME: ESCALATE\nREASONING: never discussed\n"
+                                 "RECOMMENDATION: take B\nEND"))
+    (q,) = only(out, "post_question")
+    assert q["question"] == _Q
+    assert q["consult"]["outcome"] == "escalated"
+    assert q["consult"]["reasoning"] == "never discussed"
+    assert q["consult"]["recommendation"] == "take B"
+    assert q["consult"]["session"] == _STAMP["session"]
+    assert has_notify(out)
+
+
+@pytest.mark.parametrize("kind,dsk_kw,reason", [
+    ("unreadable", {"outcome": "OUTCOME: SHRUG\nEND"}, consult_mod.MALFORMED),
+    ("exited", {"exited": True}, consult_mod.FORK_EXITED),
+    ("exited mid-write", {"exited": True, "outcome": "OUTCOME: ANS"}, consult_mod.FORK_EXITED),
+    ("timeout", {"started": NOW - consult_mod.TIMEOUT_SECONDS - 1}, consult_mod.TIMEOUT),
+    ("unreadable clock", {"started": "soon"}, consult_mod.TIMEOUT),
+])
+def test_a_consult_that_cannot_decide_falls_back_to_the_owner(kind, dsk_kw, reason):
+    out = decide(dsk=_consulting(**dsk_kw))
+    (q,) = only(out, "post_question")
+    assert q["consult"]["outcome"] == "fell_back" and q["consult"]["reason"] == reason, kind
+    assert has_notify(out)
+
+
+def test_a_consult_that_failed_to_launch_falls_back_to_the_owner():
+    out = decide(dsk=_consulting(state="fallback", rec={"reason": consult_mod.LAUNCH_FAILED,
+                                                         "detail": "rc=2"}))
+    (q,) = only(out, "post_question")
+    assert q["consult"] == {"outcome": "fell_back", "reason": consult_mod.LAUNCH_FAILED,
+                            "detail": "rc=2"}
+
+
+def test_a_posted_escalation_retries_its_labels_without_re_paging():
+    out = decide(dsk=_consulting("OUTCOME: ESCALATE\nEND", question_posted=True))
+    assert len(only(out, "post_question")) == 1 and not has_notify(out)
+
+
+def test_an_answered_consult_relaunches_on_the_in_progress_stamp_without_agent_ready():
+    dsk = disk(issues_state={"version": 1, "issues": {"i7": ist(
+        "ready", consult_relaunch=True, requeue_front=True, launches=1)}})
+    out = decide(parsed_issues=[parsed(7, labels=("in-progress", "type:build"))], dsk=dsk)
+    (l,) = only(out, "launch")
+    assert l["id"] == "i7" and l["orphan"] is False
+    assert only(out, "reclaim") == [], "the orphan sweep must not reclaim an answered consult"
+
+
+def test_an_answered_consult_waits_for_a_free_lane_like_any_launch():
+    dsk = disk(issues_state={"version": 1, "issues": {
+        "i7": ist("ready", consult_relaunch=True), "i9": ist("running", declared_touches=["api"])}})
+    out = decide(config=cfg(lanes=1), dsk=dsk,
+                 lane_state=actions.lane_state_from(dsk["issues_state"]),
+                 parsed_issues=[parsed(7, labels=("in-progress", "type:build")),
+                                parsed(9, labels=("in-progress", "type:build"), touches=("api",))])
+    assert only(out, "launch") == []
+
+
+def test_an_answered_consult_the_owner_un_approved_never_relaunches():
+    dsk = disk(issues_state={"version": 1, "issues": {"i7": ist("ready", consult_relaunch=True)}})
+    out = decide(parsed_issues=[parsed(7, labels=("type:build",))], dsk=dsk)
+    assert only(out, "launch") == []
+
+
+def test_an_answered_consult_that_keeps_failing_to_launch_parks():
+    dsk = disk(issues_state={"version": 1, "issues": {"i7": ist(
+        "ready", consult_relaunch=True, launch_failures=actions.LAUNCH_FAILURE_CAP)}})
+    out = decide(parsed_issues=[parsed(7, labels=("in-progress", "type:build"))], dsk=dsk)
+    assert only(out, "launch") == []
+    assert len(only(out, "park")) == 1
+
+
+# ---- review round 1 (#538): bounded holds, late answers, closes mid-consult, every in-flight lane ----
+
+def test_a_held_consult_is_bounded_and_then_falls_back_to_the_owner():
+    over = usage_ok()
+    over["five_hour_pct"] = 99.0
+    held = actions._consult_hold_reason(False, False)
+    rec = {"question": _Q, "reason": held, "since": NOW - consult_mod.TIMEOUT_SECONDS - 1}
+    out = decide(usage=over, dsk=_blocked({"state": "eligible", **_STAMP}, consult_held=rec))
+    assert only(out, "consult_start") == [] and only(out, "consult_held") == []
+    (q,) = only(out, "post_question")
+    assert q["consult"]["outcome"] == "fell_back"
+    assert q["consult"]["reason"] == consult_mod.HELD and "usage" in q["consult"]["detail"]
+    assert has_notify(out)
+
+
+def test_a_held_consult_inside_its_bound_keeps_waiting_quietly():
+    over = usage_ok()
+    over["five_hour_pct"] = 99.0
+    held = actions._consult_hold_reason(False, False)
+    rec = {"question": _Q, "reason": held, "since": NOW - 60}
+    out = decide(usage=over, dsk=_blocked({"state": "eligible", **_STAMP}, consult_held=rec))
+    assert [a for a in out if a.get("id") == "i7"] == []
+
+
+def test_a_hold_for_an_earlier_question_starts_a_fresh_clock():
+    over = usage_ok()
+    over["five_hour_pct"] = 99.0
+    held = actions._consult_hold_reason(False, False)
+    rec = {"question": "an older question", "reason": held, "since": NOW - 99_999}
+    out = decide(usage=over, dsk=_blocked({"state": "eligible", **_STAMP}, consult_held=rec))
+    assert only(out, "post_question") == []
+    assert len(only(out, "consult_held")) == 1
+
+
+def test_a_late_answer_after_the_question_reached_the_owner_is_ignored():
+    """The question comment landed (the owner has it) but its label move is retrying; a fork that
+    answers now must not relaunch the worker over the owner's head."""
+    out = decide(dsk=_consulting("OUTCOME: ANSWER\nANSWER:\nTake A.\nEND", question_posted=True))
+    assert only(out, "consult_answer") == []
+    assert len(only(out, "post_question")) == 1 and not has_notify(out)
+
+
+def test_the_owner_closing_an_issue_mid_consult_is_absorbed():
+    out = decide(dsk=_consulting(), gh_view=ghv(closed_nums={7}))
+    assert only(out, "absorb_close") == [{"act": "absorb_close", "id": "i7", "num": 7}]
+    assert only(out, "post_question") == [] and only(out, "consult_answer") == []
+
+
+# ---- review round 2 (#538) ----
+
+def test_a_hold_whose_reason_flips_is_still_bounded():
+    over = usage_ok()
+    over["five_hour_pct"] = 99.0                        # held now for usage...
+    rec = {"question": _Q, "reason": "an older hold reason",     # ...stored under another reason
+           "since": NOW - consult_mod.TIMEOUT_SECONDS - 1}
+    out = decide(usage=over, dsk=_blocked({"state": "eligible", **_STAMP}, consult_held=rec))
+    (q,) = only(out, "post_question")
+    assert q["consult"]["reason"] == consult_mod.HELD
+
+
+def test_a_hold_clock_in_the_future_is_re_stamped_never_read_as_expired():
+    over = usage_ok()
+    over["five_hour_pct"] = 99.0
+    held = actions._consult_hold_reason(False, False)
+    rec = {"question": _Q, "reason": held, "since": NOW + 5}
+    out = decide(usage=over, dsk=_blocked({"state": "eligible", **_STAMP}, consult_held=rec))
+    assert only(out, "post_question") == []
+    assert len(only(out, "consult_held")) == 1

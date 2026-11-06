@@ -105,6 +105,7 @@ import math
 
 import brief
 import config as _config
+import consult as consult_mod  # pure: the approver consult's outcome reader (issue #538)
 import events as events_mod
 import evidence
 import gate
@@ -321,6 +322,9 @@ FIX_ISSUE_LABELS = ["type:diagnose-and-fix", "agent-ready", gate.RESTORE_GREEN_L
 # done and only merge mechanics remain, so a lane frees the moment the report lands.
 # `blocked` is NOT here (#194): a worker asking a question stays `running` until the runner posts
 # the question and releases the lane to `awaiting_answer`, which holds no lane by design (#163).
+# `consulting` is NOT here either (#538): while a fork of the approving session considers a worker's
+# question, the worker has exited and nothing builds — a consult never takes a build lane from
+# queued work, and the consult session itself is not a lane at all.
 INFLIGHT_STATUSES = {"running", "frozen", "exited"}
 TERRITORY_CLAIM_STATUSES = INFLIGHT_STATUSES | {"gating", "holding"}
 TERMINAL_STATUSES = {"merged", "parked", "needs_william", "bounced"}
@@ -1128,7 +1132,9 @@ def _in_owner_handback_episode(ist, blocked_text):
     status = ist.get("status")
     if status == "merged":
         return False
-    if status in ("bounced", "parked", "needs_william", "awaiting_answer"):
+    # `consulting` (#538) counts for awaiting_answer's reason: the loop holds no lane on it, and an
+    # owner who closes the issue while its approving session considers the question has dropped it.
+    if status in ("bounced", "parked", "needs_william", "awaiting_answer", "consulting"):
         return True
     if isinstance(blocked_text, str) and blocked_text.lstrip().startswith("BOUNCED:"):
         return True
@@ -1142,6 +1148,32 @@ def _checks_pending_cap(config):
     ses = config.get("session") if isinstance(config, dict) and isinstance(config.get("session"), dict) else {}
     v = ses.get("checks_pending_cap")
     return v if type(v) is int and v >= 0 else CHECKS_PENDING_CAP_DEFAULT
+
+
+def _awaits_consult_relaunch(ist, labels):
+    """Is this issue's worker owed a relaunch on its approving session's ANSWER (#538)?
+
+    Owner ruling: on an ANSWER "nobody applies `agent-ready`". The approval the relaunch rides is
+    the one the loop already acted on — the runner's own `in-progress` stamp, which a consult never
+    removes — exactly the token `issues.eligible(resume=True)` accepts for every other restart of a
+    session this loop approved and launched (#150). So the stamp must still be there: an owner who
+    took it away (parked the issue mid-consult) has withdrawn that approval, and nothing relaunches
+    until his own `agent-ready` comes back."""
+    return (isinstance(ist, dict) and ist.get("consult_relaunch") is True
+            and _status_of(ist) == "ready"
+            and isinstance(labels, (list, tuple)) and "in-progress" in labels)
+
+
+def _consult_hold_reason(usage_ok, launches_held):
+    """Why an eligible consult is waiting rather than launching (#538) — the same two gates every
+    session start obeys, in the words the journal records once per reason."""
+    if not usage_ok:
+        return ("the usage meter is over a ceiling (or unreadable) — a consult counts toward the "
+                "usage ceilings like any session, so it waits")
+    if launches_held:
+        return ("session launches are held machine-wide (launch channel, account auth or a "
+                "sleeping display) — the consult waits with them")
+    return None
 
 
 def _counter(ist, key):
@@ -1888,6 +1920,14 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     acks = _dget(dsk, "acks", dict)                      # {id: raw ack text} — the worker's probe reply
     awaiting = _dget(dsk, "awaiting", dict)              # {id: marker} — worker flagged long background work
     exit_receipts = _dget(dsk, "exit_receipts", dict)    # {id: newest mail-consumption ts} (#148/#215)
+    # The approver consult (#538), all keyed by the WORKER's lane id. `consult_checks` is the
+    # runner's read of whether a blocked question can be consulted (the approver stamp, this
+    # machine, the transcript) — ABSENT means the runner did not look, which is the pre-#538
+    # question flow exactly. `consult_outcomes` is the fork's outcome file; `consult_exited` its
+    # exited marker.
+    consult_checks = _dget(dsk, "consult_checks", dict)
+    consult_outcomes = _dget(dsk, "consult_outcomes", dict)
+    consult_exited = _dget(dsk, "consult_exited", dict)
     frozen = dsk.get("frozen") if isinstance(dsk.get("frozen"), dict) else None
     alert_on_disk = dsk.get("alert") if isinstance(dsk.get("alert"), dict) else None
     # The ENGINE GENERATION this tick belongs to (issue #405) — a token the runner mints once per
@@ -2908,6 +2948,60 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                 out.append({"act": "answer_relaunch", "id": iid, "num": num})
             continue
 
+        # ---- consulting (#538): a fork of the approving session is considering the worker's
+        #      question. Like awaiting_answer it holds NO lane and no worker window, and nothing
+        #      here recovers or nudges it. Three things move it, all read from the fork's ONE
+        #      outcome file or its absence: an ANSWER relaunches the worker with nobody applying
+        #      `agent-ready`; an ESCALATE, and every way a consult can fail to decide, hands the
+        #      question to the owner exactly as before — with the fork's reasoning when it gave one,
+        #      and the reason journaled when it did not. `continue` keeps it exempt from every path
+        #      below, as awaiting_answer is. ----
+        if status == "consulting":
+            rec = ist.get("consult") if isinstance(ist.get("consult"), dict) else {}
+            question = ist.get("pending_question") if isinstance(ist.get("pending_question"),
+                                                                 str) else ""
+            to_owner = None
+            if ist.get("question_posted"):
+                # The question comment already LANDED — the owner has it — and only its label move
+                # is retrying. Nothing the fork writes now may relaunch the worker over his head
+                # (fresh review): the question is his, so this only retries the post, silently.
+                out.append({"act": "post_question", "id": iid, "num": num, "question": question,
+                            "consult": None})
+                continue
+            if rec.get("state") == "fallback":
+                to_owner = {"outcome": "fell_back", "reason": rec.get("reason"),
+                            "detail": rec.get("detail")}
+            else:
+                read, outcome = consult_mod.parse_outcome(consult_outcomes.get(iid))
+                started = rec.get("started_at")
+                if read == consult_mod.READ and outcome.kind == consult_mod.ANSWER:
+                    out.append({"act": "consult_answer", "id": iid, "num": num,
+                                "answer": outcome.answer, "reasoning": outcome.reasoning})
+                    continue
+                if read == consult_mod.READ:
+                    to_owner = {"outcome": "escalated", "reasoning": outcome.reasoning,
+                                "recommendation": outcome.recommendation,
+                                "session": rec.get("session")}
+                elif read == consult_mod.UNREADABLE:
+                    to_owner = {"outcome": "fell_back", "reason": consult_mod.MALFORMED}
+                elif iid in consult_exited:
+                    # An exited fork with no finished outcome will never finish one.
+                    to_owner = {"outcome": "fell_back", "reason": consult_mod.FORK_EXITED}
+                elif not _since_ok(started, now) or now - started >= consult_mod.TIMEOUT_SECONDS:
+                    # An unreadable clock reads as expired: the wait is BOUNDED, so corruption walks
+                    # to the owner, never to an unbounded wait (the exit interview's discipline).
+                    to_owner = {"outcome": "fell_back", "reason": consult_mod.TIMEOUT}
+                else:
+                    continue                           # still considering, inside the bound
+            # Notify-once, exactly the question's own rule: gated on the post-once stamp, and held
+            # to the morning report inside a configured quiet-hours window (#164).
+            if not ist.get("question_posted") and not notify_quiet:
+                notify(_notify.WAITING, f"{iid} needs an answer", QUESTION_ASK, "question",
+                       num=num)
+            out.append({"act": "post_question", "id": iid, "num": num, "question": question,
+                        "consult": to_owner})
+            continue
+
         # ---- recheck failure: an owner decision, checked before any gate re-run ----
         if ist.get("recheck_failed"):
             park(iid, num, "ship_recheck_cmd failed after the mechanical merge-update — "
@@ -3402,6 +3496,39 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                                f"round-trip. latest question: {blocked_text!r}",
                      needs_william=True, cause="question_cap")
             else:
+                # (#538) The approving session is asked FIRST, when the runner found it can be: the
+                # issue carries an approver stamp naming this machine, and its transcript is here.
+                # Nothing is posted and nobody is paged yet — the owner hears about this question
+                # only if the consult escalates it or cannot decide. A question whose comment
+                # already landed (a label move retrying) never starts one: it is the owner's now.
+                check = consult_checks.get(iid)
+                check = check if isinstance(check, dict) and not ist.get("question_posted") else None
+                if check is not None and check.get("state") == "eligible":
+                    held = _consult_hold_reason(scheduler.usage_ok(usage_sched), launches_held)
+                    stamp = {k: check.get(k) for k in ("session", "host", "cwd")}
+                    hold = ist.get("consult_held") if isinstance(ist.get("consult_held"),
+                                                                 dict) else {}
+                    this_q = hold.get("question") == blocked_text
+                    since = hold.get("since")
+                    if held is None:
+                        out.append({"act": "consult_start", "id": iid, "num": num,
+                                    "question": blocked_text, "stamp": stamp})
+                        continue
+                    expired = (this_q and _since_ok(since, now)
+                               and now - since >= consult_mod.TIMEOUT_SECONDS)
+                    if not expired:
+                        if not this_q or hold.get("reason") != held or not _since_ok(since, now):
+                            # Journaled ONCE per reason; the executor keeps the hold's clock from
+                            # the FIRST hold of this question, so a reason that changes never
+                            # resets it — and re-stamps a clock it cannot read (a future one, after
+                            # a backward clock step on wake) rather than reading it as expired.
+                            out.append({"act": "consult_held", "id": iid, "num": num,
+                                        "reason": held, "question": blocked_text, "stamp": stamp})
+                        continue                           # held, inside its bound
+                    # Held past the consult's own bound — checked BEFORE the reason, so a reason that
+                    # flips every tick can never keep the bound from firing: the hold must never keep
+                    # the question from everyone. It goes to the owner, saying why.
+                    check = {"state": "fallback", "reason": consult_mod.HELD, "detail": held}
                 # Night-batching (#164, opt-in since #492): a durable owner question is an owner
                 # DECISION — held to the morning report inside a configured quiet-hours window.
                 # post_question still fires, so the question is posted DURABLY as a GitHub comment
@@ -3410,7 +3537,14 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                 if not ist.get("question_posted") and not notify_quiet:
                     notify(_notify.WAITING, f"{iid} needs an answer", QUESTION_ASK, "question",
                            num=num)
-                out.append({"act": "post_question", "id": iid, "num": num, "question": blocked_text})
+                act = {"act": "post_question", "id": iid, "num": num, "question": blocked_text}
+                if check is not None:
+                    # The runner looked and found no consult possible: the question goes to the
+                    # owner exactly as today, and the REASON rides the act into the journal.
+                    act["consult"] = {"outcome": "fell_back",
+                                      "reason": check.get("reason") or consult_mod.NO_STAMP,
+                                      "detail": check.get("detail")}
+                out.append(act)
             continue
 
         # ---- liveness recovery: exited beats frozen beats idle ----
@@ -3662,8 +3796,14 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                             "add": ["in-progress"], "remove": ["agent-ready"]})
             continue
         # status is None/"ready" from here on
+        # (#538) An answered consult's relaunch is a LAUNCH like any other — phase E below admits
+        # it on the runner's own `in-progress` stamp — so it is held to the same launch-failure cap
+        # (parked with the same evidence-named memo), and kept OUT of the orphan sweep under it,
+        # which would otherwise read "in-progress, no live worker" as a restart to adopt or reclaim.
+        consult_relaunch = _awaits_consult_relaunch(ist, labels)
         launch_fails, corrupt = _counter(ist, "launch_failures")
-        if "agent-ready" in labels and (corrupt or launch_fails >= LAUNCH_FAILURE_CAP):
+        if ("agent-ready" in labels or consult_relaunch) \
+                and (corrupt or launch_fails >= LAUNCH_FAILURE_CAP):
             if launches_held:
                 continue                               # SYSTEMIC launch fault (#24) / dead auth (#159)
                                                        # / a sleeping display (#124): hold, never park
@@ -3701,6 +3841,8 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                 park(iid, num, evidence.park_memo(launch_ev, attempts=LAUNCH_FAILURE_CAP),
                      cause="launch_delivery")
             continue
+        if consult_relaunch:
+            continue                                   # phase E launches it, lane-bound like any
         if "in-progress" in labels and iid not in live_locks and not gh_stale and iid in prs:
             pv = prs.get(iid) if isinstance(prs.get(iid), dict) else {}
             branch = pv.get("headRefName")
@@ -3796,7 +3938,12 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
             ist = ist_of(iid)
             launch_fails, corrupt = _counter(ist, "launch_failures")
             at_cap = corrupt or launch_fails >= LAUNCH_FAILURE_CAP
-            if ("agent-ready" not in labels or "in-progress" in labels
+            # (#538) An answered consult's worker is admitted on the runner's own `in-progress`
+            # stamp instead of a fresh `agent-ready` (see _awaits_consult_relaunch); everything
+            # else below — lanes, usage, blocked-by, affinity — binds it exactly as any launch.
+            approved = (("agent-ready" in labels and "in-progress" not in labels)
+                        or _awaits_consult_relaunch(ist, labels))
+            if (not approved
                     or iid in parked_now
                     or iid in reapproved_now   # just re-released: launch next tick, reset counters
                     or iid in resumed_now      # just re-claimed for the gate (#161): never rebuild it
@@ -3805,6 +3952,14 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                 continue
             rows.append((iid, p, ist))
         return rows
+
+    def _candidate(p, ist):
+        """The scheduler's view of one eligible row. `resume` asks `launch_ok` to accept the
+        runner's own `in-progress` stamp as the approval — for an answered consult only (#538)."""
+        c = dict(p, requeue_front=bool(ist.get("requeue_front")))
+        if _awaits_consult_relaunch(ist, p.get("labels")):
+            c["resume"] = True
+        return c
 
     def _unsampled(rows):
         """The rows for lanes this episode's environment streak has NOT already tried (issue #320),
@@ -3883,7 +4038,7 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                      needs_william=True, cause="touches_missing")
                 continue                 # the park already SAYS this one, with a memo and a notify
             _queue_invalid(iid, p, ist)
-            candidates.append(dict(p, requeue_front=bool(ist.get("requeue_front"))))
+            candidates.append(_candidate(p, ist))
         claims = territory_claims_from(issues_state)
         selected_ids = set()
         for sel in scheduler.launchable(candidates, lanes_in, cfg, usage_sched,
@@ -4038,7 +4193,7 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
             claims = territory_claims_from(issues_state)
 
             def _probe_from(subset):
-                candidates = [dict(p, requeue_front=bool(ist.get("requeue_front")))
+                candidates = [_candidate(p, ist)
                               for iid, p, ist in subset
                               if not _needs_touches(p)]   # a touches-missing issue is never the probe
                 return scheduler.launchable(candidates, lanes_in, cfg, usage_sched,

@@ -21,6 +21,7 @@ import json
 import os
 import re
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -32,7 +33,10 @@ for _p in (os.path.join(_HERE, "..", "lib"),):
         sys.path.insert(0, _p)
 
 import actions
+import approval
 import brief
+import consult as consult_mod
+import delivery
 import events as events_mod
 from events import WAKE_GAP_SECONDS, WAKE_GRACE_SECONDS
 import evidence
@@ -162,7 +166,11 @@ SPAWNER_OPERATOR = "operator"
 # This runner's own launch outcomes. `recover` only at the `exited` tier — the only tier that
 # relaunches; it reads "ok" for a delivered NUDGE too, and an i336 lane whose auth died in-process
 # answers nudges all day while starting nothing.
-RUNNER_LAUNCH_ACTS = ("launch", "resolve_conflict")
+# `consult_start` (#538) runs the same launcher for a `c<N>` fork of an issue's approving session: a
+# verified consult is a session this machine demonstrably started, and a consult refused for a dead
+# credential is the same machine evidence a worker's refusal is. Its record names the WORKER's lane
+# id, which is the issue the consult was about.
+RUNNER_LAUNCH_ACTS = ("launch", "resolve_conflict", "consult_start")
 RUNNER_RELAUNCH_ACT = "recover"
 RUNNER_RELAUNCH_TIERS = ("exited",)
 RUNNER_DELIVERY_OK = "ok"
@@ -813,6 +821,12 @@ class Runner:
         # path is byte-identical to `time.localtime(now)`), so this seam is inert off the test bench.
         if local_clock is not None:
             self._local_clock = local_clock
+        # The approver consult's two machine facts (#538), injectable like `_anchor_status`: which
+        # machine this is (the approver stamp records a host, and consults are same-machine only),
+        # and whether a session's transcript is here to fork. `delivery` owns the transcript layout
+        # (the agent-boundary rule), so the runner asks it rather than knowing the path.
+        self._hostname = socket.gethostname
+        self._transcript_exists = lambda sid: delivery.transcript_exists(sid, agent=self.agent)
         self.stop = False
         self._owns_lock = False
         # True once this process ADOPTED the singleton across a Restart re-exec (issue #116) — the
@@ -2131,6 +2145,12 @@ class Runner:
             "acks": self._scan_dir("state", "ack"),      # {id: raw ack text} — the worker's probe reply
             "awaiting": self._scan_dir("state", "awaiting"),   # {id: marker} — long background work flagged
             "exit_receipts": self._exit_receipts(),      # {id: newest mail-consumption ts} (#148/#215)
+            # The approver consult (#538), keyed by the WORKER's lane id: can each fresh question be
+            # consulted (one stamp read per question, only while it is unrouted), and the fork's
+            # outcome file and exited marker, read by EXACT name.
+            "consult_checks": self._consult_checks(st),
+            "consult_outcomes": self._consult_files(".md", "reports"),
+            "consult_exited": self._consult_files("", "state", "exited"),
             "frozen": frozen,
             "alert": alert,
             # This process's engine generation (#405) — joins each standing hold's journaling dedup
@@ -2145,6 +2165,87 @@ class Runner:
             "local_hhmm": time.strftime("%H:%M", lt),
             "last_report_date": (_read(os.path.join(self.state, "last_morning_report")) or "").strip() or None,
         }
+
+    def _consult_files(self, suffix, *dirs):
+        """{i<N>: text} for every file named exactly `c<N><suffix>` under `dirs`. EXACT names only:
+        `_scan_dir` keys a file by everything before its first dot, so `c5.md.tmp` — the fork
+        writing its outcome atomically — would otherwise read as the outcome itself, half-written."""
+        d = os.path.join(self.home, *dirs)
+        out = {}
+        try:
+            names = os.listdir(d)
+        except OSError:
+            return out
+        for n in names:
+            stem = n[:len(n) - len(suffix)] if suffix and n.endswith(suffix) else (
+                n if not suffix else "")
+            iid = consult_mod.issue_id_of(stem)
+            if iid is None:
+                continue
+            txt = _read(os.path.join(d, n))
+            if txt is not None:
+                out[iid] = txt
+        return out
+
+    def _consult_checks(self, st):
+        """{i<N>: check} — can each worker's FRESH question go to its approving session first?
+        (issue #538). The I/O half of the routing decide does on it: the approver stamp (#537,
+        `approval.read`), this machine, the transcript. Read only for a question still unrouted —
+        a real question (not a bounce), from a running lane, not yet posted, with no consult already
+        under way for it — so the cost is one comment read per question, never one per tick.
+
+        The answers, each the runner's own reading and never a guess:
+          {"state": "eligible", "session", "host", "cwd"}
+          {"state": "fallback", "reason": <consult reason>, "detail": <str>}
+        A REFUSED read is STAMP_UNREAD, never NO_STAMP (the #21 refused-is-not-empty rule): the
+        question goes to the owner as it always did, saying why. Never raises: a check that cannot
+        be made is simply absent, which decide reads as today's question flow."""
+        out = {}
+        issues = st.get("issues") if isinstance(st, dict) else None
+        if not isinstance(issues, dict):
+            return out
+        blocked = self._scan_dir("state", "blocked")
+        for iid, text in blocked.items():
+            ist = issues.get(iid)
+            num = actions._iid_num(iid)
+            # Every IN-FLIGHT status, not `running` alone (fresh review): a worker that wrote its
+            # question and then froze or exited still asked it, and decide routes it identically.
+            if (num is None or not isinstance(ist, dict) or not isinstance(text, str)
+                    or text.lstrip().startswith("BOUNCED:")
+                    or ist.get("status") not in actions.INFLIGHT_STATUSES
+                    or ist.get("question_posted")):
+                continue
+            hold = ist.get("consult_held")
+            if (isinstance(hold, dict) and hold.get("question") == text
+                    and isinstance(hold.get("stamp"), dict)):
+                # A consult HELD on usage or a launch hold was already found eligible for this very
+                # question; re-reading the thread every tick of the hold would cost a GitHub read
+                # per tick for nothing. The bound on the hold lives in decide.
+                out[iid] = {"state": "eligible", **{k: hold["stamp"].get(k)
+                                                    for k in ("session", "host", "cwd")}}
+                continue
+            try:
+                out[iid] = self._consult_check(num)
+            except Exception as e:                     # a check that cannot be made is no check
+                self._log(f"consult check for {iid} skipped: {_short_repr(e)}")
+        return out
+
+    def _consult_check(self, num):
+        read = approval.read(num, self.config)
+        if not read.ok:
+            return {"state": "fallback", "reason": consult_mod.STAMP_UNREAD,
+                    "detail": "GitHub refused the comment read"}
+        stamp = read.stamp
+        if stamp is None:
+            return {"state": "fallback", "reason": consult_mod.NO_STAMP, "detail": ""}
+        if not consult_mod.same_machine(stamp.host, self._hostname()):
+            return {"state": "fallback", "reason": consult_mod.OTHER_MACHINE,
+                    "detail": "stamped on %s" % stamp.host}
+        if not self._transcript_exists(stamp.session):
+            return {"state": "fallback", "reason": consult_mod.NO_TRANSCRIPT,
+                    "detail": "session %s" % stamp.session}
+        return {"state": "eligible", "session": stamp.session, "host": stamp.host,
+                "cwd": stamp.cwd}
 
     def _exit_receipts(self):
         """{issue id: newest mail-consumption ts} from state/mail/<id>.consumed.<ts>[.n] — the
@@ -2721,6 +2822,11 @@ class Runner:
                 # of that one conversation. A revive is always someone's explicit act, never
                 # something a launch inherits from the shell the runner happens to live in.
                 "SL_RESUME_SESSION_ID": "",
+                # PINNED EMPTY for the same reason one class over (#538, #536's recommendation): the
+                # consult's fork knobs. Only `_exec_consult_start` names them, for a `c<N>`; an
+                # ambient export must never turn a worker launch into a fork of someone's session.
+                "SL_FORK_PARENT": "",
+                "SL_CONSULT_HOME": "",
                 # PINNED EMPTY for the same inheritance reason (#299), and it matters because this
                 # env is merged over os.environ: the launcher NAMES SL_EXPECT_GH_LOGIN in every
                 # worker command, so a runner started from inside a worker or debugger pane would
@@ -3662,8 +3768,9 @@ class Runner:
             # launch_evidence clears with it (#152) for the same reason and the #40 staleness lesson
             # (review P1-1): a fixed anchor must not leave last week's cause behind to name the wrong
             # component in a later, unrelated park.
+            # `consult_relaunch` (#538) ends here: the answered consult's worker is delivered.
             self._update_issue(iid, {"status": "running", "launch_error": None,
-                                     "launch_evidence": None},
+                                     "launch_evidence": None, "consult_relaunch": False},
                                fn=lambda st, i: self._reset_progress_clock(i))   # fresh #157 episode
             self._delivery_cleared()                   # a verified delivery proves the anchor is live
             return "ok"                                # (a verified canary IS a real launch: the issue
@@ -3703,16 +3810,22 @@ class Runner:
         import config as config_lib
         return config_lib.operator(self.config)
 
-    def _render_question(self, question):
+    def _render_question(self, question, consult_note=None):
         """The durable question comment (#163): the machine marker FIRST (so brief.build skips it as
         the runner's own marker, never a binding owner amendment), then the worker's verbatim
-        question, then how to answer. Signs the owner's own name (config.operator, #58)."""
+        question, then how to answer. Signs the owner's own name (config.operator, #58).
+
+        `consult_note` (#538) is what an ESCALATE adds: the approving session's reasoning for why
+        this is the owner's call, and its recommendation. Without one the comment is byte-identical
+        to the pre-#538 question — which is what "exactly as today" means for every fallback."""
         op = self._operator()
+        note = f"{consult_note}\n\n" if isinstance(consult_note, str) and consult_note.strip() else ""
         return (f"{QUESTION_MARKER}\n"
                 f"**A superlooper worker paused this issue to ask {op} a decision, then exited "
                 "cleanly** — its work-in-progress branch is pushed and its lane is released, so "
                 "nothing sits frozen waiting on an answer.\n\n"
                 f"{question}\n\n"
+                f"{note}"
                 f"_{op}: answer from the dashboard's Questions list, or reply here and re-apply "
                 "`agent-ready` — a fresh session then resumes this issue with your answer in its "
                 "brief, reusing the pushed branch if it still applies cleanly._")
@@ -3730,12 +3843,31 @@ class Runner:
         pane. The worktree is PRESERVED (remove_worktree=False, the no-stall D4 close) so the relaunch
         reuses the WIP; the worker has also pushed it to origin, so no live window is the only copy."""
         iid, num, question = a["id"], a.get("num"), a.get("question", "")
+        # (#538) When the approving session was consulted first — or could not be — the act says
+        # how that ended: `escalated` carries the fork's reasoning and recommendation into the
+        # comment; `fell_back` leaves the comment exactly as today and journals the reason.
+        info = a.get("consult") if isinstance(a.get("consult"), dict) else None
+        note = None
+        if info is not None and info.get("outcome") == "escalated":
+            note = consult_mod.escalation_note(
+                consult_mod.Outcome(consult_mod.ESCALATE, "", info.get("reasoning") or "",
+                                    info.get("recommendation") or ""),
+                info.get("session") or "unknown", self._operator())
         # 1. post the durable question ONCE. Stamp AFTER it lands so a failed post retries next tick;
         #    a re-derived tick (the label move retrying) skips the post and never double-comments.
         if not self._issue_field(iid, "question_posted"):
-            if not gh.comment(num, self._render_question(question)):
+            if not gh.comment(num, self._render_question(question, note)):
                 return "question comment failed (will retry next tick)"
             self._update_issue(iid, {"question_posted": True})
+            if info is not None:
+                # Once, at the moment the owner actually has the question: the morning report's
+                # consult section reads this record (#538), and a label retry must not double it.
+                self._journal_consult(iid, num, info, now)
+        # (#538) The moment the owner holds the question, the consult is over — ended HERE, before
+        # the label move that may yet fail, so a fork still alive cannot answer over his head.
+        rec = self._issue_field(iid, "consult")
+        if isinstance(rec, dict) and consult_mod.is_consult_id(rec.get("id")):
+            self._end_consult(rec["id"])
         # 2. the issue is now waiting on the owner, not building.
         if not gh.set_labels(num, add=["awaiting-answer"], remove=["in-progress"]):
             return "label move failed (will retry silently next tick)"
@@ -3745,6 +3877,9 @@ class Runner:
         # 4. settle terminal-for-now: awaiting_answer, bump the 2-capped question counter, reset the
         #    post-once stamp for the NEXT question, and consume the blocked/exited markers LAST.
         def settle(st, i):
+            if isinstance(i.get("consult"), dict) and info is not None:
+                i["consult"] = dict(i["consult"], state=info.get("outcome"))
+            i["consult_held"] = None                   # a hold's clock and stamp end with it
             i["status"] = "awaiting_answer"
             i["pending_question"] = question
             # The question's post time (ISO-8601 UTC), so answer ingestion only trusts an answer
@@ -3794,6 +3929,220 @@ class Runner:
         ok = gh.set_labels(num, add=["agent-ready"], remove=["awaiting-answer"])
         self._forget_cached_label(iid, "awaiting-answer")
         return "ok" if ok else "answer recorded; label move will retry (orphan sweep reconciles)"
+
+    # --- the approver consult (#538) ---
+
+    def _journal_consult(self, iid, num, info, now):
+        """The one record of how a consult ended — answered, escalated or fell back — that the
+        morning report and the next consult's history read. `outcome: ok` because it is written
+        only once the owner (or the worker) actually has the result."""
+        rec = {"act": "consult_outcome", "id": iid, "num": num, "outcome": "ok",
+               "outcome_kind": info.get("outcome")}
+        for k in ("reason", "detail", "reasoning", "recommendation", "answer", "session"):
+            v = info.get(k)
+            if isinstance(v, str) and v:
+                rec[k] = v[:600]
+        if rec["outcome_kind"] == "fell_back":
+            rec["sentence"] = consult_mod.fallback_sentence(info.get("reason"), info.get("detail"))
+        try:
+            journal.append(self.home, rec, now)
+        except (OSError, ValueError) as e:
+            self._log(f"consult outcome not journaled for {iid}: {_short_repr(e)}")
+
+    def _end_consult(self, cid):
+        """End a consult's session and consume its run-state: the outcome file has been acted on,
+        and an `exited` marker must not read as the NEXT consult's death. Best-effort, like every
+        close: a session already gone is a no-op."""
+        self._teardown_session(cid, remove_worktree=False)
+        _rm(os.path.join(self.home, "reports", f"{cid}.md"))
+        _rm(os.path.join(self.state, "exited", cid))
+
+    def _consult_env(self, stamp):
+        """The launch env for a consult: a worker's, plus the fork's two knobs. The fork runs on
+        the worker model — #536 measured that a fork's new turns take the LAUNCH's --model, and the
+        approver's context can be large, so it keeps the worker default's 1M window."""
+        models = self.config.get("models") if isinstance(self.config.get("models"), dict) else {}
+        env = self._script_env(self._worker_model(), models.get("worker_effort") or "")
+        env["SL_FORK_PARENT"] = str(stamp.get("session") or "")
+        env["SL_CONSULT_HOME"] = str(stamp.get("cwd") or "")
+        return env
+
+    def _consult_branch_state(self, iid):
+        branch = self._issue_field(iid, "branch")
+        branch = branch if isinstance(branch, str) and branch.strip() else ""
+        lines = ["- branch: `%s`" % branch if branch else "- branch: none recorded"]
+        head = self._lane_head(iid)
+        lines.append("- the lane's worktree HEAD: `%s`" % head if head
+                     else "- the lane's worktree HEAD: unreadable (no worktree on this machine)")
+        if branch:
+            lines.append("- the worker pushed its work in progress before it asked: read it at "
+                         "`origin/%s`" % branch)
+            pr = gh.pr_for_branch(branch)
+            if not getattr(pr, "ok", False):
+                lines.append("- pull request: GitHub could not be read just now — check it yourself")
+            elif pr.pr:
+                lines.append("- pull request: #%s, %s, head `%s`"
+                             % (pr.pr.get("number"), pr.pr.get("state"), pr.pr.get("headRefOid")))
+            else:
+                lines.append("- pull request: none opened yet")
+        return lines
+
+    def _consult_packet(self, iid, num, cid, question, stamp):
+        """The consult's brief (`consult.render_packet`): the issue as approved with its thread, the
+        question, the branch and PR now, and every earlier handback (#538 DoD)."""
+        template = _read(os.path.join(_TEMPLATES, "consult-brief.md"))
+        if not template:
+            raise ValueError("the consult-brief.md template is missing from the engine")
+        raw = self._raw_by_id.get(iid) or {}
+        title = raw.get("title") or (self._parsed_by_id.get(iid) or {}).get("title") or ""
+        body = raw.get("body")
+        if not isinstance(body, str):
+            view = gh.issue(num) or {}
+            body = view.get("body") if isinstance(view.get("body"), str) else ""
+            title = title or view.get("title") or ""
+        operator = self._operator()
+        qa = self._issue_field(iid, "qa_log")
+        thread = gh.issue_comments(num)
+        return consult_mod.render_packet(
+            template, cid=cid, num=num, title=title, body=body, question=question,
+            comments=thread.comments, comments_ok=bool(getattr(thread, "ok", False)),
+            owner=brief.owner_login(self.config),
+            operator=operator, repo_slug=self.config.get("repo"),
+            dev_branch=str(self.config.get("dev_branch") or "main"),
+            branch_state=self._consult_branch_state(iid),
+            history=consult_mod.history_lines(journal.read_all(self.home), num),
+            qa=consult_mod.qa_lines(qa, operator),
+            outcome_path=os.path.join(self.home, "reports", f"{cid}.md"),
+            home=str(stamp.get("cwd") or ""), approver_session=str(stamp.get("session") or ""))
+
+    def _exec_consult_start(self, a, now):
+        """#538: the worker exited cleanly on a question and its approving session can be asked
+        first. Close the worker's window (keeping its WIP, exactly as post_question does), write the
+        packet, and launch a FORK of the approving session (`c<N>`) in that session's own directory.
+
+        Whatever happens, the issue SETTLES to `consulting` in this one call — launched (`running`)
+        or not (`fallback`, with the reason) — and the blocked marker is consumed LAST. That is what
+        keeps a consult from re-launching every tick: decide moves a `consulting` issue only from
+        its outcome file, its exit, its bound, or the fallback recorded here. The lane is free from
+        this moment; nothing is posted and no label moves until the consult decides."""
+        iid, num, question = a["id"], a.get("num"), a.get("question", "")
+        stamp = a.get("stamp") if isinstance(a.get("stamp"), dict) else {}
+        cid = consult_mod.consult_id(num)
+        if cid is None:
+            return "skipped: no issue number to name a consult by"
+        self._teardown_session(iid, remove_worktree=False)
+        # ...and any fork of this SAME id that outlived an earlier question's consult (a crash
+        # between its settle and its end): its singleton lock would otherwise keep the new one from
+        # ever being delivered — the D4 relaunch close, one session class over.
+        self._end_consult(cid)
+        rec = {"id": cid, "session": stamp.get("session"), "host": stamp.get("host"),
+               "cwd": stamp.get("cwd"), "question": question, "started_at": now}
+        result, failure = "ok", None
+        try:
+            text = self._consult_packet(iid, num, cid, question, stamp)
+            os.makedirs(os.path.join(self.home, "briefs"), exist_ok=True)
+            with open(os.path.join(self.home, "briefs", f"{cid}.md"), "w") as f:
+                f.write(text)
+        except Exception as e:                         # any packet failure is a launch that failed
+            failure = "the consult's brief could not be written: %s" % _short_repr(e)
+            result = f"consult not launched — {failure}"
+        else:
+            rc = self._run_script([self._script(LAUNCHER), "--consult", cid],
+                                  env=self._consult_env(stamp), timeout=LAUNCH_TIMEOUT)
+            if rc != 0:
+                ev = self._evidence("launch", rc)
+                failure = f"launch rc={rc} ({ev['reason']})"
+                result = self._failed("launch", rc, f"consult launch rc={rc} — the question "
+                                                     f"falls back to {self._operator()}", ev=ev)
+                self._teardown_session(cid, remove_worktree=False)
+        if failure is None:
+            rec["state"] = "running"
+        else:
+            rec.update(state="fallback", reason=consult_mod.LAUNCH_FAILED, detail=failure)
+
+        def settle(st, i):
+            i["status"] = "consulting"
+            i["pending_question"] = question
+            i["consult"] = rec
+            i["consult_held"] = None
+            i["consult_answer_posted"] = False
+        self._update_issue(iid, fn=settle)
+        _rm(os.path.join(self.state, "blocked", iid))
+        _rm(os.path.join(self.state, "exited", iid))   # a stray turn-end stamp must not recover-launch
+        return result
+
+    def _exec_consult_held(self, a, now):
+        """#538: an eligible consult is waiting on the usage ceilings or a machine-wide launch hold,
+        like any session start. Journaled ONCE per reason (the act record is the journal line).
+
+        The record keeps the hold's clock from the FIRST hold of this question — a reason that
+        changes mid-hold never restarts it — because decide bounds the hold by it and then hands
+        the question to the owner. The stamp rides along so the view need not re-read the thread
+        on every tick of the hold."""
+        question = a.get("question")
+
+        def settle(st, i):
+            prev = i.get("consult_held") if isinstance(i.get("consult_held"), dict) else {}
+            since = prev.get("since") if prev.get("question") == question else None
+            i["consult_held"] = {"question": question, "reason": a.get("reason"),
+                                 "since": since if actions._since_ok(since, now) else now,
+                                 "stamp": a.get("stamp") if isinstance(a.get("stamp"), dict)
+                                 else None}
+        self._update_issue(a["id"], fn=settle)
+        return "ok"
+
+    def _exec_consult_answer(self, a, now):
+        """#538: the approving session ANSWERED. Post the answer, marked as that session's and never
+        the owner's; record it in the Q&A trail the relaunch brief embeds; and re-release the issue
+        so phase E relaunches the worker on the runner's own `in-progress` stamp — nobody applies
+        `agent-ready`. The answer counts toward the two-question cap like any other.
+
+        Idempotent like post_question: the comment posts ONCE (`consult_answer_posted`), and the
+        outcome file is consumed only AFTER the settle, so a failed post retries next tick and a
+        crash mid-way leaves the answer on disk to be acted on again, never lost."""
+        iid, num = a["id"], a.get("num")
+        rec = self._issue_field(iid, "consult")
+        rec = rec if isinstance(rec, dict) else {}
+        question = self._issue_field(iid, "pending_question") or rec.get("question") or ""
+        answer = a.get("answer") if isinstance(a.get("answer"), str) else ""
+        if not answer.strip():
+            return "skipped: an answer with no text is not an answer"
+        outcome = consult_mod.Outcome(consult_mod.ANSWER, answer, a.get("reasoning") or "", "")
+        session = rec.get("session") or "unknown"
+        if not self._issue_field(iid, "consult_answer_posted"):
+            if not gh.comment(num, consult_mod.answer_comment(question, outcome, session,
+                                                              self._operator())):
+                return "answer comment failed (will retry next tick)"
+            self._update_issue(iid, {"consult_answer_posted": True})
+        cid = rec.get("id") if consult_mod.is_consult_id(rec.get("id")) else consult_mod.consult_id(num)
+
+        def settle(st, i):
+            log = i.get("qa_log")
+            log = log if isinstance(log, list) else []
+            log.append({"question": question, "answer": answer, "by": "consult",
+                        "session": rec.get("session")})
+            i["qa_log"] = log
+            prev = i.get("questions_asked")
+            i["questions_asked"] = (prev if type(prev) is int else 0) + 1
+            i["pending_question"] = None
+            i["status"] = "ready"
+            i["requeue_front"] = True
+            i["consult_relaunch"] = True
+            i["consult_answer_posted"] = False
+            i["question_posted"] = False               # the NEXT question posts fresh
+            i["consult"] = dict(rec, state="answered")
+        self._update_issue(iid, fn=settle)
+        _rm(os.path.join(self.state, "blocked", iid))
+        _rm(os.path.join(self.state, "exited", iid))
+        self._journal_consult(iid, num, {"outcome": "answered", "answer": answer,
+                                         "reasoning": outcome.reasoning,
+                                         "session": rec.get("session")}, now)
+        # LAST, after the settle and the journal: consuming the outcome file before them would let
+        # a crash in between leave a `consulting` issue with no outcome, whose timeout then pages
+        # the owner for a question already answered — or drop the answer from the morning report.
+        if cid:
+            self._end_consult(cid)
+        return "ok"
 
     # --- bounce / park / labels ---
 
@@ -3850,6 +4199,11 @@ class Runner:
         iid = a["id"]
         _rm(os.path.join(self.state, "blocked", iid))
         _rm(os.path.join(self.state, "awaiting", iid))
+        # A close mid-consult (#538) ends the consult with it: the owner dropped the issue, so its
+        # approving session has nothing left to answer.
+        rec = self._issue_field(iid, "consult")
+        if isinstance(rec, dict) and consult_mod.is_consult_id(rec.get("id")):
+            self._end_consult(rec["id"])
         def settle(st, i):
             i.update({"status": "merged", "park_notify_cause": None, "park_notify_at": None,
                       "park_landed_cause": None,       # the pair (#169)

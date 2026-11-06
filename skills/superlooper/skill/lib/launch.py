@@ -12,6 +12,9 @@ runner               worker ``i<N>``             an approved issue (launch/recov
 runner               triage flight ``t<N>``      at most once a day, and only when some open
                                                  issue's body changed since the last verdicts
                                                  (``lib/triage.py``, issue #448)
+runner               consult ``c<N>``            a worker's question on issue N, when its
+                                                 approving session is on this machine (a fork of
+                                                 that session — ``lib/consult.py``, issue #538)
 watchdog             sl-debugger ``d<N>``        unattended fault, no owner present
 dashboard Fixer      sl-debugger ``d<N>``        the owner taps Debug (via ``superlooper debug``)
 ``superlooper resume``  either, revived          an operator re-enters an interrupted flight
@@ -89,6 +92,12 @@ import triage
 WORKER_RE = re.compile(r"^i[0-9]+$")
 DEBUGGER_RE = re.compile(r"^d[0-9]+$")
 TRIAGE_RE = re.compile(r"^t[0-9]+$")
+# The consult (#538): a fork of the session that approved issue N. `consult.ID_RE` spells the same
+# shape and `tests/test_consult.py` pins the two (and the PreToolUse role) together.
+CONSULT_RE = re.compile(r"^c[0-9]+$")
+# The session a consult forks: an id-shaped token, the same shape the approver stamp accepts
+# (`approval._SESSION_SHAPE`) — it becomes argv in the pane, so anything else is refused.
+_FORK_PARENT_RE = re.compile(r"[0-9A-Za-z][0-9A-Za-z-]{7,63}")
 
 # The session classes, as a caller DECLARES one (``Spec.mode``). Spelled out rather than inferred,
 # because a third class is exactly where "``cwd`` selects the mode and nothing else does" stops
@@ -97,9 +106,10 @@ TRIAGE_RE = re.compile(r"^t[0-9]+$")
 WORKER = "worker"
 DEBUGGER = "debugger"
 TRIAGE = "triage"
-MODES = (WORKER, DEBUGGER, TRIAGE)
+CONSULT = "consult"
+MODES = (WORKER, DEBUGGER, TRIAGE, CONSULT)
 
-_MODE_GUARDS = {WORKER: WORKER_RE, DEBUGGER: DEBUGGER_RE, TRIAGE: TRIAGE_RE}
+_MODE_GUARDS = {WORKER: WORKER_RE, DEBUGGER: DEBUGGER_RE, TRIAGE: TRIAGE_RE, CONSULT: CONSULT_RE}
 # One refusal sentence per mode. The first two are VERBATIM — ``evidence.py`` classifies launcher
 # stderr on phrases, and tests/test_launch_delivery drives them through the real CLI.
 #
@@ -112,6 +122,7 @@ _MODE_REFUSALS = {
     WORKER: "[%s] worker mode expects an issue id (i<N>) — refusing",
     DEBUGGER: "[%s] --cwd mode is for debugger (d<N>) ids only — refusing",
     TRIAGE: "[%s] triage mode expects a triage id (t<N>) — refusing",
+    CONSULT: "[%s] consult mode expects a consult id (c<N>) — refusing",
 }
 
 OK = 0
@@ -210,6 +221,9 @@ class Spec:
     * ``worker`` (``i<N>``)   — a worktree off ``origin/<dev_branch>``, on the issue's branch.
     * ``debugger`` (``d<N>``) — in place, in ``cwd``; no worktree and no branch. THE class that
       receives the control-socket token, which is why nothing else may reach it by accident.
+    * ``consult`` (``c<N>``)  — a fork of the session that approved issue N (#538), in that
+      session's own start directory (``consult_home``), forking ``fork_parent``. No worktree, no
+      branch, no ``cwd``: like the flight, a directory offered as ``cwd`` is a debugger confusion.
     * ``triage`` (``t<N>``)   — the flight (#448). ``triage_home`` says where: ``checkout`` (the
       ruled default) runs it in ``repo`` itself, creating nothing; ``worktree`` gives it a
       DETACHED checkout of the base, for a repo whose gitignored overlay is sensitive. ``cwd`` is
@@ -227,6 +241,11 @@ class Spec:
     cwd: str = None
     mode: str = ""                       # "" -> derive from `cwd` (worker / debugger), as before
     triage_home: str = triage.CHECKOUT   # triage only: `checkout` (default) or `worktree`
+    # consult only (#538): the approving session's START directory (from its stamp) and its id.
+    # A fork runs where its parent ran — #536 measured that a fork started elsewhere lives in the
+    # new directory, acts on the wrong tree and loads a different auto-memory index.
+    consult_home: str = ""
+    fork_parent: str = ""
     engine_bin: str = ""
     agent: str = "claude"
     model: str = ""
@@ -398,7 +417,7 @@ def _launch(spec, host, edges):
     # ``--cwd`` belongs to the debugger and to nothing else. Checked BEFORE the id guard so a
     # triage spec carrying one is refused with the debugger's own sentence — the confusion it
     # names is real, and the class it was confused with is the one holding the fence's token.
-    if mode == TRIAGE and spec.cwd is not None:
+    if mode in (TRIAGE, CONSULT) and spec.cwd is not None:
         return Result(ABORTED, _MODE_REFUSALS[DEBUGGER] % iid)
     # ...and the symmetric half, now that DEBUGGER can be DECLARED rather than only derived
     # (fresh-agent review, P2). Derived, `cwd is not None` was the mode, so this could not happen;
@@ -413,6 +432,14 @@ def _launch(spec, host, edges):
         return Result(ABORTED, _MODE_REFUSALS[mode] % iid)
     debugger = mode == DEBUGGER
     flight = mode == TRIAGE
+    consulting = mode == CONSULT
+    # ONLY a consult forks a session (#536's recommendation). A fork parent on any other class is a
+    # caller bug that would turn a worker launch into a branch of somebody's conversation — refused
+    # here, and the pane's floor refuses the same knob on any id that is not a `c<N>`.
+    fork_parent = getattr(spec, "fork_parent", "")
+    if not consulting and fork_parent not in ("", None):
+        return Result(ABORTED, "[%s] a fork parent was given to a %s launch — only a consult forks "
+                               "a session — refusing" % (iid, mode))
     if spec.agent not in AGENTS:
         return Result(UNSUPPORTED_AGENT,
                       "[%s] unsupported agent '%s' (expected: %s)"
@@ -534,6 +561,29 @@ def _launch(spec, host, edges):
         # ABSOLUTE and PHYSICAL: the pane's shell starts in its own default dir, so a relative one
         # would name nothing there.
         worktree = os.path.realpath(spec.cwd)
+    elif consulting:
+        # The consult's home (#538) is the approving session's START directory, read from the
+        # approver stamp — which arrived through a GitHub comment, so neither it nor the parent id
+        # is ever ECHOED into a refusal (evidence.py classifies these lines; see the triage
+        # refusals below for the needle that bit). The lead phrase names the class and the key.
+        home = getattr(spec, "consult_home", "")
+        if type(fork_parent) is not str or not _FORK_PARENT_RE.fullmatch(fork_parent):
+            return Result(ABORTED, "[%s] CONSULT LAUNCH REFUSED: the session to fork "
+                                   "(SL_FORK_PARENT) is not a session id — refusing" % iid)
+        if spec.resume_session_id:
+            return Result(ABORTED, "[%s] CONSULT LAUNCH REFUSED: a fork is never also a revive "
+                                   "(SL_RESUME_SESSION_ID is set) — refusing" % iid)
+        if type(home) is not str or not home or not os.path.isabs(home):
+            return Result(ABORTED, "[%s] CONSULT LAUNCH REFUSED: the approving session's directory "
+                                   "(SL_CONSULT_HOME) is not an absolute path — refusing" % iid)
+        if not os.path.isdir(home):
+            return Result(ABORTED, "[%s] CONSULT LAUNCH REFUSED: the approving session's directory "
+                                   "(SL_CONSULT_HOME) is not a directory on this machine — "
+                                   "refusing" % iid)
+        # Nothing is created, exactly as the triage flight's checkout home: the consult reads the
+        # approver's tree and writes only its outcome file, and that discipline is its brief's and
+        # its standing rule's to keep (plus the PreToolUse consult duty) — no code here writes to it.
+        worktree = os.path.realpath(home)
     elif flight:
         # The triage flight's home (#448). The two answers see DIFFERENT repositories — only the
         # checkout shows the gitignored working files an orchestrator sees — so an unreadable
@@ -750,7 +800,7 @@ def _launch(spec, host, edges):
             "installed? (bin/install-launch-shim.sh)" % iid,
             "[%s] Tore the pane down; NOT marking active." % iid]))
 
-    _record_delivery(spec, iid, session, debugger or flight, resume)
+    _record_delivery(spec, iid, session, debugger or flight or consulting, resume)
     return Result(OK, "", "[launch] %s  branch=%s pane=%s ws=%s name='%s' (delivery verified)"
                   % (iid, branch or "<none>", session.pane, session.workspace, name),
                   session=session)
@@ -988,6 +1038,10 @@ def pane_environment(spec, iid, session_id, resume, expect_login, token,
         "SL_ATTENDED": "1" if spec.attended else "",
         "SL_SESSION_ID": session_id,
         "SL_RESUME": "1" if resume else "",
+        # (#538) NAMED on every launch and EMPTY on every class but a consult — `_launch` refuses a
+        # parent on any other — so a value inherited from somewhere can never ride into a pane.
+        # start-session.sh turns it into `--resume <parent> --fork-session` for a `c<N>` alone.
+        "SL_FORK_PARENT": str(getattr(spec, "fork_parent", "") or ""),
         "SL_EXPECT_GH_LOGIN": expect_login,
         # The identity contract (#314), NAMED on every launch INCLUDING the empty case — the same
         # discipline SL_EXPECT_GH_LOGIN follows. "This machine assigns no config dir" is then
@@ -1257,7 +1311,8 @@ def _rm_quiet(path):
 
 
 __all__ = ["Spec", "Result", "Ran", "Edges", "WorktreeLock", "launch", "pane_environment",
-           "is_poison", "WORKER_RE", "DEBUGGER_RE", "TRIAGE_RE", "WORKER", "DEBUGGER", "TRIAGE",
+           "is_poison", "WORKER_RE", "DEBUGGER_RE", "TRIAGE_RE", "CONSULT_RE", "WORKER",
+           "DEBUGGER", "TRIAGE", "CONSULT",
            "MODES", "OK", "ABORTED", "NOT_DELIVERED",
            "BASE_MISSING", "AUTH_DEAD", "AUTH_DEAD_RUNNER", "ENV_POISONED", "FENCE_DOWN",
            "UNSUPPORTED_AGENT"]

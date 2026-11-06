@@ -1554,3 +1554,134 @@ def test_a_mode_that_merely_CLAIMS_to_equal_one_is_not_one(tmp_path):
     assert result.rc == launch.ABORTED
     assert "unknown session mode" in result.stderr
     assert host.spawned == []
+
+
+# =========================================================================== the consult (#538)
+#
+# A `c<N>` consult is a FORK of the session that approved issue N (#536's mechanics, #538's flow):
+# it runs in the approving session's own directory — no worktree, no branch — and carries the
+# approver's id to start-session.sh as SL_FORK_PARENT. These pin that the class exists, that it is
+# exclusive with the other three, that its home and parent are refused when unreadable, and that no
+# other class can ever be handed a parent to fork.
+
+_PARENT = "1c1e6ffb-0d84-4f0d-b3e0-ae10c5fa781c"
+
+
+def _consult_home(tmp_path, iid="c5"):
+    home = tmp_path / "home"
+    (home / "state").mkdir(parents=True, exist_ok=True)
+    (home / "briefs").mkdir(parents=True, exist_ok=True)
+    (home / "briefs" / f"{iid}.md").write_text("consult the approver")
+    (home / "state" / "issues.json").write_text(json.dumps({"issues": {}}))
+    return home
+
+
+def _consult_spec(tmp_path, iid="c5", **over):
+    approver = tmp_path / "approver-checkout"
+    approver.mkdir(exist_ok=True)
+    kw = {"home": _consult_home(tmp_path, iid), "mode": launch.CONSULT,
+          "consult_home": str(approver), "fork_parent": _PARENT}
+    kw.update(over)
+    return _spec(tmp_path, iid=iid, **kw)
+
+
+def test_a_consult_runs_in_the_approvers_own_directory_and_forks_its_session(tmp_path):
+    spec = _consult_spec(tmp_path)
+    result, edges, host = _run(spec)
+    assert result.rc == launch.OK, result.stderr
+    (spawn,) = host.spawned
+    assert spawn["cwd"] == os.path.realpath(str(tmp_path / "approver-checkout"))
+    assert spawn["env"]["SL_FORK_PARENT"] == _PARENT
+    assert spawn["env"]["SL_ISSUE_ID"] == "c5"
+    minted = spawn["env"]["SL_SESSION_ID"]
+    assert minted and minted != _PARENT, "the fork carries its OWN id, never the parent's"
+    assert spawn["env"]["SL_RESUME"] == ""
+    assert not (tmp_path / "home" / "worktrees").exists(), "a consult creates no worktree"
+    assert not any("worktree" in " ".join(c) for c in edges.calls)
+
+
+def test_a_consult_is_an_untracked_session_with_no_launch_counter(tmp_path):
+    spec = _consult_spec(tmp_path)
+    _run(spec)
+    assert json.loads((tmp_path / "home" / "state" / "issues.json").read_text()) == {"issues": {}}
+
+
+def test_every_other_class_has_its_fork_knob_pinned_empty(tmp_path):
+    """#536: an ambient fork knob must never turn a worker launch into a fork of somebody's session."""
+    result, _edges, host = _run(_spec(tmp_path))
+    assert result.rc == launch.OK
+    assert host.spawned[0]["env"]["SL_FORK_PARENT"] == ""
+
+
+def test_a_worker_spec_carrying_a_fork_parent_is_refused(tmp_path):
+    spec = _spec(tmp_path, fork_parent=_PARENT)
+    result, _edges, host = _run(spec)
+    assert result.rc == launch.ABORTED
+    assert "only a consult forks" in result.stderr
+    assert host.spawned == []
+
+
+@pytest.mark.parametrize("iid,home", [("i308", None), ("d12", None), ("t1", None)])
+def test_no_other_id_can_be_launched_as_a_consult(tmp_path, iid, home):
+    spec = _consult_spec(tmp_path, iid=iid)
+    result, _edges, host = _run(spec)
+    assert result.rc == launch.ABORTED
+    assert "consult mode expects a consult id" in result.stderr
+    assert host.spawned == []
+
+
+def test_a_consult_id_can_never_be_launched_as_a_worker(tmp_path):
+    spec = _spec(tmp_path, iid="c5", home=_consult_home(tmp_path))
+    result, _edges, host = _run(spec)
+    assert result.rc == launch.ABORTED
+    assert host.spawned == []
+
+
+def test_a_consult_with_cwd_is_refused_as_a_debugger_confusion(tmp_path):
+    """--cwd is the debugger's, and the debugger is the class handed the fence's token."""
+    spec = _consult_spec(tmp_path, cwd=str(tmp_path))
+    result, _edges, host = _run(spec)
+    assert result.rc == launch.ABORTED
+    assert "debugger (d<N>) ids only" in result.stderr
+    assert host.spawned == []
+
+
+@pytest.mark.parametrize("parent", ["", "short", "../../etc", "a b c d e f g h", None, 7])
+def test_a_consult_with_no_readable_parent_is_refused(tmp_path, parent):
+    spec = _consult_spec(tmp_path, fork_parent=parent)
+    result, _edges, host = _run(spec)
+    assert result.rc == launch.ABORTED
+    assert "CONSULT LAUNCH REFUSED" in result.stderr
+    assert host.spawned == []
+
+
+@pytest.mark.parametrize("home", ["", "relative/dir", None])
+def test_a_consult_with_no_usable_home_is_refused(tmp_path, home):
+    spec = _consult_spec(tmp_path, consult_home=home)
+    result, _edges, host = _run(spec)
+    assert result.rc == launch.ABORTED
+    assert "CONSULT LAUNCH REFUSED" in result.stderr
+    assert host.spawned == []
+
+
+def test_a_consult_home_that_is_not_a_directory_is_refused_without_echoing_it(tmp_path):
+    spec = _consult_spec(tmp_path, consult_home=str(tmp_path / "fence down"))
+    result, _edges, host = _run(spec)
+    assert result.rc == launch.ABORTED
+    assert "fence down" not in result.stderr, "an untrusted path must never reach evidence.py"
+    assert host.spawned == []
+
+
+def test_a_consult_is_never_also_a_revive(tmp_path):
+    spec = _consult_spec(tmp_path, resume_session_id="d1e1e1e1-0000-4000-8000-000000000009")
+    result, _edges, host = _run(spec)
+    assert result.rc == launch.ABORTED
+    assert host.spawned == []
+
+
+def test_a_consult_is_fence_gated_like_every_tokenless_class(tmp_path, monkeypatch):
+    """A consult holds no token, so an unfenced fleet would hand it the whole session host."""
+    _fleet(monkeypatch)
+    result, edges, host = _run(_consult_spec(tmp_path), edges=FakeEdges(fence=session_host.OPEN))
+    assert result.rc == launch.FENCE_DOWN
+    assert host.spawned == []

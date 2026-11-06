@@ -374,21 +374,46 @@ def _qa_block(qa, operator):
         a = e.get("answer")
         if not (isinstance(q, str) and q.strip()):
             continue                                   # a pair with no question is not a Q&A
-        pairs.append((q, a if isinstance(a, str) else ""))
+        # (#538) WHO answered. Only an explicit `by: "consult"` is the approving session; anything
+        # else — absent, garbage — is the owner, exactly as every pre-#538 entry was written.
+        session = e.get("session") if isinstance(e.get("session"), str) else ""
+        pairs.append((q, a if isinstance(a, str) else "", e.get("by") == "consult", session))
     if not pairs:
         return ""
-    parts = [
-        f"## Owner's answers to your predecessor's questions (BINDING — treat as approved text)\n\n"
-        f"A prior session paused this issue to ask {operator} a question and then exited cleanly — "
-        "its work-in-progress branch is already checked out (reused if it still applies cleanly). "
-        f"{operator} answered below; treat each answer as a settled decision and continue the work.\n\n"
-    ]
-    for i, (q, a) in enumerate(pairs, 1):
+    if not any(by_consult for _q, _a, by_consult, _s in pairs):
+        # The owner answered every one: the pre-#538 render, byte for byte.
+        parts = [
+            f"## Owner's answers to your predecessor's questions (BINDING — treat as approved text)\n\n"
+            f"A prior session paused this issue to ask {operator} a question and then exited cleanly — "
+            "its work-in-progress branch is already checked out (reused if it still applies cleanly). "
+            f"{operator} answered below; treat each answer as a settled decision and continue the work.\n\n"
+        ]
+    else:
+        # An answer from the approving session is binding for THIS build — the consult judged it
+        # within what the owner approved — but it is never rendered as the owner's own word: the
+        # owner ruled that a consult answers on his behalf, not in his name.
+        parts = [
+            "## Answers to your predecessor's questions (BINDING — treat as approved text)\n\n"
+            "A prior session paused this issue to ask a question and then exited cleanly — its "
+            "work-in-progress branch is already checked out (reused if it still applies cleanly). "
+            "Each answer below says who gave it. Some were given by the APPROVING SESSION: before "
+            f"the question reached {operator}, the loop consulted a fork of the orchestration "
+            "session that approved this issue, and it answered from what "
+            f"{operator} wanted when the work was shaped. Such an answer is binding for this build, "
+            f"but it is that session's judgment, not {operator}'s own word. Treat each answer as a "
+            "settled decision and continue the work.\n\n"
+        ]
+    for i, (q, a, by_consult, session) in enumerate(pairs, 1):
         answer = a.strip() if a.strip() else (
             f"_({operator} re-approved without a written answer — see the Amendments block below "
             "for any reply, or proceed on the recommendation you gave.)_")
+        if by_consult:
+            who = ("from the approving session%s — a fork of the session that approved this issue, "
+                   "not %s's own word" % (f" `{session}`" if session else "", operator))
+        else:
+            who = f"from {operator}"
         parts.append(f"**Q{i} (your predecessor asked):**\n{q}\n\n"
-                     f"**A{i} (from {operator}):**\n{answer}\n\n")
+                     f"**A{i} ({who}):**\n{answer}\n\n")
     return "".join(parts)
 
 
