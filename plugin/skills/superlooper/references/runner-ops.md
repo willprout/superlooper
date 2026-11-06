@@ -480,9 +480,10 @@ issue, its thread, the question, the branch and PR, and every earlier handback. 
 `consulting` meanwhile, holding no lane. If the fork **answers**, the runner posts the answer marked
 as the approving session's (never yours) and relaunches the worker with nobody applying
 `agent-ready` — you only see it in the morning report's **Approver consults** section and on the
-issue. If it **escalates**, or there is no stamp, no transcript, the fork fails to launch, or it
-writes nothing within 20 minutes, the question reaches you exactly as below, an escalation carrying
-the fork's reasoning and recommendation. The rule is `consult-standing-rule.md`.
+issue. If it **escalates**, or there is no stamp, no transcript, the fork fails to launch, it
+writes nothing within 20 minutes, or a usage ceiling or launch hold keeps it from starting for 20
+minutes, the question reaches you exactly as below, an escalation carrying the fork's reasoning and
+recommendation. The rule is `consult-standing-rule.md`.
 
 Your side is one touch: **answer in a comment, then re-apply `agent-ready`.** That relaunches a
 fresh session whose brief embeds the question and your answer verbatim, reusing the pushed WIP (or,

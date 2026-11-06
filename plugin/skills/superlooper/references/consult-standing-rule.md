@@ -66,14 +66,20 @@ Each of these sends the question to William exactly as it does today, with the r
 - the stamp names another machine;
 - the stamped session's transcript is not on this machine;
 - the fork fails to launch, or exits without writing an outcome;
-- the fork writes no outcome within the bounded wait (20 minutes), or one nobody can read.
+- the fork writes no outcome within the bounded wait (20 minutes), or one nobody can read;
+- the consult cannot start within the same 20 minutes, because the usage ceilings or a
+  machine-wide launch hold kept it waiting.
 
 ## Accountability and limits
 
 - The two-question cap per issue holds whoever answered: a consult's answer counts as one of the
   two, and a third question parks the issue for William as a scoping problem.
 - A consult holds no build lane, so it never takes one from queued work. It counts toward the usage
-  ceilings like any session: an over-ceiling or held machine waits rather than starting one.
+  ceilings like any session: an over-ceiling or held machine waits rather than starting one, for at
+  most the consult's own 20 minutes, and then the question goes to William.
+- Once the question has reached William, the consult is over: its session is ended at that moment,
+  and nothing it writes afterwards can relaunch the worker.
+- An owner who closes the issue mid-consult has dropped it: the consult is ended with it.
 - Every consult outcome — answered, escalated or fell back — appears in the morning report with a
   link to the issue.
 - Each consult leaves a transcript of its own in the approving session's project folder. In

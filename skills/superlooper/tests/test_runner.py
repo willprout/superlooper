@@ -9048,13 +9048,132 @@ def test_the_packet_carries_the_issues_earlier_handbacks_and_how_each_was_resolv
     history = text.split("## Its handback history")[1].split("## Your outcome")[0]
     for needle in ("asked the owner a question: QUESTION: which table?",
                    "the owner answered and re-approved",
-                   "recovered a frozen session",
+                   "relaunched after its session froze",
                    "relaunched twice, no report",
                    "the owner re-approved it",
                    "the endpoint moved",
                    "Answered by %s:** the new one" % rig.r._operator()):
         assert needle in history, needle
     assert "SOMEONE ELSE'S PARK" not in text
-    order = [history.index(n) for n in ("which table?", "recovered a frozen", "no report",
+    order = [history.index(n) for n in ("which table?", "session froze", "no report",
                                         "re-approved it", "endpoint moved")]
     assert order == sorted(order), "oldest first, so each handback reads with its resolution"
+
+
+
+# ---- review round 1 (#538) ----
+
+def test_the_view_checks_a_question_from_a_frozen_or_exited_lane_too(rig):
+    for status in ("frozen", "exited"):
+        _blocked_worker(rig, status=status)
+        _stamp_comment(rig, 5)
+        _consultable(rig)
+        assert rig.r.disk_view(NOW)["consult_checks"]["i5"]["state"] == "eligible", status
+
+
+def test_a_held_consult_is_not_re_read_from_github_every_tick(rig, monkeypatch):
+    stamp = {"session": _SESSION, "host": "Williams-Mini", "cwd": str(rig.repo)}
+    _blocked_worker(rig, consult_held={"question": _Q, "reason": "usage", "since": NOW,
+                                       "stamp": stamp})
+    _consultable(rig)
+    monkeypatch.setenv("GH_FAIL", "1")                      # a read now would come back refused
+    assert rig.r.disk_view(NOW)["consult_checks"]["i5"] == {"state": "eligible", **stamp}
+
+
+def test_consult_held_stamps_its_clock_once_per_question(rig):
+    _blocked_worker(rig)
+    stamp = {"session": _SESSION, "host": "Williams-Mini", "cwd": str(rig.repo)}
+    rig.r._execute({"act": "consult_held", "id": "i5", "num": 5, "question": _Q,
+                    "reason": "usage", "stamp": stamp}, NOW)
+    rig.r._execute({"act": "consult_held", "id": "i5", "num": 5, "question": _Q,
+                    "reason": "launch hold", "stamp": stamp}, NOW + 500)
+    held = issue_state(rig, "i5")["consult_held"]
+    assert held["since"] == NOW and held["reason"] == "launch hold" and held["stamp"] == stamp
+
+
+def test_a_refused_thread_read_is_named_in_the_packet_never_read_as_no_comments(rig, monkeypatch):
+    _blocked_worker(rig)
+    import gh as gh_mod
+    monkeypatch.setattr(gh_mod, "issue_comments",
+                        lambda num: gh_mod.CommentRead(comments=[], ok=False))
+    _start(rig)
+    text = (rig.home / "briefs" / "c5.md").read_text()
+    assert "could not be read" in text and "_No comments._" not in text
+
+
+def test_an_answer_settles_before_its_outcome_file_is_consumed(rig, monkeypatch):
+    """A crash between the two must leave the ANSWER on disk, never a consult whose outcome is gone
+    and whose timeout would page the owner for a question already answered."""
+    _consulting(rig)
+    seen = {}
+    real_end = rig.r._end_consult
+
+    def end(cid):
+        seen["status"] = issue_state(rig, "i5")["status"]
+        real_end(cid)
+    rig.r._end_consult = end
+    rig.r._execute({"act": "consult_answer", "id": "i5", "num": 5, "answer": "Take A.",
+                    "reasoning": ""}, NOW)
+    assert seen["status"] == "ready"
+
+
+def test_an_answer_resets_the_post_once_stamp_for_the_next_question(rig):
+    _consulting(rig, question_posted=True)
+    rig.r._execute({"act": "consult_answer", "id": "i5", "num": 5, "answer": "Take A.",
+                    "reasoning": ""}, NOW)
+    assert issue_state(rig, "i5")["question_posted"] is False
+
+
+def test_the_consult_ends_the_moment_its_question_reaches_the_owner(rig, monkeypatch):
+    """Even when the label move then fails: a live fork must not get to answer a question the owner
+    already holds."""
+    _consulting(rig)
+    rig.r._end_consult = lambda cid: rig.calls.append({"args": ["END", cid], "env": {}})
+    real = runner_mod.gh.set_labels
+    monkeypatch.setattr(runner_mod.gh, "set_labels", lambda *a, **k: False)
+    out = rig.r._execute({"act": "post_question", "id": "i5", "num": 5, "question": _Q,
+                          "consult": {"outcome": "fell_back", "reason": consult_mod.TIMEOUT}}, NOW)
+    assert "label move failed" in out
+    assert {"args": ["END", "c5"], "env": {}} in rig.calls
+    monkeypatch.setattr(runner_mod.gh, "set_labels", real)
+
+
+def test_absorbing_a_close_mid_consult_ends_the_consult(rig):
+    _consulting(rig)
+    rig.r._execute({"act": "absorb_close", "id": "i5", "num": 5}, NOW)
+    assert not (rig.home / "state" / "panes" / "c5").exists()
+    assert not (rig.home / "reports" / "c5.md").exists()
+
+
+def test_a_second_consult_on_the_same_issue_ends_any_stale_one_first(rig):
+    _blocked_worker(rig, consult={"id": "c5", "state": "answered", "question": "q1"})
+    _stamp_comment(rig, 5)
+    (rig.home / "state" / "panes" / "c5").write_text("w9:p9")      # a fork that outlived its answer
+    real_end = rig.r._end_consult
+
+    def end(cid):
+        rig.calls.append({"args": ["END", cid], "env": {}})
+        real_end(cid)
+    rig.r._end_consult = end
+    assert _start(rig) == "ok"
+    launch_i = next(i for i, c in enumerate(rig.calls) if "--consult" in c["args"])
+    end_i = rig.calls.index({"args": ["END", "c5"], "env": {}})
+    assert end_i < launch_i, "the stale fork is ended before the new one launches"
+    assert not (rig.home / "state" / "panes" / "c5").exists()
+
+
+def test_a_runner_restarted_mid_consult_picks_the_consult_back_up(rig):
+    _blocked_worker(rig)
+    _stamp_comment(rig, 5)
+    _consultable(rig)
+    rig.r.tick(NOW)
+    assert issue_state(rig, "i5")["status"] == "consulting"
+    reborn = runner_mod.Runner(repo=str(rig.repo), config=rig.r.config, state_home=str(rig.home),
+                               pane="pane-1", run_script=rig.r._run_script,
+                               fetch_usage=rig.r._fetch_usage)
+    reborn._anchor_status = rig.r._anchor_status
+    reborn._session_host = rig.r._session_host
+    (rig.home / "reports" / "c5.md").write_text("OUTCOME: ANSWER\nANSWER:\nTake A.\nEND\n")
+    reborn.tick(NOW + 30)
+    st = issue_state(rig, "i5")
+    assert st["status"] in ("ready", "running") and st["qa_log"][-1]["by"] == "consult"

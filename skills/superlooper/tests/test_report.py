@@ -1504,7 +1504,7 @@ def test_every_consult_outcome_is_in_the_morning_report_with_a_link():
     assert "#15" in section and "fell back" in section and "no approver stamp" in section
     for n in (13, 14, 15):
         assert "https://github.com/%s/issues/%d" % (REPO, n) in section
-    assert "3 approver consult(s)" in out.splitlines()[2], "a consult night never reads as empty"
+    assert "2 approver consult(s)" in out.splitlines()[2], "a consult night never reads as empty"
     assert "consult" in report.morning_headline(records, _view(now=_NEWS_NOW, queue=[],
                                                                usage=None), config=_cfg())
 
@@ -1513,3 +1513,17 @@ def test_a_night_with_no_consult_renders_no_consult_section():
     out = report.morning([_LAST_REPORT], _view(now=_NEWS_NOW, queue=[], usage=None), ledger={},
                          config=_cfg())
     assert "## Approver consults" not in out
+
+
+
+def test_a_fallback_alone_is_listed_but_is_not_consult_news():
+    """Review round 1: a repo that never stamps falls back on EVERY question; that question is
+    already news as an owner question, so the fallback line is listed and never counted twice."""
+    records = [_LAST_REPORT,
+               _rec(_OVERNIGHT, "post_question", id="i15", num=15, question="q", outcome="ok"),
+               _rec(_OVERNIGHT, "consult_outcome", id="i15", num=15, outcome="ok",
+                    outcome_kind="fell_back", reason="no_stamp", sentence="no stamp")]
+    view = _view(now=_NEWS_NOW, queue=[], usage=None)
+    assert report.morning_news(records, view, config=_cfg()) == ["owner_question"]
+    assert "consult" not in report.morning_headline(records, view, config=_cfg())
+    assert "fell back" in report.morning(records, view, ledger={}, config=_cfg())

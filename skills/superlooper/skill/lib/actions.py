@@ -1132,7 +1132,9 @@ def _in_owner_handback_episode(ist, blocked_text):
     status = ist.get("status")
     if status == "merged":
         return False
-    if status in ("bounced", "parked", "needs_william", "awaiting_answer"):
+    # `consulting` (#538) counts for awaiting_answer's reason: the loop holds no lane on it, and an
+    # owner who closes the issue while its approving session considers the question has dropped it.
+    if status in ("bounced", "parked", "needs_william", "awaiting_answer", "consulting"):
         return True
     if isinstance(blocked_text, str) and blocked_text.lstrip().startswith("BOUNCED:"):
         return True
@@ -2959,6 +2961,13 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
             question = ist.get("pending_question") if isinstance(ist.get("pending_question"),
                                                                  str) else ""
             to_owner = None
+            if ist.get("question_posted"):
+                # The question comment already LANDED — the owner has it — and only its label move
+                # is retrying. Nothing the fork writes now may relaunch the worker over his head
+                # (fresh review): the question is his, so this only retries the post, silently.
+                out.append({"act": "post_question", "id": iid, "num": num, "question": question,
+                            "consult": None})
+                continue
             if rec.get("state") == "fallback":
                 to_owner = {"outcome": "fell_back", "reason": rec.get("reason"),
                             "detail": rec.get("detail")}
@@ -3496,13 +3505,26 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                 check = check if isinstance(check, dict) and not ist.get("question_posted") else None
                 if check is not None and check.get("state") == "eligible":
                     held = _consult_hold_reason(scheduler.usage_ok(usage_sched), launches_held)
+                    stamp = {k: check.get(k) for k in ("session", "host", "cwd")}
+                    hold = ist.get("consult_held") if isinstance(ist.get("consult_held"),
+                                                                 dict) else {}
+                    this_q = hold.get("question") == blocked_text
+                    since = hold.get("since")
                     if held is None:
                         out.append({"act": "consult_start", "id": iid, "num": num,
-                                    "question": blocked_text,
-                                    "stamp": {k: check.get(k) for k in ("session", "host", "cwd")}})
-                    elif ist.get("consult_held_reason") != held:
-                        out.append({"act": "consult_held", "id": iid, "num": num, "reason": held})
-                    continue
+                                    "question": blocked_text, "stamp": stamp})
+                        continue
+                    if not this_q or hold.get("reason") != held:
+                        # Journaled ONCE per reason; the executor keeps the hold's clock from the
+                        # FIRST hold of this question, so a reason that changes never resets it.
+                        out.append({"act": "consult_held", "id": iid, "num": num, "reason": held,
+                                    "question": blocked_text, "stamp": stamp})
+                        continue
+                    if _since_ok(since, now) and now - since < consult_mod.TIMEOUT_SECONDS:
+                        continue                           # held, inside its bound, already said
+                    # Held past the consult's own bound (or on a clock nobody can read): the hold
+                    # must never keep the question from everyone — it goes to the owner, saying why.
+                    check = {"state": "fallback", "reason": consult_mod.HELD, "detail": held}
                 # Night-batching (#164, opt-in since #492): a durable owner question is an owner
                 # DECISION — held to the morning report inside a configured quiet-hours window.
                 # post_question still fires, so the question is posted DURABLY as a GitHub comment

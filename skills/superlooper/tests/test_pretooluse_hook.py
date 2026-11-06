@@ -1506,3 +1506,21 @@ def test_the_consult_write_deny_never_reaches_a_worker():
     assert wp.run(_cbash("git commit -am wip"), WORKER_ENV) is None
     assert wp.run(_cbash("gh issue comment 5 --body hi"), WORKER_ENV) is None
     assert wp.run(_pre("Write", {"file_path": "/repo/x.py"}), WORKER_ENV) is None
+
+
+@pytest.mark.parametrize("command", [
+    "git branch -D sl/i5-x", "git branch -f main HEAD~1", "git bisect start", "git update-ref -d x",
+    "git config user.name x", "gh workflow run ci.yml", "gh run rerun 1", "gh run cancel 1",
+    "gh repo edit --visibility private", "gh release create v1",
+    "gh api graphql -f query='mutation { addComment(input:{}) { clientMutationId } }'",
+])
+def test_review_round_1_consult_write_verbs_are_denied(command):
+    assert wp.run(_cbash(command), CONSULT_ENV) is not None, command
+
+
+@pytest.mark.parametrize("command", [
+    "git branch -a", "git branch --list", "git config --get user.name", "git config -l",
+    "gh api graphql -f query='query { viewer { login } }'", "gh run view 1", "gh workflow list",
+])
+def test_review_round_1_consult_reads_stay_allowed(command):
+    assert wp.run(_cbash(command), CONSULT_ENV) is None, command

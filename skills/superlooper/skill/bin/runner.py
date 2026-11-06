@@ -2204,9 +2204,21 @@ class Runner:
         for iid, text in blocked.items():
             ist = issues.get(iid)
             num = actions._iid_num(iid)
+            # Every IN-FLIGHT status, not `running` alone (fresh review): a worker that wrote its
+            # question and then froze or exited still asked it, and decide routes it identically.
             if (num is None or not isinstance(ist, dict) or not isinstance(text, str)
-                    or text.lstrip().startswith("BOUNCED:") or ist.get("status") != "running"
+                    or text.lstrip().startswith("BOUNCED:")
+                    or ist.get("status") not in actions.INFLIGHT_STATUSES
                     or ist.get("question_posted")):
+                continue
+            hold = ist.get("consult_held")
+            if (isinstance(hold, dict) and hold.get("question") == text
+                    and isinstance(hold.get("stamp"), dict)):
+                # A consult HELD on usage or a launch hold was already found eligible for this very
+                # question; re-reading the thread every tick of the hold would cost a GitHub read
+                # per tick for nothing. The bound on the hold lives in decide.
+                out[iid] = {"state": "eligible", **{k: hold["stamp"].get(k)
+                                                    for k in ("session", "host", "cwd")}}
                 continue
             try:
                 out[iid] = self._consult_check(num)
@@ -3847,16 +3859,17 @@ class Runner:
                 # Once, at the moment the owner actually has the question: the morning report's
                 # consult section reads this record (#538), and a label retry must not double it.
                 self._journal_consult(iid, num, info, now)
+        # (#538) The moment the owner holds the question, the consult is over — ended HERE, before
+        # the label move that may yet fail, so a fork still alive cannot answer over his head.
+        rec = self._issue_field(iid, "consult")
+        if isinstance(rec, dict) and consult_mod.is_consult_id(rec.get("id")):
+            self._end_consult(rec["id"])
         # 2. the issue is now waiting on the owner, not building.
         if not gh.set_labels(num, add=["awaiting-answer"], remove=["in-progress"]):
             return "label move failed (will retry silently next tick)"
         self._forget_cached_label(iid, "in-progress")
-        # 3. close the live window, PRESERVING the WIP worktree for the relaunch — and end the
-        #    consult's session too, when there was one (#538): its job ended when it decided.
+        # 3. close the live window, PRESERVING the WIP worktree for the relaunch.
         self._teardown_session(iid, remove_worktree=False)
-        rec = self._issue_field(iid, "consult")
-        if isinstance(rec, dict) and consult_mod.is_consult_id(rec.get("id")):
-            self._end_consult(rec["id"])
         # 4. settle terminal-for-now: awaiting_answer, bump the 2-capped question counter, reset the
         #    post-once stamp for the NEXT question, and consume the blocked/exited markers LAST.
         def settle(st, i):
@@ -3984,9 +3997,11 @@ class Runner:
             title = title or view.get("title") or ""
         operator = self._operator()
         qa = self._issue_field(iid, "qa_log")
+        thread = gh.issue_comments(num)
         return consult_mod.render_packet(
             template, cid=cid, num=num, title=title, body=body, question=question,
-            comments=gh.issue_comments(num).comments, owner=brief.owner_login(self.config),
+            comments=thread.comments, comments_ok=bool(getattr(thread, "ok", False)),
+            owner=brief.owner_login(self.config),
             operator=operator, repo_slug=self.config.get("repo"),
             dev_branch=str(self.config.get("dev_branch") or "main"),
             branch_state=self._consult_branch_state(iid),
@@ -4011,6 +4026,10 @@ class Runner:
         if cid is None:
             return "skipped: no issue number to name a consult by"
         self._teardown_session(iid, remove_worktree=False)
+        # ...and any fork of this SAME id that outlived an earlier question's consult (a crash
+        # between its settle and its end): its singleton lock would otherwise keep the new one from
+        # ever being delivered — the D4 relaunch close, one session class over.
+        self._end_consult(cid)
         rec = {"id": cid, "session": stamp.get("session"), "host": stamp.get("host"),
                "cwd": stamp.get("cwd"), "question": question, "started_at": now}
         result, failure = "ok", None
@@ -4040,7 +4059,7 @@ class Runner:
             i["status"] = "consulting"
             i["pending_question"] = question
             i["consult"] = rec
-            i["consult_held_reason"] = None
+            i["consult_held"] = None
             i["consult_answer_posted"] = False
         self._update_issue(iid, fn=settle)
         _rm(os.path.join(self.state, "blocked", iid))
@@ -4049,8 +4068,22 @@ class Runner:
 
     def _exec_consult_held(self, a, now):
         """#538: an eligible consult is waiting on the usage ceilings or a machine-wide launch hold,
-        like any session start. Journaled ONCE per reason (the act record is the journal line)."""
-        self._update_issue(a["id"], {"consult_held_reason": a.get("reason")})
+        like any session start. Journaled ONCE per reason (the act record is the journal line).
+
+        The record keeps the hold's clock from the FIRST hold of this question — a reason that
+        changes mid-hold never restarts it — because decide bounds the hold by it and then hands
+        the question to the owner. The stamp rides along so the view need not re-read the thread
+        on every tick of the hold."""
+        question = a.get("question")
+
+        def settle(st, i):
+            prev = i.get("consult_held") if isinstance(i.get("consult_held"), dict) else {}
+            since = prev.get("since") if prev.get("question") == question else None
+            i["consult_held"] = {"question": question, "reason": a.get("reason"),
+                                 "since": since if actions._since_ok(since, now) else now,
+                                 "stamp": a.get("stamp") if isinstance(a.get("stamp"), dict)
+                                 else None}
+        self._update_issue(a["id"], fn=settle)
         return "ok"
 
     def _exec_consult_answer(self, a, now):
@@ -4060,7 +4093,8 @@ class Runner:
         `agent-ready`. The answer counts toward the two-question cap like any other.
 
         Idempotent like post_question: the comment posts ONCE (`consult_answer_posted`), and the
-        outcome file is consumed only in the final settle, so a failed post retries next tick."""
+        outcome file is consumed only AFTER the settle, so a failed post retries next tick and a
+        crash mid-way leaves the answer on disk to be acted on again, never lost."""
         iid, num = a["id"], a.get("num")
         rec = self._issue_field(iid, "consult")
         rec = rec if isinstance(rec, dict) else {}
@@ -4076,8 +4110,6 @@ class Runner:
                 return "answer comment failed (will retry next tick)"
             self._update_issue(iid, {"consult_answer_posted": True})
         cid = rec.get("id") if consult_mod.is_consult_id(rec.get("id")) else consult_mod.consult_id(num)
-        if cid:
-            self._end_consult(cid)
 
         def settle(st, i):
             log = i.get("qa_log")
@@ -4092,10 +4124,16 @@ class Runner:
             i["requeue_front"] = True
             i["consult_relaunch"] = True
             i["consult_answer_posted"] = False
+            i["question_posted"] = False               # the NEXT question posts fresh
             i["consult"] = dict(rec, state="answered")
         self._update_issue(iid, fn=settle)
         _rm(os.path.join(self.state, "blocked", iid))
         _rm(os.path.join(self.state, "exited", iid))
+        # LAST, after the settle: consuming the outcome file before it would let a crash in between
+        # leave a `consulting` issue with no outcome, whose timeout then pages the owner for a
+        # question already answered and posted (fresh review).
+        if cid:
+            self._end_consult(cid)
         self._journal_consult(iid, num, {"outcome": "answered", "answer": answer,
                                          "reasoning": outcome.reasoning,
                                          "session": rec.get("session")}, now)
@@ -4156,6 +4194,11 @@ class Runner:
         iid = a["id"]
         _rm(os.path.join(self.state, "blocked", iid))
         _rm(os.path.join(self.state, "awaiting", iid))
+        # A close mid-consult (#538) ends the consult with it: the owner dropped the issue, so its
+        # approving session has nothing left to answer.
+        rec = self._issue_field(iid, "consult")
+        if isinstance(rec, dict) and consult_mod.is_consult_id(rec.get("id")):
+            self._end_consult(rec["id"])
         def settle(st, i):
             i.update({"status": "merged", "park_notify_cause": None, "park_notify_at": None,
                       "park_landed_cause": None,       # the pair (#169)

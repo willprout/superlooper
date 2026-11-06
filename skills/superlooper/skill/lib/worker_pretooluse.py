@@ -1222,13 +1222,31 @@ _CONSULT_GH_WRITES = {
     "pr": frozenset(("comment", "edit", "close", "reopen", "create", "merge", "ready", "review",
                      "checkout", "lock", "unlock", "update-branch")),
     "label": frozenset(("create", "edit", "delete", "clone")),
+    # CI and the repository itself (fresh review): re-running, cancelling or dispatching a workflow
+    # acts on the gate that judges every PR, and repo/release edits outlive any one issue.
+    "workflow": frozenset(("run", "enable", "disable")),
+    "run": frozenset(("rerun", "cancel", "delete")),
+    "repo": frozenset(("edit", "delete", "rename", "archive", "unarchive", "create", "fork",
+                       "sync", "set-default")),
+    "release": frozenset(("create", "edit", "delete", "upload", "delete-asset")),
+    "secret": frozenset(("set", "delete")),
+    "variable": frozenset(("set", "delete")),
+    "cache": frozenset(("delete",)),
 }
 # `gh api` writes when it is told a write method, or when it is handed a body: with `-f`/`-F`/
 # `--input` and no `-X`, gh itself defaults the method to POST.
 _GH_BODY_FLAGS = ("-f", "-F", "--field", "--raw-field", "--input")
 _CONSULT_GIT_WRITES = frozenset((
-    "add", "am", "apply", "checkout", "cherry-pick", "clean", "commit", "merge", "mv", "pull",
-    "push", "rebase", "reset", "restore", "revert", "rm", "stash", "switch", "tag", "worktree"))
+    "add", "am", "apply", "bisect", "checkout", "cherry-pick", "clean", "commit", "merge", "mv",
+    "notes", "pull", "push", "rebase", "reset", "restore", "revert", "rm", "stash", "switch", "tag",
+    "update-ref", "worktree"))
+# Two verbs that READ by default and WRITE with a flag (fresh review): `git branch` lists, and
+# deletes / force-moves / renames with these; `git config` writes unless it is asked to read.
+_GIT_BRANCH_WRITE_FLAGS = frozenset(("-d", "-D", "--delete", "-f", "--force", "-m", "-M", "--move",
+                                     "-c", "-C", "--copy", "-u", "--set-upstream-to",
+                                     "--unset-upstream", "--edit-description"))
+_GIT_CONFIG_READ_FLAGS = frozenset(("--get", "--get-all", "--get-regexp", "--get-urlmatch", "-l",
+                                    "--list", "--show-origin", "--show-scope", "get", "list"))
 # git's own options that take a value before the subcommand (`git -C /repo commit`).
 _GIT_GLOBAL_WITH_VALUE = frozenset(("-C", "-c", "--git-dir", "--work-tree", "--namespace"))
 _FILE_TOOLS = {"Write": "file_path", "Edit": "file_path", "MultiEdit": "file_path",
@@ -1245,6 +1263,7 @@ _CONSULT_WRITE_REASON = (
 
 
 def _git_verb(tokens, start, end):
+    """(verb, index) of a `git` call's subcommand, stepping over git's own global options."""
     i = start
     while i < end:
         tok = tokens[i]
@@ -1254,8 +1273,21 @@ def _git_verb(tokens, start, end):
         if tok.startswith("-"):
             i += 1
             continue
-        return tok
-    return None
+        return tok, i
+    return None, end
+
+
+def _git_writes(tokens, start, end):
+    verb, at = _git_verb(tokens, start, end)
+    args = tokens[at + 1:end]
+    if verb in _CONSULT_GIT_WRITES:
+        return True
+    if verb == "branch":
+        return any(t in _GIT_BRANCH_WRITE_FLAGS or t.startswith(("--set-upstream-to=",))
+                   for t in args)
+    if verb == "config":
+        return not any(t in _GIT_CONFIG_READ_FLAGS for t in args)
+    return False
 
 
 def _consult_bash_write(tokens):
@@ -1268,6 +1300,13 @@ def _consult_bash_write(tokens):
             return True
         if args and args[0] == "api":
             method = _api_method(tokens, verb, end)
+            if len(args) >= 2 and args[1] == "graphql":
+                # GraphQL is always a POST, so the method says nothing: a query READS, a mutation
+                # WRITES, and the operation's own keyword is the only evidence (fresh review: a
+                # read-only `query=` was being denied). Fail toward the deny on any mutation word.
+                if any("mutation" in t.lower() for t in tokens[verb + 2:end]):
+                    return True
+                continue
             if method is not None:
                 if method not in _READ_METHODS:
                     return True
@@ -1275,7 +1314,7 @@ def _consult_bash_write(tokens):
                      for t in tokens[verb + 1:end]):
                 return True
     for start, end in _invocations(tokens, "git"):
-        if _git_verb(tokens, start, end) in _CONSULT_GIT_WRITES:
+        if _git_writes(tokens, start, end):
             return True
     return False
 

@@ -87,6 +87,7 @@ LAUNCH_FAILED = "launch_failed"
 FORK_EXITED = "fork_exited"
 TIMEOUT = "timeout"
 MALFORMED = "malformed_outcome"
+HELD = "consult_held"
 
 # Every way a consult hands the question back to the owner WITHOUT a decision, and the sentence the
 # journal and the morning report carry for it. A table, so a reason nobody wrote a sentence for
@@ -104,6 +105,10 @@ FALLBACK_REASONS = {
     FORK_EXITED: "the consult fork exited without writing an outcome",
     TIMEOUT: "the consult fork wrote no outcome within %d minutes" % (TIMEOUT_SECONDS // 60),
     MALFORMED: "the consult fork's outcome file could not be read as ANSWER or ESCALATE",
+    # A consult waits on the usage ceilings and machine-wide launch holds like any session, but
+    # never for longer than it would have been given to decide: past the same bound the question
+    # goes to the owner, so a hold can never keep a question from everyone (fresh review, P1).
+    HELD: "the consult could not start within %d minutes" % (TIMEOUT_SECONDS // 60),
 }
 
 
@@ -256,8 +261,12 @@ def _history_line(r):
         return "%s — the question fell back to the owner: %s" % (
             when, fallback_sentence(r.get("reason")))
     if act == "park":
-        return "%s — parked for the owner (%s): %s" % (when, r.get("cause") or "no cause",
-                                                        _clip(r.get("memo")))
+        # `cause` is a short token on most parks and a whole sentence on some older ones (measured
+        # on the live journal), where it only repeats the memo — so it is named only when short.
+        cause = r.get("cause")
+        tag = (" (%s)" % cause if isinstance(cause, str) and 0 < len(cause) <= 40
+               and " " not in cause else "")
+        return "%s — parked for the owner%s: %s" % (when, tag, _clip(r.get("memo")))
     if act == "bounce":
         return "%s — bounced by its worker (premise drift): %s" % (when, _clip(r.get("memo")))
     if act == "reapprove":
@@ -265,10 +274,12 @@ def _history_line(r):
     if act == "resume_at_gate":
         return "%s — the owner re-approved a finished build; it resumed at the merge gate" % when
     if act == "regenerate":
-        return "%s — regenerated from the issue (merge conflict): %s" % (when,
-                                                                        _clip(r.get("reason")))
+        branch = r.get("new_branch")
+        return "%s — regenerated from the issue after a merge conflict%s" % (
+            when, " (rebuilt on `%s`)" % branch if isinstance(branch, str) and branch else "")
     if act == "recover":
-        return "%s — recovered a %s session" % (when, r.get("tier"))
+        return "%s — relaunched after its session %s" % (
+            when, "froze" if r.get("tier") == "frozen" else "exited")
     if act == "absorb_close":
         return "%s — the owner closed it on GitHub" % when
     return None
@@ -329,9 +340,15 @@ def _sub(template, mapping):
                   template)
 
 
-def _comment_block(comments, owner, operator):
+def _comment_block(comments, owner, operator, ok=True):
     """The issue's comment thread, every author, VERBATIM — context for the consult, attributed so
-    it can tell the owner's word from the loop's own machine comments."""
+    it can tell the owner's word from the loop's own machine comments. A thread GitHub REFUSED to
+    serve is said to be unread, never rendered as "no comments": an owner amendment the consult
+    never saw would otherwise read as one that does not exist."""
+    if not ok:
+        return ("_The comment thread could not be read from GitHub when this packet was built — "
+                "read it yourself (`gh issue view <N> --comments`) before you decide: it may carry "
+                "the owner's amendments._")
     out = []
     for c in comments if isinstance(comments, list) else []:
         if not isinstance(c, dict) or not isinstance(c.get("body"), str):
@@ -352,7 +369,7 @@ def _comment_block(comments, owner, operator):
 
 def render_packet(template, *, cid, num, title, body, question, comments, owner, operator,
                   repo_slug, dev_branch, branch_state, history, qa, outcome_path, home,
-                  approver_session, rule_paths=(RULE_PATH, RULE_MIRROR)):
+                  approver_session, rule_paths=(RULE_PATH, RULE_MIRROR), comments_ok=True):
     """The consult's whole brief. Everything the fork knows about now comes from here: its memory
     dates from approval time (and only from the approver's last compaction on), so the packet
     carries the issue as approved, its thread, the question, the branch/PR state and the history."""
@@ -363,7 +380,8 @@ def render_packet(template, *, cid, num, title, body, question, comments, owner,
         "approver_session": approver_session, "home": home,
         "question": (question or "").strip() or "_(the worker's question was empty)_",
         "issue_body": (body or "").strip() or "_(empty body)_",
-        "comments": _comment_block(comments, owner, operator),
+        "comments": _comment_block(comments, owner, operator, ok=comments_ok).replace(
+            "<N>", str(num)),
         "branch_state": "\n".join(branch_state or []) or "_(nothing recorded)_",
         "history": "\n".join(hist) if hist else "_None — this is the issue's first handback._",
         "outcome_path": outcome_path, "outcome_format": outcome_format(),
@@ -415,7 +433,7 @@ def escalation_note(outcome, approver_session, operator):
 
 __all__ = ["ID_RE", "PREFIX", "consult_id", "is_consult_id", "issue_id_of", "TIMEOUT_SECONDS",
            "NO_STAMP", "STAMP_UNREAD", "OTHER_MACHINE", "NO_TRANSCRIPT", "LAUNCH_FAILED", "FORK_EXITED", "TIMEOUT",
-           "MALFORMED", "FALLBACK_REASONS", "fallback_sentence", "same_machine",
+           "MALFORMED", "HELD", "FALLBACK_REASONS", "fallback_sentence", "same_machine",
            "ANSWER", "ESCALATE", "Outcome", "ABSENT", "INCOMPLETE", "UNREADABLE", "READ",
            "END_LINE", "parse_outcome", "outcome_format", "HISTORY_ACTS", "history_lines",
            "qa_lines", "RULE_PATH", "RULE_MIRROR", "render_packet", "MARKER", "answer_comment", "escalation_note"]

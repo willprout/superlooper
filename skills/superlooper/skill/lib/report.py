@@ -347,7 +347,7 @@ def _questions(records, window_start):
     return lines, total
 
 
-def _consults(records, repo, window_start):
+def _consults(records, repo, window_start, decided_only=False):
     """Every approver consult that ENDED overnight (#538) — answered, escalated, or fell back — one
     line each with a link to the issue. An answered consult is the one thing the loop decided on the
     owner's behalf without asking him, so it is never left for him to discover; a fall-back says
@@ -365,6 +365,8 @@ def _consults(records, repo, window_start):
             continue
         link = _issue_link(repo, num)
         kind = r.get("outcome_kind")
+        if decided_only and kind not in ("answered", "escalated"):
+            continue
         if kind == "answered":
             lines.append(f"- #{num} — answered by its approving session; the worker was relaunched "
                          f"with that answer, marked on the issue as not yours — {link}")
@@ -1231,6 +1233,11 @@ def _facts(journal_records, gh_view, config):
         "resurrections": _resurrection(records, overnight_start),      # runner auto-restarts (#208)
         "questions": questions, "q_total": q_total,
         "consults": _consults(records, repo, overnight_start),        # the approver consult (#538)
+        # ...and the ones that are NEWS: an answer the loop gave on the owner's behalf, or an
+        # escalation. A fall-back is listed in the section but is not counted again — the question
+        # it sent him is already news as an owner question (fresh review: a repo that never stamps
+        # would otherwise report "N consult(s)" every morning it had a question).
+        "consult_news": _consults(records, repo, overnight_start, decided_only=True),
         "triage_lines": _triage(records, repo, overnight_start),       # the triage flight (#449)
         "holds": holds,
         "hold_alerts": _hold_alerts(holds, view, now),
@@ -1253,7 +1260,7 @@ def _facts(journal_records, gh_view, config):
 NEWS_CLASSES = ("merge", "park", "bounce", "owner_question", "consult", "regeneration", "wander",
                 "unattended_debugger", "runner_resurrection", "triage", "queue_hold", "aged_hold")
 _NEWS_FACTS = (("merge", "merged"), ("park", "parked"), ("bounce", "bounces"),
-               ("owner_question", "questions"), ("consult", "consults"),
+               ("owner_question", "questions"), ("consult", "consult_news"),
                ("regeneration", "regens_overnight"),
                ("wander", "wanders"), ("unattended_debugger", "watchdog"),
                ("runner_resurrection", "resurrections"), ("triage", "triage_lines"),
@@ -1287,7 +1294,7 @@ _HEADLINE_CLAUSES = (
     ("parked", lambda f: "%d parked" % len(f["parked"])),
     ("bounces", lambda f: "%d bounced" % len(f["bounces"])),
     ("questions", lambda f: "%d question(s)" % (f["q_total"] or len(f["questions"]))),
-    ("consults", lambda f: "%d consult(s)" % len(f["consults"])),
+    ("consult_news", lambda f: "%d consult(s)" % len(f["consult_news"])),
     ("hold_alerts", lambda f: "%d aged hold(s)" % len(f["hold_alerts"])),
     ("triage_lines", lambda f: "triage: %d merged, %d closed, %d escalated"
      % _triage_counts(f["records"], f["overnight_start"])),
@@ -1385,7 +1392,7 @@ def morning(journal_records, gh_view, ledger, config):
         # constants that only happen to be equal today, and a single hardcoded number would become a
         # lie the day they diverge. The alert lines below each state their own age.
         summary += f" **{len(hold_alerts)} standing hold/freeze past its age threshold — see below.**"
-    others = [(len(f["consults"]), "approver consult(s)"),
+    others = [(len(f["consult_news"]), "approver consult(s)"),
               (len(wanders), "wander(s)"), (len(watchdog), "unattended-debugger event(s)"),
               (len(resurrections), "runner-resurrection event(s)")]
     if any(n for n, _ in others):
@@ -1419,8 +1426,8 @@ def morning(journal_records, gh_view, ledger, config):
         _section("Parked / needs-owner", parked),
         _section("Bounces", bounces),
         _section("Owner questions", questions, "None — no worker needed an owner decision."),
-        # SILENT on a night with no consult, like Triage below: a repo that never stamps approvals
-        # never consults, and a standing "None." here would be a section about nothing.
+        # SILENT on a night with no consult outcome, like Triage below: a standing "None." would be
+        # a section about nothing on every repo that does not stamp its approvals.
         *([_section("Approver consults", f["consults"])] if f["consults"] else []),
         _section("Conflict regenerations (last 7 days)", regens),
         _section("Wanders", wanders),

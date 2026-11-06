@@ -136,7 +136,7 @@ def test_history_carries_every_landed_handback_for_this_issue_in_order():
     assert "owner answered" in lines[1]
     assert "crashed twice" in lines[2]
     assert "re-approved" in lines[3]
-    assert "frozen" in lines[4]
+    assert "session froze" in lines[4]
     assert "premise gone" in lines[5]
     assert "use B" in lines[6]
     assert not any("other issue" in l for l in lines)
