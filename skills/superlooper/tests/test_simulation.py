@@ -1007,6 +1007,110 @@ def test_blocked_question_durable_roundtrip_resumes_and_merges(sim_factory):
 
 
 # =====================================================================================
+# the approver consult (#538): a worker's question goes FIRST to a fork of the session that
+# approved the issue — ANSWER relaunches the worker with nobody applying agent-ready; ESCALATE
+# hands the question to the owner with the fork's reasoning. The fork is fake-claude playing the
+# `consult` scenario, launched through the REAL chain: runner -> launch-session.py --consult ->
+# session host -> start-session.sh (`--resume <approver> --fork-session`) -> fake-claude.
+# =====================================================================================
+
+_APPROVER = "1c1e6ffb-0d84-4f0d-b3e0-ae10c5fa781c"
+
+
+def _approved_by_a_stamped_session(sim, num):
+    """What `superlooper approve` leaves behind (#537): the audit comment with the hidden stamp,
+    authored by the owner, naming a session on THIS machine whose transcript is on disk."""
+    import approval
+    body = approval.audit_comment("sim", "2026-11-06",
+                                  approval.Stamp(_APPROVER, "simhost", str(sim.repo)))
+
+    def fn(st):
+        st["issues"][str(num)].setdefault("comments", []).append(
+            {"body": body, "author": {"login": "sim"}, "authorAssociation": "OWNER",
+             "createdAt": "2026-11-06T19:55:00Z"})
+    sim.edit_gh_state(fn)
+    proj = sim.home_dir / ".claude" / "projects" / "-sim-approver"
+    proj.mkdir(parents=True, exist_ok=True)
+    (proj / ("%s.jsonl" % _APPROVER)).write_text('{"type": "user"}\n')
+    sim.runner._hostname = lambda: "simhost.local"
+
+
+def _fork_argv(sim, num):
+    path = sim.scenario_dir / ("argv.c%d" % num)
+    return json.loads(path.read_text()) if path.exists() else None
+
+
+def test_a_question_the_approving_session_answers_relaunches_and_merges(sim_factory):
+    sim = sim_factory()
+    question = ("QUESTION: Should the simulated widget use approach A or B?\n"
+                "OPTIONS:\n- A (matches the pattern)\n- B (new dependency)\nRECOMMENDATION: A")
+    num = sim.add_issue(title="Blocks on a question the approver can answer",
+                        scenario={"scenario": "blocked", "question": question})
+    sid, cid = "i%d" % num, "c%d" % num
+    _approved_by_a_stamped_session(sim, num)
+    sim.set_scenario(cid, {"scenario": "consult",
+                           "outcome": "OUTCOME: ANSWER\nANSWER:\nUse approach A — the pattern "
+                                      "the owner chose.\nREASONING:\nRuled in the approving "
+                                      "conversation.\nEND\n"})
+
+    assert sim.tick_until(lambda: sim.loop_issue(sid).get("status") == "merged", ticks=40), \
+        [(r.get("act"), r.get("outcome")) for r in sim.journal()]
+
+    # the fork really was a fork of the approver, under its own id
+    argv = _fork_argv(sim, num)
+    assert argv is not None, "the consult never ran"
+    assert argv[argv.index("--resume") + 1] == _APPROVER
+    assert "--fork-session" in argv
+    assert argv[argv.index("--session-id") + 1] != _APPROVER
+    # the answer went up marked as the approving session's, and the owner was never asked
+    consult_comments = [m for m in sim.mutations("comment")
+                        if m["body"].startswith("<!-- superlooper-consult -->")]
+    assert len(consult_comments) == 1 and "Use approach A" in consult_comments[0]["body"]
+    assert not [m for m in sim.mutations("comment")
+                if m["body"].startswith("<!-- superlooper-question -->")], \
+        "an answered question never reaches the owner"
+    assert not sim.notify_lines() or not any("needs an answer" in l for l in sim.notify_lines())
+    # nobody applied agent-ready — the relaunch rode the runner's own in-progress stamp
+    assert not [m for m in sim.mutations("set_labels") if "agent-ready" in str(m.get("add"))]
+    # the relaunched worker's Q&A names the approving session, and the cap counted the question
+    qa = sim.loop_issue(sid).get("qa_log") or []
+    assert qa and qa[-1].get("by") == "consult" and "approach A" in qa[-1]["answer"]
+    assert sim.loop_issue(sid).get("questions_asked") == 1
+    brief_text = open(os.path.join(sim.home, "briefs", "%s.md" % sid)).read()
+    assert "approving session" in brief_text and _APPROVER in brief_text
+    # the consult session was ended once it decided, and the outcome recorded once
+    assert [r for r in sim.journal("consult_outcome") if r.get("outcome_kind") == "answered"]
+    assert not os.path.exists(os.path.join(sim.home, "reports", "%s.md" % cid))
+
+
+def test_a_question_the_approving_session_escalates_reaches_the_owner_with_its_reasoning(
+        sim_factory):
+    sim = sim_factory()
+    num = sim.add_issue(title="Blocks on a real fork",
+                        scenario={"scenario": "blocked"})
+    sid, cid = "i%d" % num, "c%d" % num
+    _approved_by_a_stamped_session(sim, num)
+    sim.set_scenario(cid, {"scenario": "consult",
+                           "outcome": "OUTCOME: ESCALATE\nREASONING:\nNever discussed when the "
+                                      "work was shaped.\nRECOMMENDATION:\nTake A.\nEND\n"})
+
+    assert sim.tick_until(lambda: sim.loop_issue(sid).get("status") == "awaiting_answer",
+                          ticks=30), [(r.get("act"), r.get("outcome")) for r in sim.journal()]
+    (q,) = [m for m in sim.mutations("comment")
+            if m["body"].startswith("<!-- superlooper-question -->")]
+    assert "Never discussed when the work was shaped." in q["body"] and "Take A." in q["body"]
+    assert "awaiting-answer" in sim.issue(num)["labels"]
+    assert any("needs an answer" in l for l in sim.notify_lines())
+
+    # ...and from here it is today's flow: the owner answers, the worker resumes and merges
+    _owner_answers(sim, num, "Take A.")
+    assert sim.tick_until(lambda: sim.loop_issue(sid).get("status") == "merged", ticks=40), \
+        [(r.get("act"), r.get("outcome")) for r in sim.journal()]
+    assert (sim.loop_issue(sid).get("qa_log") or [{}])[-1].get("by") is None, \
+        "the owner's own answer is attributed to the owner"
+
+
+# =====================================================================================
 # investigate: marker comment + parent:-linked child; parent closed; child WAITS
 # =====================================================================================
 

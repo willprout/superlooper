@@ -347,6 +347,37 @@ def _questions(records, window_start):
     return lines, total
 
 
+def _consults(records, repo, window_start):
+    """Every approver consult that ENDED overnight (#538) — answered, escalated, or fell back — one
+    line each with a link to the issue. An answered consult is the one thing the loop decided on the
+    owner's behalf without asking him, so it is never left for him to discover; a fall-back says
+    why the approving session could not be asked. Read from the runner's `consult_outcome` records,
+    which are written once, when the result actually landed."""
+    lines = []
+    for r in sorted(records, key=lambda x: _ts(x) or 0):
+        if r.get("act") != "consult_outcome" or not _ok(r):
+            continue
+        ts = _ts(r)
+        if ts is not None and ts < window_start:
+            continue
+        num = _num(r.get("num"))
+        if num is None:
+            continue
+        link = _issue_link(repo, num)
+        kind = r.get("outcome_kind")
+        if kind == "answered":
+            lines.append(f"- #{num} — answered by its approving session; the worker was relaunched "
+                         f"with that answer, marked on the issue as not yours — {link}")
+        elif kind == "escalated":
+            lines.append(f"- #{num} — the approving session escalated the question to you, with "
+                         f"its reasoning and recommendation — {link}")
+        else:
+            why = r.get("sentence") if isinstance(r.get("sentence"), str) else r.get("reason")
+            lines.append(f"- #{num} — the question fell back to you: {why or 'reason unrecorded'}"
+                         f" — {link}")
+    return lines
+
+
 # The channel's proof is the newest text that reached the phone (issue #495). Past this age with none,
 # the report says so plainly: the channel is unproven, and a dead one would stay invisible until the
 # day there is work to page about.
@@ -1199,6 +1230,7 @@ def _facts(journal_records, gh_view, config):
         "wakes": _wakes(records, overnight_start),                     # nor is a sleep (#491)
         "resurrections": _resurrection(records, overnight_start),      # runner auto-restarts (#208)
         "questions": questions, "q_total": q_total,
+        "consults": _consults(records, repo, overnight_start),        # the approver consult (#538)
         "triage_lines": _triage(records, repo, overnight_start),       # the triage flight (#449)
         "holds": holds,
         "hold_alerts": _hold_alerts(holds, view, now),
@@ -1218,10 +1250,11 @@ def _facts(journal_records, gh_view, config):
 #     threshold it is a stall and rides `aged_hold`;
 #   * installed-engine drift — a standing nudge for the file, never the phone;
 #   * a routine green nightly and a watchdog countdown that launched nothing (already never news).
-NEWS_CLASSES = ("merge", "park", "bounce", "owner_question", "regeneration", "wander",
+NEWS_CLASSES = ("merge", "park", "bounce", "owner_question", "consult", "regeneration", "wander",
                 "unattended_debugger", "runner_resurrection", "triage", "queue_hold", "aged_hold")
 _NEWS_FACTS = (("merge", "merged"), ("park", "parked"), ("bounce", "bounces"),
-               ("owner_question", "questions"), ("regeneration", "regens_overnight"),
+               ("owner_question", "questions"), ("consult", "consults"),
+               ("regeneration", "regens_overnight"),
                ("wander", "wanders"), ("unattended_debugger", "watchdog"),
                ("runner_resurrection", "resurrections"), ("triage", "triage_lines"),
                ("queue_hold", "queue_hold"), ("aged_hold", "hold_alerts"))
@@ -1229,7 +1262,8 @@ _NEWS_FACTS = (("merge", "merged"), ("park", "parked"), ("bounce", "bounces"),
 
 # Why a quiet morning sent no text — the journaled reason on the skip record both morning-report entry
 # points write, so the journal says the push was withheld by rule, not lost.
-QUIET_SKIP_REASON = ("quiet report — no merge, park, bounce, owner question, regeneration, wander, "
+QUIET_SKIP_REASON = ("quiet report — no merge, park, bounce, owner question, approver consult, "
+                     "regeneration, wander, "
                      "unattended debugger, runner resurrection, triage verdict, queue hold or aged "
                      "hold since the last report (a waiting queue is not news); the file is written, "
                      "no text sent")
@@ -1253,6 +1287,7 @@ _HEADLINE_CLAUSES = (
     ("parked", lambda f: "%d parked" % len(f["parked"])),
     ("bounces", lambda f: "%d bounced" % len(f["bounces"])),
     ("questions", lambda f: "%d question(s)" % (f["q_total"] or len(f["questions"]))),
+    ("consults", lambda f: "%d consult(s)" % len(f["consults"])),
     ("hold_alerts", lambda f: "%d aged hold(s)" % len(f["hold_alerts"])),
     ("triage_lines", lambda f: "triage: %d merged, %d closed, %d escalated"
      % _triage_counts(f["records"], f["overnight_start"])),
@@ -1327,7 +1362,8 @@ def morning(journal_records, gh_view, ledger, config):
     # This `quiet` words the FILE's summary line and is unchanged by #495; whether a TEXT goes out is
     # morning_news's narrower question (no queue, no young freeze, tonight's regenerations only).
     quiet = not any((merged, parked, bounces, regens, wanders, watchdog, resurrections,
-                     questions, queue, frozen, hold_alerts, queue_hold, triage_lines))
+                     questions, f["consults"], queue, frozen, hold_alerts, queue_hold,
+                     triage_lines))
     summary = ("Nothing happened overnight — queue empty." if quiet else
                f"{len(merged)} merged · {len(parked)} parked/needs-owner · "
                f"{len(bounces)} bounce(s) · {len(regens)} regen(s) · "
@@ -1349,7 +1385,8 @@ def morning(journal_records, gh_view, ledger, config):
         # constants that only happen to be equal today, and a single hardcoded number would become a
         # lie the day they diverge. The alert lines below each state their own age.
         summary += f" **{len(hold_alerts)} standing hold/freeze past its age threshold — see below.**"
-    others = [(len(wanders), "wander(s)"), (len(watchdog), "unattended-debugger event(s)"),
+    others = [(len(f["consults"]), "approver consult(s)"),
+              (len(wanders), "wander(s)"), (len(watchdog), "unattended-debugger event(s)"),
               (len(resurrections), "runner-resurrection event(s)")]
     if any(n for n, _ in others):
         # News the tally above does not count (#495): a night whose only news is a runner
@@ -1382,6 +1419,9 @@ def morning(journal_records, gh_view, ledger, config):
         _section("Parked / needs-owner", parked),
         _section("Bounces", bounces),
         _section("Owner questions", questions, "None — no worker needed an owner decision."),
+        # SILENT on a night with no consult, like Triage below: a repo that never stamps approvals
+        # never consults, and a standing "None." here would be a section about nothing.
+        *([_section("Approver consults", f["consults"])] if f["consults"] else []),
         _section("Conflict regenerations (last 7 days)", regens),
         _section("Wanders", wanders),
         _section("Unattended debugger", wakes + countdowns + watchdog,

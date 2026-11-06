@@ -360,3 +360,28 @@ def test_an_agent_with_no_oracle_gets_none_rather_than_a_pretend_one(tmp_path):
     is None and the caller refuses the send."""
     assert delivery.for_lane(str(tmp_path), "i7", "hello", agent="codex",
                              env={"HOME": str(tmp_path)}) is None
+
+
+# --------------------------- #538: is the approving session's transcript on this machine? ---------
+
+def test_a_transcript_in_any_project_folder_is_found_by_id(tmp_path):
+    sid = "1c1e6ffb-0d84-4f0d-b3e0-ae10c5fa781c"
+    proj = tmp_path / ".claude" / "projects" / "-Users-w-Projects-superlooper"
+    proj.mkdir(parents=True)
+    (proj / ("%s.jsonl" % sid)).write_text("{}\n")
+    env = {"HOME": str(tmp_path)}
+    assert delivery.transcript_exists(sid, env=env) is True
+    assert delivery.transcript_exists("d1e1e1e1-0000-4000-8000-000000000000", env=env) is False
+
+
+@pytest.mark.parametrize("bad", ["", None, "../../etc/passwd", "a b", 7])
+def test_no_transcript_for_an_id_that_could_not_name_one(tmp_path, bad):
+    assert delivery.transcript_exists(bad, env={"HOME": str(tmp_path)}) is False
+
+
+def test_no_transcript_for_an_agent_this_module_cannot_read(tmp_path):
+    sid = "1c1e6ffb-0d84-4f0d-b3e0-ae10c5fa781c"
+    proj = tmp_path / ".claude" / "projects" / "p"
+    proj.mkdir(parents=True)
+    (proj / ("%s.jsonl" % sid)).write_text("{}\n")
+    assert delivery.transcript_exists(sid, env={"HOME": str(tmp_path)}, agent="codex") is False

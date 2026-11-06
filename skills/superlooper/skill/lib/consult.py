@@ -80,6 +80,7 @@ TIMEOUT_SECONDS = 20 * 60
 # --------------------------------------------------------------------------- the fallbacks
 
 NO_STAMP = "no_stamp"
+STAMP_UNREAD = "stamp_unread"
 OTHER_MACHINE = "other_machine"
 NO_TRANSCRIPT = "no_transcript"
 LAUNCH_FAILED = "launch_failed"
@@ -92,6 +93,9 @@ MALFORMED = "malformed_outcome"
 # cannot reach a reader as a bare token.
 FALLBACK_REASONS = {
     NO_STAMP: "the issue carries no approver stamp, so there is no approving session to consult",
+    # Never inferred as NO_STAMP (the #21 refused-is-not-empty discipline): GitHub refused the read,
+    # so nobody knows whether a stamp exists, and the question goes to the owner as it always did.
+    STAMP_UNREAD: "the approver stamp could not be read from GitHub just now",
     OTHER_MACHINE: "the approving session ran on another machine, and consults are same-machine "
                    "only",
     NO_TRANSCRIPT: "the approving session's transcript is not on this machine, so there is "
@@ -410,7 +414,7 @@ def escalation_note(outcome, approver_session, operator):
 
 
 __all__ = ["ID_RE", "PREFIX", "consult_id", "is_consult_id", "issue_id_of", "TIMEOUT_SECONDS",
-           "NO_STAMP", "OTHER_MACHINE", "NO_TRANSCRIPT", "LAUNCH_FAILED", "FORK_EXITED", "TIMEOUT",
+           "NO_STAMP", "STAMP_UNREAD", "OTHER_MACHINE", "NO_TRANSCRIPT", "LAUNCH_FAILED", "FORK_EXITED", "TIMEOUT",
            "MALFORMED", "FALLBACK_REASONS", "fallback_sentence", "same_machine",
            "ANSWER", "ESCALATE", "Outcome", "ABSENT", "INCOMPLETE", "UNREADABLE", "READ",
            "END_LINE", "parse_outcome", "outcome_format", "HISTORY_ACTS", "history_lines",

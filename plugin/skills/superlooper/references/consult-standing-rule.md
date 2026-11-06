@@ -76,7 +76,7 @@ Each of these sends the question to William exactly as it does today, with the r
   ceilings like any session: an over-ceiling or held machine waits rather than starting one.
 - Every consult outcome — answered, escalated or fell back — appears in the morning report with a
   link to the issue.
-- Each consult leaves a transcript of its own in the approving session's project folder, named
-  `superlooper c<N>` in `/resume`, so it can't be mistaken for the original conversation. The
-  original transcript is never modified (#536 measured this).
+- Each consult leaves a transcript of its own in the approving session's project folder. In
+  `/resume` it carries the consult's own session name (its `c<N>` id), so it can't be mistaken for
+  the original conversation. The original transcript is never modified (#536 measured this).
 - Questions only. Parks, bounces and frozen lanes are a later issue's.

@@ -1215,6 +1215,9 @@ _NEWS_TABLE = [
     ("a triage-flight verdict",
      [_rec(_OVERNIGHT, "triage_close", num=30, date="2026-07-02", verdict="overtaken",
            commit="abc1234", detail="overtaken", outcome="ok")], {}, ["triage"]),
+    ("a question its approving session answered (#538)",
+     [_rec(_OVERNIGHT, "consult_outcome", id="i13", num=13, outcome="ok",
+           outcome_kind="answered", answer="Take A.")], {}, ["consult"]),
     ("a launch-queue hold",
      [], {"queue_hold": {"reasons": ["auth_dead"], "since": _NEWS_NOW - 600}}, ["queue_hold"]),
     ("a hold past its age threshold",
@@ -1479,3 +1482,34 @@ def test_the_morning_headline_names_the_news_the_file_tallies():
     assert h.startswith("3 merged · 2 parked · 1 bounced · ") and "3 merged" in out
     assert "question" in h and "regen" in h and "wander" in h
     assert "queue" not in h                                   # a waiting queue is not news
+
+
+
+# --------------------------- #538: every consult outcome, with a link ---------------------------
+
+def test_every_consult_outcome_is_in_the_morning_report_with_a_link():
+    records = [_LAST_REPORT,
+               _rec(_OVERNIGHT, "consult_outcome", id="i13", num=13, outcome="ok",
+                    outcome_kind="answered", answer="Take A."),
+               _rec(_OVERNIGHT + 1, "consult_outcome", id="i14", num=14, outcome="ok",
+                    outcome_kind="escalated", reasoning="never discussed"),
+               _rec(_OVERNIGHT + 2, "consult_outcome", id="i15", num=15, outcome="ok",
+                    outcome_kind="fell_back", reason="no_stamp",
+                    sentence="the issue carries no approver stamp")]
+    out = report.morning(records, _view(now=_NEWS_NOW, queue=[], usage=None), ledger={},
+                         config=_cfg())
+    section = out.split("## Approver consults")[1].split("\n## ")[0]
+    assert "#13" in section and "answered by its approving session" in section
+    assert "#14" in section and "escalated" in section
+    assert "#15" in section and "fell back" in section and "no approver stamp" in section
+    for n in (13, 14, 15):
+        assert "https://github.com/%s/issues/%d" % (REPO, n) in section
+    assert "3 approver consult(s)" in out.splitlines()[2], "a consult night never reads as empty"
+    assert "consult" in report.morning_headline(records, _view(now=_NEWS_NOW, queue=[],
+                                                               usage=None), config=_cfg())
+
+
+def test_a_night_with_no_consult_renders_no_consult_section():
+    out = report.morning([_LAST_REPORT], _view(now=_NEWS_NOW, queue=[], usage=None), ledger={},
+                         config=_cfg())
+    assert "## Approver consults" not in out

@@ -746,3 +746,37 @@ def test_the_pointer_says_the_deny_will_catch_it(_sl_home):
     # broken tool, and retries instead of working around it.
     clause = _filing_clause(brief.build(_issue(), _cfg(_sl_home)))
     assert "refuse" in clause.lower() or "denie" in clause.lower() or "blocked" in clause.lower()
+
+
+# --------------------------- #538: an answer from the approving session ---------------------------
+
+_SESSION = "1c1e6ffb-0d84-4f0d-b3e0-ae10c5fa781c"
+
+
+def test_a_consult_answer_is_attributed_to_the_approving_session_never_the_owner(_sl_home):
+    qa = [{"question": "QUESTION: A or B?", "answer": "Take A.", "by": "consult",
+           "session": _SESSION}]
+    out = brief.build(_issue(), _cfg(_sl_home, operator="William"), qa=qa)
+    block = out.split("# Loop contract")[0]
+    assert "Take A." in block
+    assert "approving session" in block
+    assert _SESSION in block
+    assert "from William" not in block, "a consult's answer is never rendered as the owner's"
+    assert _QA_HEADER not in block, "the header must not claim the owner answered"
+    assert "not William's own word" in block
+
+
+def test_mixed_answers_each_name_who_gave_them(_sl_home):
+    qa = [{"question": "first?", "answer": "do X"},
+          {"question": "second?", "answer": "do Y", "by": "consult", "session": _SESSION}]
+    out = brief.build(_issue(), _cfg(_sl_home, operator="William"), qa=qa).split("# Loop contract")[0]
+    first, second = out.split("**Q2")
+    assert "(from William)" in first
+    assert "approving session" in second and "(from William)" not in second
+
+
+def test_an_owner_only_trail_renders_exactly_as_before(_sl_home):
+    """The pre-#538 render is unchanged for a trail the owner answered alone."""
+    qa = [{"question": "q?", "answer": "yes"}]
+    out = brief.build(_issue(), _cfg(_sl_home, operator="William"), qa=qa)
+    assert _QA_HEADER in out and "A1 (from William):**" in out
