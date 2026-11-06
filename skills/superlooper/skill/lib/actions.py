@@ -1115,7 +1115,7 @@ def _since_ok(since, now):
     return _real(since) and 0 <= since <= now
 
 
-def _in_owner_handback_episode(ist, blocked_text):
+def _in_owner_handback_episode(ist, blocked_text, now=None):
     """True iff the issue is in an owner-handback episode — a park, a bounce, OR a durable question
     (#163) that is handing the issue back to the owner (issue #108). Either it has already SETTLED
     into an owner-decision status (parked / needs_william / bounced / awaiting_answer), or it is
@@ -1139,6 +1139,10 @@ def _in_owner_handback_episode(ist, blocked_text):
     # (#539) ...and so does a handback the approving session is considering: the loop is handing the
     # issue back (the consult only decides HOW), so an owner who closes it meanwhile has dropped it.
     if _handback_pending(ist):
+        return True
+    # ...and one its approving session chose to WAIT on, while the wait holds (fresh review): a
+    # close during the hold is the owner dropping it, never a handback re-derived on a closed issue.
+    if now is not None and _handback_waiting(ist, now):
         return True
     if isinstance(blocked_text, str) and blocked_text.lstrip().startswith("BOUNCED:"):
         return True
@@ -2157,6 +2161,8 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
             notify(_notify.WAITING, f"{iid} {who}", HANDBACK_ASK, "park", num=num)
         out.append(act)
 
+    hb_started = set()          # issues a handback consult was started for THIS tick (#539)
+
     def handback_route(iid, num, kind, key, handback):
         """THE door every issue-level handback passes (#539): a park whatever its cause, a bounce, a
         frozen lane, a lane at a dialog, a lane the host reports blocked. Owner ruling 2026-11-04:
@@ -2168,14 +2174,16 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
         lane handback (it has no act of its own) answers with its one `handback_escalate`.
 
         A view with no check for the issue is today exactly. One consult per issue at a time, and a
-        worker's question consult (#538) owns its issue outright. The cap counts every consult the
-        issue's approving session was asked in this approval episode: the cap-th handback goes to the
-        owner regardless, with the consult history attached. A consult that cannot START now (a usage
+        worker's question consult (#538) owns its issue outright. The cap counts the HANDBACK
+        consults since the owner's last approval (a worker's questions keep their own two-question
+        cap): the cap-th handback goes to the owner regardless, with the consult history attached. A consult that cannot START now (a usage
         ceiling, a launch hold) is not waited for: a handback is already a safe state the owner can
         act on, so it reaches him as today, saying why."""
         ist = ist_of(iid)
         if _status_of(ist) == "consulting":
             return (None, False)
+        if iid in hb_started:
+            return _HB_TAKEN                  # one consult per issue per tick (fresh review P2)
         rec = _handback_rec(ist)
         if rec is not None and rec.get("state") in HANDBACK_PENDING_STATES:
             return _HB_TAKEN
@@ -2198,8 +2206,12 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
         count, corrupt = _counter(ist, "handback_consults")
         cap = consult_mod.handback_cap(cfg)
         if corrupt or count + 1 >= cap:
-            return (dict(base, outcome="fell_back", reason=consult_mod.HANDBACK_CAP,
-                         consults=None if corrupt else count, cap=cap), True)
+            # With consults on record the owner gets this one regardless, WITH their history (a
+            # note, and a lane's one escalation). With none — a cap of 0 or 1 — there is no history
+            # to attach: it is today's handback, nothing added (fresh review).
+            via = dict(base, outcome="fell_back", reason=consult_mod.HANDBACK_CAP,
+                       consults=None if corrupt else count, cap=cap)
+            return (via, consult_mod.note_posts(via))
         held = _consult_hold_reason(scheduler.usage_ok(usage_sched), launches_held)
         if held is not None:
             return (dict(base, outcome="fell_back", reason=consult_mod.HELD_NOW, detail=held),
@@ -2207,6 +2219,7 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
         out.append({"act": "handback_consult", "id": iid, "num": num, "kind": kind, "key": key,
                     "handback": dict(handback), "number": count + 1, "cap": cap,
                     "stamp": {k: check.get(k) for k in ("session", "host", "cwd")}})
+        hb_started.add(iid)
         return _HB_TAKEN
 
     def emit_bounce(iid, num, memo, via=None):
@@ -2248,8 +2261,16 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
         out.append({"act": "handback_escalate", "id": iid, "num": num, "kind": kind,
                     "key": via.get("key"), "consult": via})
 
-    def lane_handback(iid, kind, since, memo):
-        """A lane handback's door, for the ALERT reasons below: True when today's reason stands."""
+    def lane_handback(iid, kind, since, memo, reason):
+        """A lane handback's door, for the ALERT reasons below: True when today's reason stands.
+
+        A reason ALREADY standing on the durable ALERT is the owner's (fresh review P2): it paged
+        when a consult could not start, or before #539 shipped. Pulling it back into a consult now
+        would drop the reason and page a recovery that never happened, then a second 🔴 on the
+        escalation — so it stays his, exactly as today."""
+        if (reason in prev_alert_reasons and not _handback_pending(ist_of(iid))
+                and not _handback_waiting(ist_of(iid), now)):
+            return True
         num_ = _iid_num(iid)
         route = handback_route(iid, num_, kind, consult_mod.handback_key(kind, since),
                                {"memo": memo, "since": since})
@@ -2289,13 +2310,17 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
         if state == "escalated":
             via = rec.get("via") if isinstance(rec.get("via"), dict) else {"outcome": "escalated"}
             return handback_deliver(iid, num, rec, via)
-        hb = rec.get("handback") if isinstance(rec.get("handback"), dict) else {}
+        hb = rec.get("handback") if isinstance(rec.get("handback"), dict) else None
         read, outcome, refused = consult_mod.parse_handback_outcome(consult_outcomes.get(iid))
         if read == consult_mod.READ:
-            if outcome.move == consult_mod.ESCALATE:
+            if outcome.move == consult_mod.ESCALATE or hb is None:
+                # A record whose handback cannot be read cannot say whether it was a bright-line
+                # park: fail closed — the owner gets it, the fork's move as its recommendation.
+                rec_text = outcome.recommendation if outcome.move == consult_mod.ESCALATE else \
+                    consult_mod.MOVE_SENTENCES.get(outcome.move, outcome.move)
                 return handback_deliver(iid, num, rec, {
                     "outcome": "escalated", "reasoning": outcome.reasoning,
-                    "recommendation": outcome.recommendation})
+                    "recommendation": rec_text})
             if hb.get("bright_line"):
                 proposal = consult_mod.MOVE_SENTENCES.get(outcome.move, outcome.move)
                 if outcome.clarification:
@@ -2711,7 +2736,7 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                 and lane_handback(iid, consult_mod.AT_DIALOG, ist_of(iid)["sensed_since"],
                                   f"{iid}'s session has sat at its own in-window dialog for "
                                   f"{AT_DIALOG_ALERT_SECONDS // 60}+ minutes, waiting on an answer "
-                                  "nobody is there to give")):
+                                  "nobody is there to give", f"session_at_dialog:{iid}")):
             reasons.append(f"session_at_dialog:{iid}")
         # A session the HOST has reported `blocked` — waiting on a person — past the same bound
         # (issue #520). The at_dialog reasoning holds word for word: never parked, so it must speak,
@@ -2734,7 +2759,8 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                 and lane_handback(iid, consult_mod.HOST_BLOCKED, hb["sensed_since"],
                                   f"the session host has reported {iid} blocked on a person — a "
                                   f"dialog or prompt nobody is watching — for "
-                                  f"{AT_DIALOG_ALERT_SECONDS // 60}+ minutes")):
+                                  f"{AT_DIALOG_ALERT_SECONDS // 60}+ minutes",
+                                  f"session_host_blocked:{iid}")):
             reasons.append(f"session_host_blocked:{iid}")
         # A hand-back (park #61, OR bounce #108 — both reuse this marker) whose label move keeps
         # failing past the bound: the marker is stamped and the silent retries have run long enough
@@ -3070,15 +3096,21 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
         # the terminal-status block AND the bounce/park re-derivations below, so it wins over every
         # retry the stuck label would otherwise keep firing.
         if (not gh_stale and _iid_num(iid) in closed_nums
-                and _in_owner_handback_episode(ist, blocked.get(iid))):
+                and _in_owner_handback_episode(ist, blocked.get(iid), now)):
             out.append({"act": "absorb_close", "id": iid, "num": _iid_num(iid)})
             continue
         # ---- a handback consult pending (#539): the approving session is considering a park, a
         #      bounce, a freeze, a dialog or a host block on this issue. The issue is PAUSED — no
         #      other path below acts on it — until the fork's one outcome file (or its absence, past
         #      the bound) settles it. Its status is untouched, so its lane and territory hold. ----
+        if iid in hb_started:
+            continue                                   # a consult started for it this tick (A)
         hb_rec = _handback_rec(ist)
-        if hb_rec is not None and hb_rec.get("state") in HANDBACK_PENDING_STATES:
+        # A TERMINAL issue is never the overlay's (fresh review P1): the owner closed it mid-consult
+        # (absorb_close settles it `merged` and drops the record), and nothing may be handed back on
+        # an issue the owner already dropped — not even when the consult's bound runs out.
+        if (hb_rec is not None and hb_rec.get("state") in HANDBACK_PENDING_STATES
+                and status not in TERMINAL_STATUSES):
             handback_overlay(iid, _iid_num(iid), hb_rec)
             continue
         if status in TERMINAL_STATUSES:
@@ -4216,6 +4248,7 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                     # (#539) an issue whose handback its approving session is considering — or is
                     # holding with a WAIT — is the consult's, never a fresh launch.
                     or _handback_pending(ist) or _handback_waiting(ist, now)
+                    or iid in hb_started
                     or _status_of(ist) not in RELAUNCHABLE_STATUSES   # wrong-typed status: never launch (#95)
                     or (at_cap and not ignore_launch_cap)):
                 continue

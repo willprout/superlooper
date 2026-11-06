@@ -495,3 +495,69 @@ def test_a_relaunched_issue_launches_on_the_runners_own_stamp():
     out = decide(parsed_issues=[parsed(5, labels=_IN_FLIGHT)], dsk=dsk)
     (l,) = _mine(out, "launch")
     assert l["num"] == 5
+
+
+# ============================== fresh-review round 1 (P1/P2) ==============================
+
+def test_a_consult_on_an_issue_the_owner_closed_never_hands_anything_back():
+    """P1: absorb_close settles the issue `merged`; a consult record left pending must never
+    deliver a park/bounce on the closed issue when its bound runs out."""
+    for at in (NOW, NOW + consult_mod.TIMEOUT_SECONDS + 5):
+        kw = _running(status="merged")
+        out = decide(now=at, gh_view=ghv(closed_nums={5}), **kw)
+        assert only(out, "park") == [] and only(out, "bounce") == [], at
+        assert not [n for n in only(out, "notify") if "i5" in n.get("headline", "")], at
+
+
+def test_two_handbacks_in_one_tick_start_one_consult():
+    """P2: a lane at its dialog (Section A) that also wrote a BOUNCED: memo (Section D)."""
+    kw = _at_dialog()
+    kw["dsk"]["blocked"] = {"i5": "BOUNCED: gone"}
+    out = decide(**kw)
+    assert len(only(out, "handback_consult")) == 1
+    assert _mine(out, "recover") == [] and _mine(out, "bounce") == []
+
+
+def test_a_dialog_alert_already_standing_stays_the_owners():
+    """P2: a dialog alert that already paged (a consult that could not start, or one standing
+    before #539 shipped) is not pulled back into a consult — that would page a false recovery."""
+    kw = _at_dialog()
+    kw["dsk"]["alert"] = {"reasons": ["session_at_dialog:i5"], "since": NOW - 100,
+                          "paged": ["session_at_dialog:i5"],
+                          "delivered": ["session_at_dialog:i5"]}
+    out = decide(**kw)
+    assert only(out, "handback_consult") == []
+    # the standing ALERT is unchanged — no re-raise, and above all no false recovery
+    assert only(out, "clear_alert") == []
+    assert all("session_at_dialog:i5" in a["reasons"] for a in only(out, "alert"))
+    assert not [n for n in only(out, "notify") if n.get("tier") == "recovered"]
+
+
+def test_an_owner_close_during_a_wait_is_absorbed():
+    key = consult_mod.handback_key(consult_mod.PARK, "frozen_cap")
+    hold = {"key": key, "kind": consult_mod.PARK, "state": "waiting", "until": NOW + 600}
+    out = decide(gh_view=ghv(closed_nums={5}), **_frozen_at_cap(handback=hold))
+    assert len(_mine(out, "absorb_close")) == 1
+    assert only(out, "handback_consult") == []
+
+
+def test_a_cap_with_no_consult_on_record_is_todays_handback_with_nothing_added():
+    """P3: `handback_cap` 0 or 1 means straight to the owner — today's, not a cap note and not a
+    page a frozen lane never sent."""
+    c = cfg(session={"idle_seconds": 480, "freeze_seconds": 2700, "retry_cap": 2,
+                     "conflict_cap": 2, "handback_cap": 1})
+    out = decide(config=c, **_frozen_lane())
+    assert only(out, "handback_consult") == [] and only(out, "handback_escalate") == []
+    assert not has_notify(out) and len(_mine(out, "recover")) == 1
+    (p,) = only(decide(config=c, **_frozen_at_cap()), "park")
+    assert not consult_mod.note_posts(p["consult"])
+
+
+def test_a_park_record_that_cannot_be_read_escalates_rather_than_moves():
+    """P3: a corrupt handback payload loses its bright-line flag — fail closed to the owner."""
+    kw = _running(outcome=_outcome("MOVE: RELAUNCH", "REASONING:", "r"),
+                  rec={"handback": "garbage"})
+    out = decide(**kw)
+    assert only(out, "handback_move") == []
+    (p,) = only(out, "park")
+    assert p["consult"]["outcome"] == "escalated"

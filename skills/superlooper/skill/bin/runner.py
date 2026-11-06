@@ -3813,7 +3813,7 @@ class Runner:
                                  "queue_invalid_since": None, "relaunch_held": False,
                                  "launch_hold_generation": None, "wildcard_hold_generation": None,
                                  "queue_invalid_generation": None})
-        if self._issue_field(iid, "consult_resume") and not canary:
+        if self._issue_field(iid, "consult_resume"):
             # (#539) A consult chose to RESUME the interrupted session: re-enter its conversation
             # through the existing verb, lane-bound like any launch (phase E admitted it).
             return self._exec_consult_resume(iid, num, now)
@@ -4331,6 +4331,7 @@ class Runner:
 
         def settle(st, i):
             i["handback"] = rec
+            i["handback_move_posted"] = False          # this consult's move is announced afresh
             prev = i.get("handback_consults")
             i["handback_consults"] = (prev if type(prev) is int and prev >= 0 else 0) + 1
         self._update_issue(iid, fn=settle)
@@ -4452,7 +4453,12 @@ class Runner:
         body = a.get("body") if isinstance(a.get("body"), str) else ""
         touches = self._issue_field(iid, "declared_touches")
         fu = rec.get("follow_up")
-        if type(fu) is not int:
+        if type(fu) is not int and not rec.get("follow_up_attempted"):
+            # Stamped BEFORE the create (fresh review): a crash between gh's create and the settle
+            # below must never file the follow-up twice. An attempt whose result was lost goes to
+            # the owner carrying the proposal, which he can see against the issue list.
+            rec = dict(rec, follow_up_attempted=True)
+            self._update_issue(iid, fn=lambda st, i: i.__setitem__("handback", rec))
             fu = gh.create_issue(title, consult_mod.follow_up_body(body, num, rec.get("session"),
                                                                    touches),
                                  consult_mod.follow_up_labels(a.get("issue_type")))
@@ -4526,7 +4532,11 @@ class Runner:
                 "--operator", "a consult of the issue's approving session"]
         note = self._issue_field(iid, "consult_resume_note")
         if isinstance(note, str) and note.strip():
-            argv += ["--note", note]
+            # The verb renders --note as a new instruction; say whose it is, so the revived
+            # session never reads the approving session's judgment as the owner's own word.
+            argv += ["--note", "(From a consult of this issue's approving session — its "
+                               "judgment of what the owner wants, not the owner's own word.) "
+                     + note.strip()]
         rc = self._run_script(argv, env=self._script_env("", ""), timeout=LAUNCH_TIMEOUT)
         if rc == 0:
             gh.set_labels(num, add=["in-progress"], remove=["agent-ready"])
@@ -4617,6 +4627,13 @@ class Runner:
                 and hb.get("state") in actions.HANDBACK_PENDING_STATES:
             self._end_consult(hb["id"])
         def settle(st, i):
+            # (#539, fresh review P1) The consult is DROPPED with the issue — never left pending,
+            # where its bound would one day run out and hand a park back on a closed issue — and a
+            # WAIT it chose ends with it.
+            rec = i.get("handback")
+            if isinstance(rec, dict) and (rec.get("state") in actions.HANDBACK_PENDING_STATES
+                                          or rec.get("state") == "waiting"):
+                i["handback"] = dict(rec, state="dropped")
             i.update({"status": "merged", "park_notify_cause": None, "park_notify_at": None,
                       "park_landed_cause": None,       # the pair (#169)
                       "park_comment_posted": False})
@@ -4986,7 +5003,12 @@ class Runner:
                       # `nudged_at` stamp would make the gate park INSTANTLY at the first gate hiccup,
                       # zero grace (defect b). An owner re-approval is a fresh chance, so clear both;
                       # the gate nudges anew and the worker gets its full compliance window.
-                      "nudged": [], "nudged_at": {}})
+                      "nudged": [], "nudged_at": {},
+                      # (#539) The owner's re-approval ends the handback episode: the consult
+                      # record is that episode's, and the handback cap bounds how often the loop
+                      # consults WITHOUT him — he has just acted, so it counts from zero. Not an
+                      # attempt counter, so the continuation rule above does not keep it.
+                      "handback": None, "handback_consults": 0})
         self._update_issue(iid, fn=resume)
         journal.append(self.home, {"act": "resume_at_gate", "id": iid}, now)
         # Re-claim the lane: in-progress (the loop is driving it to merge) replaces the owner's

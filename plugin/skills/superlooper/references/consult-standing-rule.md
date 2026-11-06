@@ -124,10 +124,11 @@ journaled:
 - The two-question cap per issue holds whoever answered: a consult's answer counts as one of the
   two, and a third question parks the issue for William as a scoping problem.
 - **The handback cap.** A third handback on the same issue goes to William regardless, with the
-  consult history attached. The count includes every consult the issue's approving session was
-  asked since the issue's approval: questions, parks, bounces, freezes and dialogs alike. Three is
-  the default. William changes it with `session.handback_cap` in the repo's config; `0` or `1`
-  sends every handback straight to him. A fresh approval starts the count again.
+  consult history attached. It counts the handback consults since the issue's approval: parks,
+  bounces, freezes, dialogs and host blocks. A worker's questions keep their own two-question cap.
+  Three is the default. William changes it with `session.handback_cap` in the repo's config; `0` or
+  `1` sends every handback straight to him, exactly as today. His re-approval starts the count
+  again, whether it rebuilds the issue or resumes a finished build at the gate.
 - A consult holds no build lane, so it never takes one from queued work. While it considers a
   handback, the issue's status is untouched: a frozen lane keeps its lane and a gating issue its
   territory, and nothing else acts on the issue until the fork decides. A consult counts toward the

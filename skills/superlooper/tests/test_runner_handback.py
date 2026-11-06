@@ -249,7 +249,7 @@ def test_a_resume_is_launched_through_superlooper_resume_unattended(rig):
     (call,) = [c for c in rig.calls if "resume" in c["args"]]
     assert call["args"][0].endswith("/superlooper") and call["args"][1] == "resume"
     assert "i5" in call["args"] and "--unattended" in call["args"]
-    assert call["args"][call["args"].index("--note") + 1] == "Finish the review step."
+    assert call["args"][call["args"].index("--note") + 1].endswith("Finish the review step.")
     assert call["args"][call["args"].index("--repo") + 1] == str(rig.repo)
     st = issue_state(rig, "i5")
     assert st["status"] == "running"
@@ -440,3 +440,55 @@ def test_a_freeze_stamps_when_its_episode_began(rig):
     assert issue_state(rig, "i5")["frozen_since"] == NOW
     rig.r._execute({"act": "recover", "id": "i5", "tier": "frozen"}, NOW + 700)
     assert issue_state(rig, "i5")["frozen_since"] == NOW, "one freeze, one episode"
+
+
+# ============================== fresh-review round 1 ==============================
+
+def test_an_owner_close_mid_consult_drops_the_consult_record(rig):
+    _pending(rig)
+    rig.r._execute({"act": "absorb_close", "id": "i5", "num": 5}, NOW)
+    assert issue_state(rig, "i5")["handback"]["state"] == "dropped"
+
+
+def test_a_re_approval_that_resumes_at_the_gate_is_a_fresh_handback_episode(rig):
+    _pending(rig, status="parked")
+    seed_issue(rig, "i5", handback={"key": _KEY, "state": "delivered"}, handback_consults=2)
+    rig.r._execute({"act": "resume_at_gate", "id": "i5", "num": 5}, NOW)
+    st = issue_state(rig, "i5")
+    assert st["handback"] is None and st["handback_consults"] == 0
+
+
+def test_the_resume_note_is_never_rendered_as_the_owners_instruction(rig):
+    seed_issue(rig, "i5", status="ready", consult_relaunch=True, consult_resume=True,
+               consult_resume_note="Finish the review step.", branch="sl/i5-x")
+    _launchable(rig)
+    rig.r._execute({"act": "launch", "id": "i5", "num": 5, "branch": "sl/i5-x"}, NOW)
+    (call,) = [c for c in rig.calls if "resume" in c["args"]]
+    note = call["args"][call["args"].index("--note") + 1]
+    assert note.endswith("Finish the review step.")
+    assert "approving session" in note and "not" in note.lower()
+
+
+def test_a_canary_launch_still_resumes(rig):
+    seed_issue(rig, "i5", status="ready", consult_relaunch=True, consult_resume=True,
+               branch="sl/i5-x")
+    _launchable(rig)
+    rig.r._execute({"act": "launch", "id": "i5", "num": 5, "branch": "sl/i5-x", "canary": True},
+                   NOW)
+    assert [c for c in rig.calls if "resume" in c["args"]]
+    assert not issue_state(rig, "i5")["consult_resume"]
+
+
+def test_a_follow_up_is_never_filed_twice(rig):
+    _pending(rig)
+    seed_issue(rig, "i5", handback={**issue_state(rig, "i5")["handback"],
+                                    "follow_up_attempted": True})
+    _move(rig, consult_mod.FOLLOW_UP, title="T", body="B", issue_type="type:build")
+    assert [m for m in mutations(rig) if m["kind"] == "create_issue"] == []
+    assert issue_state(rig, "i5")["handback"]["state"] == "escalated"
+
+
+def test_a_new_consult_announces_its_own_move(rig):
+    seed_issue(rig, "i5", status="running", handback_move_posted=True)
+    _start(rig)
+    assert issue_state(rig, "i5")["handback_move_posted"] is False

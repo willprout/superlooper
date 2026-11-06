@@ -123,8 +123,9 @@ _NESTED_DEFAULTS = {
     # 10800 (3h) clears any real CI run; a huge value effectively disables the bound.
     # handback_cap (issue #539): the handback a consult of the issue's approving session no longer
     # sees. Every park, bounce, freeze, dialog or host block on an issue goes to that session first;
-    # the cap-th one (counting every consult in the approval episode) goes to the owner regardless,
-    # with the consult history attached. 0 or 1 sends every handback straight to the owner.
+    # the cap-th one (counting the handback consults since the owner's approval; a worker's questions
+    # keep their own two-question cap) goes to the owner regardless, with the consult history
+    # attached. 0 or 1 sends every handback straight to the owner, exactly as before.
     "session": {"idle_seconds": 480, "freeze_seconds": 2700, "retry_cap": 2, "conflict_cap": 2,
                 "checks_pending_cap": 10800, "handback_cap": 3},
     "qa": {"nightly_cmd": None, "results_glob": None, "retry_once": True,

@@ -500,7 +500,9 @@ NEVER_MOVES = ("a hand-merge", "a force-push", "applying `agent-ready`", "a `pre
 WAIT_MAX_MINUTES = 120
 
 # A third handback on the same issue goes to the owner regardless (#539 DoD); config
-# `session.handback_cap` changes it. 0 or 1 sends every handback straight to the owner.
+# `session.handback_cap` changes it. It counts the handback consults since the owner's approval —
+# a worker's questions keep their own two-question cap (#163). 0 or 1 sends every handback straight
+# to the owner, exactly as today.
 HANDBACK_CAP_DEFAULT = 3
 
 HELD_NOW = "consult_held_now"
@@ -737,8 +739,11 @@ _NOTE_REASONS = (REFUSED_MOVE, HANDBACK_CAP)
 
 
 def note_posts(via):
-    """Does this delivery post a consult note on the issue?"""
+    """Does this delivery post a consult note on the issue? The cap posts one only with consults
+    on record to attach — a cap of 0 or 1 reached with none is today's handback, nothing added."""
     if not isinstance(via, dict):
+        return False
+    if via.get("reason") == HANDBACK_CAP and via.get("consults") == 0:
         return False
     return via.get("outcome") == "escalated" or via.get("reason") in _NOTE_REASONS
 
