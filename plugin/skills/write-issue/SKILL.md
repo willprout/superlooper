@@ -86,6 +86,8 @@ doing its job. Apply the ONE value that names **your own session kind**:
   apply it by hand.
 - **`source:dashboard-flag`** — the command center's Flag button. Applied by the dashboard; never
   by hand.
+- **`source:consult`** — a follow-up the runner filed when a consult of an issue's approving
+  session chose FOLLOW_UP for a handback (#539). The runner stamps this; never apply it by hand.
 
 The engine's label registry (`skills/superlooper/skill/lib/labels.py`) is the truth for the set, and
 `superlooper adopt` creates it on a repo. The family is **open**, like `model:`: an adopter registers

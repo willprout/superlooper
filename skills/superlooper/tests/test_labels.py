@@ -135,8 +135,12 @@ def test_source_consult_is_runner_managed_and_is_what_the_consult_files_with():
     assert consult.FOLLOW_UP_SOURCE == "source:consult"
     assert {"kind": "create", "name": "source:consult"} in labels.label_migration_plan(
         [n for n, _c, _d in labels.LABELS if n != "source:consult"])
-    for name in consult.follow_up_labels("type:build"):
-        assert labels.label_spec(name) is not None, name
+    for t in (*consult.FOLLOW_UP_TYPES, "type:fix", "", None, "agent-ready"):
+        names = consult.follow_up_labels(t)
+        for name in names:
+            assert labels.label_spec(name) is not None, (t, name)
+        assert "agent-ready" not in names and not any(n.startswith("pre-authorized:")
+                                                       for n in names)
 
 
 def test_runner_managed_subset_is_the_tagged_set():

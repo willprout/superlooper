@@ -162,6 +162,12 @@ _UNREADABLE = {
         "here at all. The plan can only ever compute `type:<kind>` for kind in issues.VALID_TYPES "
         "(lib/janitor.py builds it from queue_lint's type choices) — pinned by "
         "test_every_type_label_the_janitor_can_compute_is_registered below."),
+    (_ENGINE + "/bin/runner.py", "consult_mod.follow_up_labels(a.get('issue_type'))"): (1,
+        "The handback consult's FOLLOW_UP (#539) files its issue with consult.follow_up_labels(), a "
+        "fixed shape: `needs-owner`, one of consult.FOLLOW_UP_TYPES, and consult.FOLLOW_UP_SOURCE — "
+        "whatever type the fork wrote is clamped to that tuple, and agent-ready / pre-authorized: "
+        "can never appear. Every name it can return is pinned to LABELS by "
+        "test_labels.test_source_consult_is_runner_managed_and_is_what_the_consult_files_with."),
     (_ENGINE + "/bin/superlooper", "handback_to_clear"): (1,
         "`superlooper approve` (#537) removes only the hand-back labels the issue actually CARRIES "
         "— a computed subset, because `gh issue edit` hard-fails the whole edit (the agent-ready "
