@@ -9177,3 +9177,29 @@ def test_a_runner_restarted_mid_consult_picks_the_consult_back_up(rig):
     reborn.tick(NOW + 30)
     st = issue_state(rig, "i5")
     assert st["status"] in ("ready", "running") and st["qa_log"][-1]["by"] == "consult"
+
+
+
+# ---- review round 2 (#538) ----
+
+def test_a_held_fallback_clears_its_hold_record(rig):
+    _blocked_worker(rig, consult_held={"question": _Q, "reason": "usage", "since": NOW - 9999,
+                                       "stamp": {"session": _SESSION}})
+    rig.r._execute({"act": "post_question", "id": "i5", "num": 5, "question": _Q,
+                    "consult": {"outcome": "fell_back", "reason": consult_mod.HELD}}, NOW)
+    assert issue_state(rig, "i5").get("consult_held") is None
+
+
+def test_an_answer_is_journaled_before_the_consult_is_ended(rig):
+    _consulting(rig)
+    seen = {}
+    real_end = rig.r._end_consult
+
+    def end(cid):
+        seen["journaled"] = any(r.get("act") == "consult_outcome"
+                                for r in journal.read(str(rig.home)))
+        real_end(cid)
+    rig.r._end_consult = end
+    rig.r._execute({"act": "consult_answer", "id": "i5", "num": 5, "answer": "Take A.",
+                    "reasoning": ""}, NOW)
+    assert seen["journaled"] is True

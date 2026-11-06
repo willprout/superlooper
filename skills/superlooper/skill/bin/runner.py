@@ -3879,6 +3879,7 @@ class Runner:
         def settle(st, i):
             if isinstance(i.get("consult"), dict) and info is not None:
                 i["consult"] = dict(i["consult"], state=info.get("outcome"))
+            i["consult_held"] = None                   # a hold's clock and stamp end with it
             i["status"] = "awaiting_answer"
             i["pending_question"] = question
             # The question's post time (ISO-8601 UTC), so answer ingestion only trusts an answer
@@ -4133,14 +4134,14 @@ class Runner:
         self._update_issue(iid, fn=settle)
         _rm(os.path.join(self.state, "blocked", iid))
         _rm(os.path.join(self.state, "exited", iid))
-        # LAST, after the settle: consuming the outcome file before it would let a crash in between
-        # leave a `consulting` issue with no outcome, whose timeout then pages the owner for a
-        # question already answered and posted (fresh review).
-        if cid:
-            self._end_consult(cid)
         self._journal_consult(iid, num, {"outcome": "answered", "answer": answer,
                                          "reasoning": outcome.reasoning,
                                          "session": rec.get("session")}, now)
+        # LAST, after the settle and the journal: consuming the outcome file before them would let
+        # a crash in between leave a `consulting` issue with no outcome, whose timeout then pages
+        # the owner for a question already answered — or drop the answer from the morning report.
+        if cid:
+            self._end_consult(cid)
         return "ok"
 
     # --- bounce / park / labels ---

@@ -1524,3 +1524,22 @@ def test_review_round_1_consult_write_verbs_are_denied(command):
 ])
 def test_review_round_1_consult_reads_stay_allowed(command):
     assert wp.run(_cbash(command), CONSULT_ENV) is None, command
+
+
+@pytest.mark.parametrize("command", [
+    "echo 'mutation{addLabelsToLabelable(input:{}){clientMutationId}}' | gh api graphql -F query=@-",
+    "gh api graphql -F query=@- <<< 'mutation { x }'",
+    "gh api graphql -F query=@q.graphql",
+    "gh api graphql --input body.json",
+    "git branch -Df sl/x", "git checkout-index -a -f", "git symbolic-ref HEAD refs/heads/x",
+    "git remote set-url origin x", "git reflog expire --all", "gh project item-edit --id x",
+    "gh gist create notes.md",
+])
+def test_review_round_2_consult_write_paths_are_denied(command):
+    assert wp.run(_cbash(command), CONSULT_ENV) is not None, command
+
+
+@pytest.mark.parametrize("command", ["git remote -v", "git reflog -5", "git symbolic-ref HEAD",
+                                     "git config user.email"])
+def test_review_round_2_consult_reads_stay_allowed(command):
+    assert wp.run(_cbash(command), CONSULT_ENV) is None, command

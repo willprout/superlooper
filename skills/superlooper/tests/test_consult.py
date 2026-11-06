@@ -242,3 +242,13 @@ def test_the_standing_rule_exists_beside_the_triage_rule_and_the_brief_points_at
     for must in ("approving session", "Same machine only", "ESCALATE", "agent-ready",
                  "Goal", "Definition of done", "Boundaries", "no approver stamp"):
         assert must in rule, must
+
+
+
+def test_a_comment_that_mentions_a_placeholder_reaches_the_consult_verbatim():
+    """Review round 2: only the refused-read note names the issue number; an owner comment that
+    happens to say `<N>` is the owner's text and is never rewritten."""
+    text = _packet(comments=[{"author": {"login": "o"}, "body": "Use the d<N> token, not c<N>."}])
+    assert "Use the d<N> token, not c<N>." in text
+    refused = _packet(comments_ok=False)
+    assert "gh issue view 5 --comments" in refused

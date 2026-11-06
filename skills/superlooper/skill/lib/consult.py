@@ -341,15 +341,15 @@ def _sub(template, mapping):
                   template)
 
 
-def _comment_block(comments, owner, operator, ok=True):
+def _comment_block(comments, owner, operator, ok=True, num=None):
     """The issue's comment thread, every author, VERBATIM — context for the consult, attributed so
     it can tell the owner's word from the loop's own machine comments. A thread GitHub REFUSED to
     serve is said to be unread, never rendered as "no comments": an owner amendment the consult
     never saw would otherwise read as one that does not exist."""
     if not ok:
         return ("_The comment thread could not be read from GitHub when this packet was built — "
-                "read it yourself (`gh issue view <N> --comments`) before you decide: it may carry "
-                "the owner's amendments._")
+                "read it yourself (`gh issue view %s --comments`) before you decide: it may carry "
+                "the owner's amendments._" % (num if type(num) is int else "<N>"))
     out = []
     for c in comments if isinstance(comments, list) else []:
         if not isinstance(c, dict) or not isinstance(c.get("body"), str):
@@ -381,8 +381,7 @@ def render_packet(template, *, cid, num, title, body, question, comments, owner,
         "approver_session": approver_session, "home": home,
         "question": (question or "").strip() or "_(the worker's question was empty)_",
         "issue_body": (body or "").strip() or "_(empty body)_",
-        "comments": _comment_block(comments, owner, operator, ok=comments_ok).replace(
-            "<N>", str(num)),
+        "comments": _comment_block(comments, owner, operator, ok=comments_ok, num=num),
         "branch_state": "\n".join(branch_state or []) or "_(nothing recorded)_",
         "history": "\n".join(hist) if hist else "_None — this is the issue's first handback._",
         "outcome_path": outcome_path, "outcome_format": outcome_format(),

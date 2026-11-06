@@ -1232,14 +1232,24 @@ _CONSULT_GH_WRITES = {
     "secret": frozenset(("set", "delete")),
     "variable": frozenset(("set", "delete")),
     "cache": frozenset(("delete",)),
+    "project": frozenset(("create", "edit", "delete", "close", "copy", "link", "unlink",
+                          "item-add", "item-archive", "item-create", "item-delete", "item-edit",
+                          "field-create", "field-delete", "mark-template")),
+    "gist": frozenset(("create", "edit", "delete", "rename", "clone")),
 }
 # `gh api` writes when it is told a write method, or when it is handed a body: with `-f`/`-F`/
 # `--input` and no `-X`, gh itself defaults the method to POST.
 _GH_BODY_FLAGS = ("-f", "-F", "--field", "--raw-field", "--input")
 _CONSULT_GIT_WRITES = frozenset((
-    "add", "am", "apply", "bisect", "checkout", "cherry-pick", "clean", "commit", "merge", "mv",
-    "notes", "pull", "push", "rebase", "reset", "restore", "revert", "rm", "stash", "switch", "tag",
-    "update-ref", "worktree"))
+    "add", "am", "apply", "bisect", "checkout", "checkout-index", "cherry-pick", "clean", "commit",
+    "merge", "mv", "notes", "pull", "push", "read-tree", "rebase", "replace", "reset", "restore",
+    "revert", "rm", "stash", "switch", "tag", "update-index", "update-ref", "worktree"))
+# Verbs that READ bare and WRITE with a subcommand (review round 2).
+_GIT_WRITE_SUBCOMMANDS = {
+    "remote": frozenset(("add", "remove", "rm", "rename", "set-url", "set-head", "set-branches",
+                         "prune", "update")),
+    "reflog": frozenset(("expire", "delete")),
+}
 # Two verbs that READ by default and WRITE with a flag (fresh review): `git branch` lists, and
 # deletes / force-moves / renames with these; `git config` writes unless it is asked to read.
 _GIT_BRANCH_WRITE_FLAGS = frozenset(("-d", "-D", "--delete", "-f", "--force", "-m", "-M", "--move",
@@ -1282,11 +1292,22 @@ def _git_writes(tokens, start, end):
     args = tokens[at + 1:end]
     if verb in _CONSULT_GIT_WRITES:
         return True
+    if verb in _GIT_WRITE_SUBCOMMANDS:
+        return bool(args) and args[0] in _GIT_WRITE_SUBCOMMANDS[verb]
+    if verb == "symbolic-ref":
+        return len([t for t in args if not t.startswith("-")]) >= 2 or "-d" in args \
+            or "--delete" in args
     if verb == "branch":
+        # Single-dash flags combine (`-Df`), so a short-flag token is read letter by letter.
+        short = set("dDfmMcCu")
         return any(t in _GIT_BRANCH_WRITE_FLAGS or t.startswith(("--set-upstream-to=",))
+                   or (t.startswith("-") and not t.startswith("--") and set(t[1:]) & short)
                    for t in args)
     if verb == "config":
-        return not any(t in _GIT_CONFIG_READ_FLAGS for t in args)
+        if any(t in _GIT_CONFIG_READ_FLAGS for t in args):
+            return False
+        # `git config <key>` with one value-less key is a READ; anything with a value writes.
+        return len([t for t in args if not t.startswith("-")]) != 1
     return False
 
 
@@ -1303,8 +1324,15 @@ def _consult_bash_write(tokens):
             if len(args) >= 2 and args[1] == "graphql":
                 # GraphQL is always a POST, so the method says nothing: a query READS, a mutation
                 # WRITES, and the operation's own keyword is the only evidence (fresh review: a
-                # read-only `query=` was being denied). Fail toward the deny on any mutation word.
-                if any("mutation" in t.lower() for t in tokens[verb + 2:end]):
+                # read-only `query=` was being denied). So the operation must be READABLE here:
+                # a body from a file or stdin (`@file`, `@-`, `--input`) is one this hook cannot
+                # see, and is denied (review round 2: `echo 'mutation…' | gh api graphql -F
+                # query=@-` was a label move in one line); and any "mutation" anywhere on the
+                # line — the piped or here-string half included — denies too.
+                gh_args = tokens[verb + 2:end]
+                if (any("mutation" in t.lower() for t in tokens)
+                        or any(t == "--input" or t.startswith("--input=") or "=@" in t
+                               or t.startswith("@") for t in gh_args)):
                     return True
                 continue
             if method is not None:

@@ -3514,16 +3514,20 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                         out.append({"act": "consult_start", "id": iid, "num": num,
                                     "question": blocked_text, "stamp": stamp})
                         continue
-                    if not this_q or hold.get("reason") != held:
-                        # Journaled ONCE per reason; the executor keeps the hold's clock from the
-                        # FIRST hold of this question, so a reason that changes never resets it.
-                        out.append({"act": "consult_held", "id": iid, "num": num, "reason": held,
-                                    "question": blocked_text, "stamp": stamp})
-                        continue
-                    if _since_ok(since, now) and now - since < consult_mod.TIMEOUT_SECONDS:
-                        continue                           # held, inside its bound, already said
-                    # Held past the consult's own bound (or on a clock nobody can read): the hold
-                    # must never keep the question from everyone — it goes to the owner, saying why.
+                    expired = (this_q and _since_ok(since, now)
+                               and now - since >= consult_mod.TIMEOUT_SECONDS)
+                    if not expired:
+                        if not this_q or hold.get("reason") != held or not _since_ok(since, now):
+                            # Journaled ONCE per reason; the executor keeps the hold's clock from
+                            # the FIRST hold of this question, so a reason that changes never
+                            # resets it — and re-stamps a clock it cannot read (a future one, after
+                            # a backward clock step on wake) rather than reading it as expired.
+                            out.append({"act": "consult_held", "id": iid, "num": num,
+                                        "reason": held, "question": blocked_text, "stamp": stamp})
+                        continue                           # held, inside its bound
+                    # Held past the consult's own bound — checked BEFORE the reason, so a reason that
+                    # flips every tick can never keep the bound from firing: the hold must never keep
+                    # the question from everyone. It goes to the owner, saying why.
                     check = {"state": "fallback", "reason": consult_mod.HELD, "detail": held}
                 # Night-batching (#164, opt-in since #492): a durable owner question is an owner
                 # DECISION — held to the morning report inside a configured quiet-hours window.

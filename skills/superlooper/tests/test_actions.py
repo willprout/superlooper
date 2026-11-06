@@ -7027,3 +7027,25 @@ def test_the_owner_closing_an_issue_mid_consult_is_absorbed():
     out = decide(dsk=_consulting(), gh_view=ghv(closed_nums={7}))
     assert only(out, "absorb_close") == [{"act": "absorb_close", "id": "i7", "num": 7}]
     assert only(out, "post_question") == [] and only(out, "consult_answer") == []
+
+
+# ---- review round 2 (#538) ----
+
+def test_a_hold_whose_reason_flips_is_still_bounded():
+    over = usage_ok()
+    over["five_hour_pct"] = 99.0                        # held now for usage...
+    rec = {"question": _Q, "reason": "an older hold reason",     # ...stored under another reason
+           "since": NOW - consult_mod.TIMEOUT_SECONDS - 1}
+    out = decide(usage=over, dsk=_blocked({"state": "eligible", **_STAMP}, consult_held=rec))
+    (q,) = only(out, "post_question")
+    assert q["consult"]["reason"] == consult_mod.HELD
+
+
+def test_a_hold_clock_in_the_future_is_re_stamped_never_read_as_expired():
+    over = usage_ok()
+    over["five_hour_pct"] = 99.0
+    held = actions._consult_hold_reason(False, False)
+    rec = {"question": _Q, "reason": held, "since": NOW + 5}
+    out = decide(usage=over, dsk=_blocked({"state": "eligible", **_STAMP}, consult_held=rec))
+    assert only(out, "post_question") == []
+    assert len(only(out, "consult_held")) == 1
