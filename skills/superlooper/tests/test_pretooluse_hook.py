@@ -1033,6 +1033,56 @@ def test_the_approval_deny_beats_the_issue_create_format_deny(tmp_path):
     assert "MECHANICALLY INVALID" not in reason
 
 
+# --------------------------- matcher B2: the approval verb (issue #537) ---------------------------
+
+@pytest.mark.parametrize("command", [
+    "superlooper approve 5",
+    "superlooper approve --repo /x 5 6",
+    "~/.local/bin/superlooper approve 5",
+    "/Users/w/.claude/skills/superlooper/bin/superlooper approve 5",
+    "python3 skills/superlooper/skill/bin/superlooper approve 5",
+    "python3 -I /x/skill/bin/superlooper approve --repo . 5",
+    "/usr/bin/python3 /x/bin/superlooper approve 5",
+    # the review's P1: the verb's own refusal reads ITS environment, which a command line can blank
+    "SL_ISSUE_ID= SL_RUN_ROOT= SL_START_TOKEN= SL_SESSION_ID= superlooper approve 5",
+    "env -u SL_ISSUE_ID -u SL_RUN_ROOT -u SL_START_TOKEN -u SL_SESSION_ID superlooper approve 5",
+    "env -i PATH=$PATH superlooper approve 5",
+    "cd /tmp && superlooper approve 5",
+    "gh issue view 5\nsuperlooper approve 5",
+])
+def test_the_approval_verb_is_denied_in_a_loop_session(tmp_path, command):
+    _worktree(tmp_path)
+    reason = _bash(command, tmp_path)
+    assert reason, "the approval verb must be denied in a loop session: %r" % command
+    assert "needs-owner" in reason and "superlooper approve" in reason
+
+
+@pytest.mark.parametrize("command", [
+    "superlooper approve --help",
+    "superlooper approve -h",
+    "superlooper status",
+    "superlooper triage-act --issue 5 --verdict buildable",
+    # the words as TEXT
+    "echo superlooper approve 5",
+    "grep -n 'superlooper approve' plugin/skills/superlooper/references/approval-protocol.md",
+    "gh issue comment 7 --body 'run superlooper approve 7 when the owner says so'",
+    "git commit -m 'superlooper approve: the whole ceremony in one verb'",
+    "python3 -m pytest tests/test_approval.py -k approve",
+])
+def test_other_superlooper_verbs_and_mentions_of_approve_are_untouched(tmp_path, command):
+    _worktree(tmp_path)
+    assert _bash(command, tmp_path) is None, "must NOT deny: %r" % command
+
+
+def test_a_script_that_runs_the_verb_is_an_accepted_miss(tmp_path):
+    # The hook sees the script's NAME, never its contents — the same accepted miss as `sh -c '…'`.
+    # The verb's own refusal still fires there unless the script also blanks the markers. Pinned so
+    # a future tightening is a conscious change.
+    _worktree(tmp_path)
+    assert _bash("./approve-them.sh 5", tmp_path) is None
+    assert _bash("sh -c 'superlooper approve 5'", tmp_path) is None
+
+
 # --------------------------- matcher C: out-of-band shipping ---------------------------
 
 @pytest.mark.parametrize("command", [
@@ -1293,6 +1343,7 @@ def test_an_exotic_refspec_is_an_accepted_miss(tmp_path):
 @pytest.mark.parametrize("command", ["gh api repos/o/r/statuses/abc -f state=success",
                                      "gh issue edit 4 --add-label agent-ready",
                                      "gh issue edit 4 --add-label pre-authorized:referee",
+                                     "superlooper approve 4",
                                      "gh pr merge 42",
                                      "git push --force origin sl/x"])
 def test_the_bad_merge_denies_hold_for_every_role_attended_or_not(tmp_path, env, command):
@@ -1305,6 +1356,7 @@ def test_the_bad_merge_denies_hold_for_every_role_attended_or_not(tmp_path, env,
 
 @pytest.mark.parametrize("command", ["gh api repos/o/r/statuses/abc -f state=success",
                                      "gh issue edit 4 --add-label agent-ready",
+                                     "superlooper approve 4",
                                      "gh pr merge 42",
                                      "git push --force origin sl/x"])
 def test_no_bad_merge_deny_outside_a_loop_session(tmp_path, command):

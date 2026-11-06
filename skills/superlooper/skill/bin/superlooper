@@ -14,6 +14,11 @@
                   clears the stop marker too, so the off switch can never latch
   status          render the runner's own state (running / STOPPED BY OWNER / crashed) plus lanes /
                   gate / frozen / journal tail, from state + journal (no GitHub)
+  approve         record the owner's word on issue(s) N... — the whole approval ceremony in one call
+                  (issue #537): the audit comment, `agent-ready`, and the hand-back labels cleared.
+                  The comment carries a hidden stamp naming the approving session (id, machine,
+                  working directory) so the loop can consult that session later. Run only on the
+                  owner's explicit say-so; refused inside any session the runner launched
   adopt           write the config template into a target repo + seed CLAUDE.md standing rules +
                   create the §C.2 label set + print branch-protection recommendations
                   (print-only in v1)
@@ -96,6 +101,7 @@ import re
 import secrets
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -109,13 +115,20 @@ for _p in (os.path.join(_HERE, "..", "lib"), _HERE):
         sys.path.insert(0, _p)
 
 import actions as actions_lib
+# The approval ceremony + approver stamp (issue #537). Imported UNALIASED: the #337 label fence
+# resolves `approval.AGENT_READY` across modules by the module's file stem.
+import approval
 import closures
 import config as config_lib
+# The agent's transcript layout — where a session's own start directory is read from (#537).
+import delivery
 import doc_lint
 import focus as focus_lib
 import gate
 import gh
 import gitops
+# The agent's own spelling of "which conversation is this" lives there (the agent boundary).
+import identity
 import issues as issues_lib
 import janitor as janitor_lib
 # The §C.2 label set + the runner-managed subset live in a shared lib module (issue #160) so the
@@ -6210,6 +6223,87 @@ def cmd_focus_session(args):
     return result.exit_code
 
 
+# ------------------------------- approve (issue #537) -------------------------------
+
+def cmd_approve(args):
+    """Record the owner's word on each named issue: the whole approval ceremony in one call (#537).
+
+    Per issue, in this order: post the audit comment (with the approving session's stamp), apply
+    `agent-ready`, remove whichever of `needs-owner`/`needs-william`/`parked` it carries. The comment
+    goes FIRST so the label can never land without its trail — `agent-ready` that no comment ties to
+    the owner's word is exactly what the audit comment exists to prevent, and with no comment there
+    is no stamp either. A label move that fails after its comment landed is reported, and re-running
+    is safe (a second audit comment is noise; the newest stamp is still this session).
+
+    Exit codes: 0 every issue approved · 1 a config, read or write failed (each issue is attempted
+    independently; the failures are named) · 3 REFUSED: this is a session the runner launched, and
+    nothing was read or written.
+    """
+    tripped = approval.launched_by_runner(os.environ)
+    if tripped:
+        if tripped == "SL_ISSUE_ID":
+            why = "SL_ISSUE_ID=%s is set" % (os.environ.get("SL_ISSUE_ID") or "").strip()
+        elif tripped in approval.LAUNCH_MARKERS:
+            why = "%s is set" % tripped          # never its value: SL_START_TOKEN is a secret
+        else:
+            why = tripped
+        print("superlooper approve refused: this process runs inside a session the runner "
+              "launched (%s). `agent-ready` is the owner's word, relayed by a supervised session "
+              "— a loop session never applies it. Nothing was written." % why, file=sys.stderr)
+        return 3
+    try:
+        cfg = _load_config(args.repo)
+    except (ValueError, OSError) as e:
+        print("superlooper approve: %s" % e, file=sys.stderr)
+        return 1
+    session = identity.own_session_id(os.environ)
+    # The directory the session STARTED in, from its own transcript: the one a later resume must run
+    # in. The shell's cwd is only the fallback, because a session's shell wanders (`cd` to run a
+    # suite) and the transcript's directory does not.
+    cwd = delivery.session_directory(session)
+    if not cwd:
+        try:
+            cwd = os.getcwd()
+        except OSError:                  # a pruned working directory (D14) — no stamp, still approve
+            cwd = ""
+    stamp = approval.make_stamp(session, socket.gethostname(), cwd)
+    if stamp is None:
+        why = ("%s is not set — this is not running inside a session" % identity.SESSION_ID_VAR
+               if not session else "the session id, host or working directory could not be read")
+        print("superlooper approve: no session was recorded (%s). Approving without an approver "
+              "stamp: an earlier stamp on an issue still stands, and an issue with none falls "
+              "back to the owner." % why, file=sys.stderr)
+    body = approval.audit_comment(config_lib.operator(cfg),
+                                  time.strftime("%Y-%m-%d", time.localtime()), stamp)
+
+    rc = 0
+    for num in dict.fromkeys(args.num):
+        view = gh.issue(num)
+        if not isinstance(view, dict) or type(view.get("number")) is not int \
+                or view.get("number") != num:
+            print("#%s: could not be read from GitHub — not approved, nothing was written" % num,
+                  file=sys.stderr)
+            rc = 1
+            continue
+        if not gh.comment(num, body):
+            print("#%s: the audit comment could not be posted — not approved, no label was moved"
+                  % num, file=sys.stderr)
+            rc = 1
+            continue
+        handback_to_clear = approval.labels_to_clear(issues_lib._label_names(view))
+        if not gh.set_labels(num, add=[approval.AGENT_READY], remove=handback_to_clear):
+            print("#%s: the audit comment landed but the label move failed — `agent-ready` is NOT "
+                  "applied; re-run `superlooper approve %s`" % (num, num), file=sys.stderr)
+            rc = 1
+            continue
+        print("#%s: approved — `%s` applied%s; audit comment posted%s"
+              % (num, approval.AGENT_READY,
+                 ", removed %s" % ", ".join("`%s`" % n for n in handback_to_clear)
+                 if handback_to_clear else "",
+                 " with the approver stamp (session %s)" % stamp.session if stamp else ""))
+    return rc
+
+
 # ------------------------------- stubs -------------------------------
 
 def _stub(which, wave):
@@ -6306,6 +6400,26 @@ def main(argv=None):
            "--operator": dict(default=None, help="who started it — journaled (audit)"),
            "--source": dict(default=None, help="what asked (audit only; default 'cli')")})
     add("status", cmd_status)
+    add("approve", cmd_approve,
+        description=(
+            "Record the owner's word on each named issue — the WHOLE approval ceremony in one call\n"
+            "per issue (issue #537): post the audit comment 'Approved by <operator> in\n"
+            "conversation, <date>.', apply `agent-ready`, and remove whichever of `needs-owner` /\n"
+            "`needs-william` / `parked` the issue carries.\n"
+            "\n"
+            "Run it only on the owner's explicit say-so in conversation: the label records the\n"
+            "owner's word, it is not the word. The audit comment carries a hidden stamp naming the\n"
+            "session that approved (its id, this machine, and the directory it started in), which\n"
+            "is how the loop finds that session again to consult it about the issue. From a plain\n"
+            "terminal there is no session, so it approves without a stamp and says so on stderr.\n"
+            "\n"
+            "It REFUSES inside any session the runner launched (a build worker, a repair session,\n"
+            "a triage flight, a consult) — approval is relayed by a SUPERVISED session.\n"
+            "\n"
+            "Exit codes: 0 every issue approved · 1 a config, read or write failed (named; the\n"
+            "other issues are still attempted) · 3 refused inside a launched session, nothing\n"
+            "written."),
+        **{"num": dict(type=int, nargs="+", metavar="N", help="the issue(s) the owner approved")})
     add("adopt", cmd_adopt)
     add("doctor", cmd_doctor,
         **{"--stack": dict(action="store_true",

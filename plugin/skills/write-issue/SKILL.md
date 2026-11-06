@@ -196,6 +196,6 @@ section above. If `gh` refuses the label, the repo has not run `superlooper adop
 shipped: file without it rather than blocking, and say so.)
 
 Then bring the drafted issues to William for approval in conversation. When he approves, the
-approval step (the superlooper skill's `references/approval-protocol.md`) applies `agent-ready`
-and records the audit comment. Until then the issue sits un-queued — which is correct: an
-unapproved issue must never build.
+approval step applies `agent-ready` and records the audit comment. That step is one command,
+`superlooper approve`; see the superlooper skill's `references/approval-protocol.md`. Until
+then the issue sits un-queued — which is correct: an unapproved issue must never build.

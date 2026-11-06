@@ -85,6 +85,26 @@ DEFAULT_PROBE_SECONDS = 5
 
 REFUSED = 3                    # identity.py's own exit code for a refusal; 0 = the account is right
 
+# Claude Code's own record of WHICH CONVERSATION a process runs inside (issue #537). The agent
+# exports it into every tool subprocess of a session — supervised or launched — and it is absent in
+# a plain terminal. It names the transcript file (`<id>.jsonl`, found by id: see
+# `delivery.Transcript._path`), which is what lets the loop find the session that approved an issue
+# again later. Spelled here, and only here, because it is the AGENT's variable (the agent boundary);
+# a launched session also carries the launcher's own `SL_SESSION_ID`, which is the runner's record
+# of the same fact and never a substitute for the agent's.
+SESSION_ID_VAR = "CLAUDE_CODE_SESSION_ID"
+
+
+def own_session_id(env=None):
+    """This process's conversation id as the agent reports it, or "" when it reports none.
+
+    "" is an answer, not an error: a person approving from a plain terminal is in no session, and
+    the caller records that honestly rather than guessing one. The value is returned trimmed and
+    otherwise unjudged — whoever stores it decides what shape it must have."""
+    env = os.environ if env is None else env
+    value = env.get(SESSION_ID_VAR) if hasattr(env, "get") else None
+    return value.strip() if isinstance(value, str) else ""
+
 
 # ------------------------------------------------------------------ the string, and its namespace
 

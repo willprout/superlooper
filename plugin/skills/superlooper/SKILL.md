@@ -25,7 +25,7 @@ see the published `docs/ADOPTING.md` contract at `~/.claude/skills/superlooper/d
 | You are… | Go to | For |
 |---|---|---|
 | **writing issues** for the loop (an agent, in a planning conversation) | the **write-issue** skill (`/superlooper:write-issue`) | the rigorous issue format, the thin-issue doctrine, `type:`/`touches:`/`blocked-by`, cross-PR-promises-become-issues, how to file with `gh` |
-| **approving issues** (applying `agent-ready` after William's say-so) | `references/approval-protocol.md` | approval-by-conversation, the audit comment, the one standing-rule exception, never editing an approved Goal/DoD |
+| **approving issues** (applying `agent-ready` after William's say-so) | `references/approval-protocol.md` | approval-by-conversation, the one-command ceremony (`superlooper approve`, which stamps the approving session), the one standing-rule exception, never editing an approved Goal/DoD |
 | **running or operating the loop** (start/stop, the morning report, a bounce, a freeze, promotion, launchd) | `references/runner-ops.md` | day-to-day operation + `parked`/`needs-owner`/`expedite`/`preserve`/freeze semantics + the doctor checklist |
 | **adopting a repo** into the loop (config, labels, branch protection) | the **adopt** skill (`/superlooper:adopt`) | the bootstrap walkthrough — clone → gated `./bin/install.sh` → `doctor --stack` → `adopt`/`doctor`/`run` — plus the published `docs/ADOPTING.md` contract (every config field, the label set) |
 

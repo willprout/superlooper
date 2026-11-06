@@ -2,7 +2,9 @@
 
 `agent-ready` is William's word. This is the single most important bright line in the whole system,
 and it is enforced by discipline here and by absence everywhere else (no code path applies
-`agent-ready` on its own judgment).
+`agent-ready` on its own judgment). A session applies it with `superlooper approve`, and only when
+it is relaying his say-so. Both the verb and the loop's tool-call hook refuse it in every session
+the runner launched.
 
 ## Approval-by-conversation (spec §2, verbatim intent)
 
@@ -25,25 +27,55 @@ Read that literally:
 
 ## What you do when William approves
 
-When William approves issues in conversation (e.g. "yes, those three are approved"):
+When William approves issues in conversation (e.g. "yes, those three are approved"), run **one
+command**, naming each issue he approved and only those:
 
-1. **Apply `agent-ready` AND remove `needs-owner`** (plus the legacy `needs-william`, and
-   `parked` if present) on each issue he named — and only those. The removal is not optional
-   housekeeping: `needs-owner` says "waiting for the owner's decision," which the approval just
-   ended, and leaving it on confuses humans and agents reading raw labels (owner instruction
-   2026-08-05). This matches what the dashboard's Approve verb has always done in one move
-   (`dashboard/lib/actions.py`, `approve`).
-2. **Append an audit comment** to each, recording the human decision behind the label:
+```
+superlooper approve --repo <path> <N> [<N>...]
+```
+
+That is the whole ceremony. Do not do these steps by hand. A step taught in prose gets skipped,
+which is why the ceremony is a verb. For each issue, the verb:
+
+1. **Posts the audit comment** that records the human decision behind the label:
 
    ```
    Approved by William in conversation, 2026-07-02.
    ```
 
-   (Use the real date.) The comment is the paper trail that ties the label back to the moment of
-   approval — the morning report and any future audit read it to distinguish work William's word
-   released from work a standing rule released.
+   It uses the operator name from the repo's config and today's date. The comment is the paper
+   trail that ties the label back to the moment of approval. The morning report and any future
+   audit read it to tell work William's word released apart from work a standing rule released.
+   The comment goes first, so the label can never land without its trail.
+2. **Applies `agent-ready` and removes `needs-owner`**, plus the legacy `needs-william` and
+   `parked`, wherever the issue carries them. The removal is not optional housekeeping:
+   `needs-owner` says "waiting for the owner's decision", which the approval just ended, and
+   leaving it on confuses humans and agents reading raw labels (owner instruction 2026-08-05). The
+   dashboard's Approve button makes the same move in one tap (`dashboard/lib/actions.py`,
+   `approve`). One difference: the button also clears a stale `rebuild` label, and the verb does
+   not touch `rebuild`. A stale `rebuild` left on a parked build makes the re-approval rebuild it
+   from scratch instead of resuming at the gate.
 
-That is the entire ceremony. Approval is one touch: his word, your label, your audit note.
+**The approver stamp.** The verb appends a hidden, machine-readable stamp to the audit comment. It
+names the session that approved: its session id, this machine, and the directory the session
+started in. The owner's ruling (2026-11-04) is that when the loop needs to consult someone about an
+issue, it consults the session that *approved* it, not the one that wrote it. The approving
+orchestrator holds the project-wide context of what William wants; a build session that filed a
+follow-up may not. The engine's reader for the stamp is `approval.read`
+(`skills/superlooper/skill/lib/approval.py`), which the consult work will call. It trusts only
+comments the repo owner's account wrote, and only ones shaped like this audit comment. It takes the
+newest stamp, and an unstamped approval never clears an earlier stamp.
+
+- **Run it from the session William is talking to.** The stamp names whichever session runs the
+  verb, so run it in the conversation where he gave his word, not in a helper you spawn.
+- **No session, no stamp.** From a plain terminal the verb still approves and posts the comment
+  without a stamp, and says so on stderr. The dashboard's Approve button posts no stamp either. An
+  unstamped approval falls back to William (owner ruling).
+- **Refused in a launched session.** Inside any session the runner launched (a build worker, a
+  repair session, a triage flight, a consult) the verb refuses and writes nothing, and the loop's
+  tool-call hook denies the command before it runs.
+
+Approval is one touch: his word, your one command.
 
 ## The one exception: a standing rule William himself defined
 
@@ -86,7 +118,8 @@ him **pre-authorize** it. Pre-authorization is *still his word* — just granted
 - **Record it as a distinct label: `pre-authorized:referee`.** Never fold this into `agent-ready`
   (the same discipline as `auto-approved:nightly-red`): a distinct label keeps the audit trail
   showing *how* a referee touch was cleared. Apply it alongside `agent-ready` only when he
-  pre-authorizes, and append an audit comment recording the decision:
+  pre-authorizes. `superlooper approve` does not apply this label, so add it by hand with its own
+  audit comment recording the decision:
 
   ```
   Referee-path pre-authorization granted by William in conversation, 2026-07-16.

@@ -162,6 +162,13 @@ _UNREADABLE = {
         "here at all. The plan can only ever compute `type:<kind>` for kind in issues.VALID_TYPES "
         "(lib/janitor.py builds it from queue_lint's type choices) — pinned by "
         "test_every_type_label_the_janitor_can_compute_is_registered below."),
+    (_ENGINE + "/bin/superlooper", "handback_to_clear"): (1,
+        "`superlooper approve` (#537) removes only the hand-back labels the issue actually CARRIES "
+        "— a computed subset, because `gh issue edit` hard-fails the whole edit (the agent-ready "
+        "add included) on a remove naming a label the repo lacks, and a repo past the #58 rename "
+        "lacks `needs-william` (the dashboard's #114). Every name it can carry is in "
+        "`approval.CLEARED_BY_APPROVAL`, pinned to LABELS + RETIRED_LABELS by "
+        "test_approval.test_the_ceremony_labels_are_registered_vocabulary."),
 }
 
 _SCRIPT_SUFFIXES = (".py",)
