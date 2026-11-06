@@ -120,6 +120,8 @@ import actions as actions_lib
 import approval
 import closures
 import config as config_lib
+# The agent's transcript layout — where a session's own start directory is read from (#537).
+import delivery
 import doc_lint
 import focus as focus_lib
 import gate
@@ -6221,7 +6223,7 @@ def cmd_focus_session(args):
     return result.exit_code
 
 
-# ------------------------------- stubs -------------------------------
+# ------------------------------- approve (issue #537) -------------------------------
 
 def cmd_approve(args):
     """Record the owner's word on each named issue: the whole approval ceremony in one call (#537).
@@ -6239,22 +6241,31 @@ def cmd_approve(args):
     """
     tripped = approval.launched_by_runner(os.environ)
     if tripped:
-        who = os.environ.get("SL_ISSUE_ID", "").strip() if tripped == "SL_ISSUE_ID" else ""
+        if tripped == "SL_ISSUE_ID":
+            why = "SL_ISSUE_ID=%s is set" % (os.environ.get("SL_ISSUE_ID") or "").strip()
+        elif tripped in approval.LAUNCH_MARKERS:
+            why = "%s is set" % tripped          # never its value: SL_START_TOKEN is a secret
+        else:
+            why = tripped
         print("superlooper approve refused: this process runs inside a session the runner "
-              "launched (%s%s is set). `agent-ready` is the owner's word, relayed by a supervised "
-              "session — a loop session never applies it. Nothing was written."
-              % (tripped, "=%s" % who if who else ""), file=sys.stderr)
+              "launched (%s). `agent-ready` is the owner's word, relayed by a supervised session "
+              "— a loop session never applies it. Nothing was written." % why, file=sys.stderr)
         return 3
     try:
         cfg = _load_config(args.repo)
     except (ValueError, OSError) as e:
         print("superlooper approve: %s" % e, file=sys.stderr)
         return 1
-    try:
-        cwd = os.getcwd()
-    except OSError:                      # a pruned working directory (D14) — no stamp, still approve
-        cwd = ""
     session = identity.own_session_id(os.environ)
+    # The directory the session STARTED in, from its own transcript: the one a later resume must run
+    # in. The shell's cwd is only the fallback, because a session's shell wanders (`cd` to run a
+    # suite) and the transcript's directory does not.
+    cwd = delivery.session_directory(session)
+    if not cwd:
+        try:
+            cwd = os.getcwd()
+        except OSError:                  # a pruned working directory (D14) — no stamp, still approve
+            cwd = ""
     stamp = approval.make_stamp(session, socket.gethostname(), cwd)
     if stamp is None:
         why = ("%s is not set — this is not running inside a session" % identity.SESSION_ID_VAR
@@ -6292,6 +6303,8 @@ def cmd_approve(args):
                  " with the approver stamp (session %s)" % stamp.session if stamp else ""))
     return rc
 
+
+# ------------------------------- stubs -------------------------------
 
 def _stub(which, wave):
     def run(args):
@@ -6394,11 +6407,11 @@ def main(argv=None):
             "conversation, <date>.', apply `agent-ready`, and remove whichever of `needs-owner` /\n"
             "`needs-william` / `parked` the issue carries.\n"
             "\n"
-            "Run it only on the owner's explicit say-so in conversation: the label records his\n"
-            "word, it is not the word. The audit comment carries a hidden stamp naming the session\n"
-            "that approved (its id, this machine, and the working directory), which is how the\n"
-            "loop finds that session again to consult it about the issue. From a plain terminal\n"
-            "there is no session, so it approves without a stamp and says so on stderr.\n"
+            "Run it only on the owner's explicit say-so in conversation: the label records the\n"
+            "owner's word, it is not the word. The audit comment carries a hidden stamp naming the\n"
+            "session that approved (its id, this machine, and the directory it started in), which\n"
+            "is how the loop finds that session again to consult it about the issue. From a plain\n"
+            "terminal there is no session, so it approves without a stamp and says so on stderr.\n"
             "\n"
             "It REFUSES inside any session the runner launched (a build worker, a repair session,\n"
             "a triage flight, a consult) — approval is relayed by a SUPERVISED session.\n"

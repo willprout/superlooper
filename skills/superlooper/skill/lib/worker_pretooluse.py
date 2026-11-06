@@ -25,7 +25,8 @@ proved a PreToolUse hook returning permissionDecision:"deny" blocks the call eve
      moment it files wrong. The issue is validated BEFORE it exists; the deny names exactly what is
      missing and the required shape; the session retries correctly on the freshest possible turn.
 
-  4. A FORGED COMMIT STATUS, 5. AN APPROVAL LABEL (`agent-ready` / `pre-authorized:*`), and
+  4. A FORGED COMMIT STATUS, 5. AN APPROVAL LABEL (`agent-ready` / `pre-authorized:*`, applied by
+     a raw `gh` write or by the `superlooper approve` verb, #537), and
      6. OUT-OF-BAND SHIPPING (`gh pr merge`, a direct push to the dev branch, any force-push) —
      issue #226, the three paths to a bad merge. Their full rationale, their accepted misses and the
      one posture difference from duty 3 sit above the matchers themselves, below. Two facts belong
@@ -579,6 +580,13 @@ def _newline_separated(command):
     return "".join(out)
 
 
+# The binaries the bad-merge matchers judge. A cheap substring prefilter, run before EVERY Bash
+# call: a line naming none of them cannot match any matcher, so it is never tokenized. A matcher for
+# a new binary must add it here, or that matcher is handed None and silently never fires (#537 hit
+# exactly that: the approval-verb matcher saw no `superlooper` line until this named it).
+_SCREENED_BINARIES = ("gh", "git", "superlooper")
+
+
 def _split_shell(command):
     """The command's tokens, with unquoted newlines as `;` separators and shell punctuation split
     off its neighbours, or None when the line cannot be read.
@@ -593,7 +601,7 @@ def _split_shell(command):
     Kept separate from `_split_command` (duty 3's) so neither of these changes can move duty 3's
     verdicts: its fail-open direction makes its own misses harmless, and re-tokenizing it would be a
     behavior change this issue does not need."""
-    if not isinstance(command, str) or ("gh" not in command and "git" not in command):
+    if not isinstance(command, str) or not any(b in command for b in _SCREENED_BINARIES):
         return None
     try:
         lexer = shlex.shlex(_newline_separated(command), posix=True, punctuation_chars=True)
@@ -806,6 +814,74 @@ def _approval_label_deny(tokens):
     return None
 
 
+# --------------------------- matcher B2: the approval VERB (issue #537) ---------------------------
+
+# `superlooper approve` performs the whole approval ceremony — `agent-ready`, the hand-back labels,
+# the audit comment — and stamps the calling session as the issue's APPROVER, the session the loop
+# later consults about it. The verb refuses inside a launched session on its own, but it can only
+# read its OWN process environment, and a command line can blank that (`SL_ISSUE_ID= superlooper
+# approve 5`, `env -u …`). This hook reads the AGENT's environment, which no command line reaches —
+# the same reason the raw `gh` label write above is denied here rather than trusted to the brief.
+# Without this matcher the verb would be an easier door to `agent-ready` than the one matcher B
+# closes (fresh-agent review on #537, P1).
+#
+# Matched at a command position as matcher B's calls are, and ALSO behind an interpreter
+# (`python3 …/bin/superlooper approve`, how a source checkout runs it) and behind `env`'s own
+# options (`env -u X superlooper approve`). Accepted misses, the same posture as the label matcher's:
+# a call behind a quote (`sh -c '…'`), and a script file that runs the verb for the session — the
+# hook sees the script's name, never its contents. `--help` writes nothing and is allowed.
+_SUPERLOOPER_BIN = "superlooper"
+_APPROVE_VERB = "approve"
+_INTERPRETER_RE = re.compile(r"(?:^|/)(?:python(?:\d+(?:\.\d+)?)?|bash|sh|zsh)$")
+# `env` options that consume the NEXT token, so `env -u SL_ISSUE_ID superlooper …` is read as the
+# `superlooper` call it is rather than as an argument to some unknown command.
+_ENV_VALUE_FLAGS = frozenset(("-u", "--unset", "-C", "--chdir", "-S", "--split-string"))
+
+_APPROVE_REASON = (
+    "`superlooper approve` is forbidden in a superlooper loop session. It applies `agent-ready` — "
+    "the OWNER's word, and the launch gate — and it records THIS session as the issue's approver, "
+    "the session the loop would later consult about the issue as if the owner had approved it "
+    "here. Only a supervised session the owner is talking to runs it. Nothing was approved. File "
+    "the work `needs-owner` instead: that is the label that puts the issue in front of the owner, "
+    "and they approve it in their own words."
+)
+
+
+def _runs_as_command(tokens, i):
+    """Like `_at_command_position`, but also seeing through an interpreter (`python3 -I …`) and
+    `env`'s value-taking options. A walk-back that ends anywhere but a separator or the line start
+    — `echo superlooper approve`, `grep -e superlooper approve` — is text, not a call."""
+    j = i - 1
+    while j >= 0:
+        tok = tokens[j]
+        if (tok in _WRAPPERS or _ASSIGNMENT_RE.match(tok) or _INTERPRETER_RE.search(tok)
+                or tok.startswith("-")):
+            j -= 1
+            continue
+        if j >= 1 and tokens[j - 1] in _ENV_VALUE_FLAGS:
+            j -= 2                       # `-u NAME`: the flag and the name it consumes
+            continue
+        break
+    return j < 0 or tokens[j] in _SEPARATORS
+
+
+def _approve_verb_deny(tokens):
+    for i, tok in enumerate(tokens):
+        if not (tok == _SUPERLOOPER_BIN or tok.endswith("/" + _SUPERLOOPER_BIN)):
+            continue
+        if not _runs_as_command(tokens, i):
+            continue
+        end = len(tokens)
+        for j in range(i + 1, len(tokens)):
+            if tokens[j] in _RUN_END:
+                end = j
+                break
+        verb = next((t for t in tokens[i + 1:end] if not t.startswith("-")), None)
+        if verb == _APPROVE_VERB and not _is_help(tokens, i + 1, end):
+            return _APPROVE_REASON
+    return None
+
+
 # --------------------------- matcher C: out-of-band shipping ---------------------------
 
 # `--mirror` carries no `--force` and no refspec, yet it force-updates EVERY ref and deletes the
@@ -938,6 +1014,7 @@ def _bad_merge_deny(command, contract):
         return None
     return (_forged_status_deny(tokens)
             or _approval_label_deny(tokens)
+            or _approve_verb_deny(tokens)
             or _out_of_band_deny(tokens, contract))
 
 

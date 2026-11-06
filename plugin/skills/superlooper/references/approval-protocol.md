@@ -2,9 +2,9 @@
 
 `agent-ready` is William's word. This is the single most important bright line in the whole system,
 and it is enforced by discipline here and by absence everywhere else (no code path applies
-`agent-ready` on its own judgment). The one verb that applies it, `superlooper approve`, does so
-only when a supervised session relays his say-so, and it refuses inside every session the runner
-launched.
+`agent-ready` on its own judgment). A session applies it with `superlooper approve`, and only when
+it is relaying his say-so. Both the verb and the loop's tool-call hook refuse it in every session
+the runner launched.
 
 ## Approval-by-conversation (spec §2, verbatim intent)
 
@@ -51,17 +51,20 @@ which is why the ceremony is a verb. For each issue, the verb:
    `parked`, wherever the issue carries them. The removal is not optional housekeeping:
    `needs-owner` says "waiting for the owner's decision", which the approval just ended, and
    leaving it on confuses humans and agents reading raw labels (owner instruction 2026-08-05). The
-   dashboard's Approve button does the same label move in one tap (`dashboard/lib/actions.py`,
-   `approve`).
+   dashboard's Approve button makes the same move in one tap (`dashboard/lib/actions.py`,
+   `approve`). One difference: the button also clears a stale `rebuild` label, and the verb does
+   not touch `rebuild`. A stale `rebuild` left on a parked build makes the re-approval rebuild it
+   from scratch instead of resuming at the gate.
 
 **The approver stamp.** The verb appends a hidden, machine-readable stamp to the audit comment. It
-names the session that approved: its session id, this machine, and its working directory. The
-owner's ruling (2026-11-04) is that when the loop needs to consult someone about an issue, it
-consults the session that *approved* it, not the one that wrote it. The approving orchestrator holds
-the project-wide context of what William wants; a build session that filed a follow-up may not. The
-engine reads the stamp back with `approval.read` (`skills/superlooper/skill/lib/approval.py`). That
-reader trusts only comments the repo owner's account wrote, takes the newest stamp, and never lets
-an unstamped approval clear an earlier stamp.
+names the session that approved: its session id, this machine, and the directory the session
+started in. The owner's ruling (2026-11-04) is that when the loop needs to consult someone about an
+issue, it consults the session that *approved* it, not the one that wrote it. The approving
+orchestrator holds the project-wide context of what William wants; a build session that filed a
+follow-up may not. The engine's reader for the stamp is `approval.read`
+(`skills/superlooper/skill/lib/approval.py`), which the consult work will call. It trusts only
+comments the repo owner's account wrote, and only ones shaped like this audit comment. It takes the
+newest stamp, and an unstamped approval never clears an earlier stamp.
 
 - **Run it from the session William is talking to.** The stamp names whichever session runs the
   verb, so run it in the conversation where he gave his word, not in a helper you spawn.
@@ -69,7 +72,8 @@ an unstamped approval clear an earlier stamp.
   without a stamp, and says so on stderr. The dashboard's Approve button posts no stamp either. An
   unstamped approval falls back to William (owner ruling).
 - **Refused in a launched session.** Inside any session the runner launched (a build worker, a
-  repair session, a triage flight, a consult) the verb refuses and writes nothing.
+  repair session, a triage flight, a consult) the verb refuses and writes nothing, and the loop's
+  tool-call hook denies the command before it runs.
 
 Approval is one touch: his word, your one command.
 

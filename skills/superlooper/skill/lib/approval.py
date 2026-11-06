@@ -14,13 +14,16 @@ Two halves live here:
   skipped (the point-of-error principle, #215/#225). The verb does all three; this module says
   exactly what they are, so the verb and its tests cannot drift apart.
 
-* **The stamp and its reader.** The stamp rides at the END of the audit comment as a hidden HTML
-  comment on its own line — after the audit sentence, never before it, because the brief drops a
-  comment that BEGINS with a machine marker (`brief._MARKER_PREFIX`) and the approval would then
-  vanish from the worker's view of its own thread. The reader returns an issue's NEWEST valid stamp
-  among comments the repo owner's account authored, by the same owner rule the brief's amendments
-  use (`brief.owner_login`), and nothing else is evidence: a stamp in another account's comment,
-  quoted mid-sentence, or malformed is no stamp.
+* **The stamp and its reader.** The stamp is the LAST line of the audit comment, a hidden HTML
+  comment — after the audit sentence, never before it, because the brief drops a comment that
+  BEGINS with a machine marker (`brief._MARKER_PREFIX`) and the approval would then vanish from the
+  worker's view of its own thread. The reader returns an issue's NEWEST valid stamp among comments
+  the repo owner's account authored, by the same owner rule the brief's amendments use
+  (`brief.owner_login`), and only from a comment SHAPED like the audit comment: its first line the
+  audit sentence, its last line the marker. Nothing else is evidence — a stamp in another account's
+  comment, one quoted in a code block or mid-sentence, one a comment merely discusses, or a
+  malformed one is no stamp. Every loop session posts as the owner's own login, so shape is the
+  only thing that tells "an approval" apart from "a comment that mentions one".
 
 **An unstamped approval never clears a stamp.** The dashboard's Approve button posts none (owner
 ruling: an unstamped approval falls back to the owner), and neither does any approval that predates
@@ -29,8 +32,10 @@ that does.
 
 **What the owner check can and cannot do.** Every loop session posts as the owner's own login (no
 bot account, owner ruling 2026-08-05), so "authored by the owner" excludes other accounts and
-nothing more. What keeps a loop session from approving at all is the verb's refusal below
-(`launched_by_runner`) together with the worker hook's deny on the raw `agent-ready` write.
+nothing more. What keeps a loop session from approving at all is the verb's own refusal below
+(`launched_by_runner`) and, at the moment of the tool call, the worker hook
+(`worker_pretooluse`), which denies both the raw `agent-ready` write and `superlooper approve`
+itself — the hook reads the AGENT's environment, which a command line cannot blank.
 
 **The agent boundary.** Which variable carries a session's id is the agent's spelling, so it lives
 in `identity.py` (`identity.own_session_id`); nothing here names it. The stamp itself is agent-
@@ -61,11 +66,17 @@ LAUNCH_MARKERS = ("SL_ISSUE_ID", "SL_RUN_ROOT", "SL_START_TOKEN", "SL_SESSION_ID
 # The marker's name. Shares the `<!-- superlooper-` family prefix with the review and investigation
 # markers, but is never at the START of a comment (see the module docstring).
 MARKER = "superlooper-approver"
-_STAMP_LINE = re.compile(r"^<!-- " + re.escape(MARKER) + r" (\{.*\}) -->[ \t\r]*$", re.M)
+_STAMP_LINE = re.compile(r"<!-- " + re.escape(MARKER) + r" (\{.*\}) -->")
+# The first line of every conversational approval (see `audit_sentence`). The operator is config
+# text, so it is matched loosely; the date and the closing period are not.
+_AUDIT_SENTENCE = re.compile(r"Approved by \S.* in conversation, \d{4}-\d{2}-\d{2}\.")
+_FENCES = ("```", "~~~")
 
 # An id-shaped token: what names a transcript file. The same shape `delivery._UUID_ISH` accepts,
 # for the same reason — a value that is not one cannot become a path, a broken marker, or prose.
-_SESSION_SHAPE = re.compile(r"^[0-9A-Za-z][0-9A-Za-z-]{7,63}$")
+# Always applied with `fullmatch`: a `$` anchor matches before a trailing newline, and an id with a
+# newline in it is exactly the value that must not be accepted.
+_SESSION_SHAPE = re.compile(r"[0-9A-Za-z][0-9A-Za-z-]{7,63}")
 
 Stamp = collections.namedtuple("Stamp", ["session", "host", "cwd"])
 
@@ -75,15 +86,25 @@ Stamp = collections.namedtuple("Stamp", ["session", "host", "cwd"])
 ApproverRead = collections.namedtuple("ApproverRead", ["stamp", "ok"])
 
 
+UNREADABLE_ENV = "an unreadable environment"
+
+
 def launched_by_runner(env):
-    """The first launch marker set in `env`, or None for a plain terminal or a supervised session.
+    """Why this process counts as a session the runner launched, or None for a plain terminal or a
+    supervised session.
+
+    The answer is the first launch marker PRESENT in `env` — set at all, even to "" or to something
+    that is not a string, because the launcher never leaves one of them out and a blanked one is a
+    launched session that blanked it. An `env` that cannot be read is refused too
+    (`UNREADABLE_ENV`): this guard fails CLOSED, since the cost of a wrong refusal is an owner
+    re-running the command, and the cost of a wrong pass is `agent-ready` applied by a loop session.
 
     Returns the variable's NAME, never its value: `SL_START_TOKEN` is a per-launch secret, and a
     refusal message must not print it."""
-    env = env if isinstance(env, dict) or hasattr(env, "get") else {}
+    if env is None or not hasattr(env, "get") or not hasattr(env, "__contains__"):
+        return UNREADABLE_ENV
     for var in LAUNCH_MARKERS:
-        value = env.get(var)
-        if isinstance(value, str) and value.strip():
+        if var in env:
             return var
     return None
 
@@ -99,14 +120,20 @@ def make_stamp(session, host, cwd):
     The host keeps only its first label: `socket.gethostname()` answers `Williams-Mini.lan` on one
     network and `Williams-Mini.local` on another, and a consult routes on the machine, not on the
     network it happened to be on."""
-    if not isinstance(session, str) or not _SESSION_SHAPE.match(session.strip()):
+    if not isinstance(session, str) or not _SESSION_SHAPE.fullmatch(session.strip()):
         return None
     if not isinstance(host, str) or not isinstance(cwd, str):
         return None
     host = host.strip().split(".", 1)[0]
-    if not host or not cwd:
+    if not _clean(host) or not _clean(cwd):
         return None
     return Stamp(session=session.strip(), host=host, cwd=cwd)
+
+
+def _clean(text):
+    """A non-empty string with no control characters. A newline in a host or a path is not one any
+    machine produced, and it is how a value would smuggle a second line into the comment."""
+    return isinstance(text, str) and bool(text) and not any(ord(ch) < 32 for ch in text)
 
 
 def render_stamp(stamp):
@@ -122,14 +149,14 @@ def render_stamp(stamp):
 
 
 def audit_comment(operator, date, stamp=None):
-    """The whole audit comment: the sentence, then — when there is a stamp — one line a human can
-    read on the issue and the hidden marker the engine reads. With no stamp it is the bare sentence,
-    exactly what an unstamped approval has always looked like."""
+    """The whole audit comment: the sentence, then — when there is a stamp — the hidden marker as
+    its last line. With no stamp it is the bare sentence, exactly what an unstamped approval has
+    always looked like. The marker is the only place the stamp appears: hidden on the rendered page,
+    and machine data rather than prose in the brief, which embeds the owner's comments verbatim."""
     text = audit_sentence(operator, date)
     if stamp is None:
         return text
-    return "%s\n\nApproving session: `%s` on %s, cwd `%s`.\n\n%s" % (
-        text, stamp.session, stamp.host, stamp.cwd, render_stamp(stamp))
+    return "%s\n\n%s" % (text, render_stamp(stamp))
 
 
 def _from_payload(raw):
@@ -140,19 +167,30 @@ def _from_payload(raw):
     if not isinstance(d, dict):
         return None
     session, host, cwd = d.get("session"), d.get("host"), d.get("cwd")
-    if not (isinstance(session, str) and _SESSION_SHAPE.match(session)):
+    if not (isinstance(session, str) and _SESSION_SHAPE.fullmatch(session)):
         return None
-    if not (isinstance(host, str) and host and isinstance(cwd, str) and cwd):
+    if not (_clean(host) and _clean(cwd)):
         return None
     return Stamp(session=session, host=host, cwd=cwd)
 
 
-def parse_stamps(body):
-    """Every valid stamp in one comment body, in order. A marker must stand on its own line — one
-    quoted in backticks or mid-sentence is a comment ABOUT the format, not an approval."""
+def parse_stamp(body):
+    """The stamp an AUDIT COMMENT carries, or None.
+
+    Only a comment shaped like one `audit_comment` writes counts: its first non-blank line the audit
+    sentence, its last non-blank line the marker, and no code fence anywhere in it. Every other shape
+    is a comment ABOUT an approval — one quoting an audit comment in a code block, one explaining
+    the format, one with prose after the marker — and since every loop session posts as the owner,
+    reading any of them would let a comment that merely mentions a stamp become the approver."""
     if not isinstance(body, str):
-        return []
-    return [s for s in (_from_payload(m.group(1)) for m in _STAMP_LINE.finditer(body)) if s]
+        return None
+    lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
+    if len(lines) < 2 or not _AUDIT_SENTENCE.fullmatch(lines[0]):
+        return None
+    if any(ln.startswith(_FENCES) for ln in lines):
+        return None
+    m = _STAMP_LINE.fullmatch(lines[-1])
+    return _from_payload(m.group(1)) if m else None
 
 
 def latest_stamp(comments, owner):
@@ -173,9 +211,9 @@ def latest_stamp(comments, owner):
         login = author.get("login") if isinstance(author, dict) else None
         if not (isinstance(login, str) and login == owner):
             continue
-        stamps = parse_stamps(c.get("body"))
-        if stamps:
-            found = stamps[-1]
+        stamp = parse_stamp(c.get("body"))
+        if stamp is not None:
+            found = stamp
     return found
 
 

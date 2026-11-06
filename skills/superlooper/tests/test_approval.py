@@ -60,7 +60,17 @@ def _approved(stamp=None, operator="William", date="2026-11-06"):
 
 def test_the_stamp_round_trips_through_the_audit_comment():
     s = _stamp()
-    assert approval.parse_stamps(_approved(s)) == [s]
+    assert approval.parse_stamp(_approved(s)) == s
+
+
+def test_the_stamp_is_the_hidden_last_line_and_nothing_else():
+    """The DoD asks for a HIDDEN machine-readable marker. A visible prose line would also be read,
+    verbatim, by every worker whose brief embeds the owner's comments as binding amendments."""
+    body = _approved(_stamp())
+    first, *_middle, last = [ln for ln in body.splitlines() if ln.strip()]
+    assert first == "Approved by William in conversation, 2026-11-06."
+    assert last == approval.render_stamp(_stamp()) and last.startswith("<!-- ")
+    assert len([ln for ln in body.splitlines() if ln.strip()]) == 2
 
 
 @pytest.mark.parametrize("cwd", [
@@ -77,7 +87,7 @@ def test_the_stamp_round_trips_a_directory_whatever_it_contains(cwd):
     body = _approved(s)
     marker_lines = [ln for ln in body.splitlines() if ln.startswith("<!-- ")]
     assert len(marker_lines) == 1 and marker_lines[0].count("-->") == 1
-    assert approval.parse_stamps(body) == [s]
+    assert approval.parse_stamp(body) == s
 
 
 def test_the_audit_comment_begins_with_the_audit_sentence():
@@ -90,14 +100,9 @@ def test_the_audit_comment_begins_with_the_audit_sentence():
     assert not body.lstrip().startswith(brief._MARKER_PREFIX)
 
 
-def test_the_stamp_is_also_legible_to_a_human_reading_the_issue():
-    body = _approved(_stamp())
-    assert "Approving session: `%s` on Williams-Mini" % SESSION in body
-
-
 def test_with_no_session_the_comment_is_the_bare_audit_sentence():
     assert _approved(None) == "Approved by William in conversation, 2026-11-06."
-    assert approval.parse_stamps(_approved(None)) == []
+    assert approval.parse_stamp(_approved(None)) is None
 
 
 def test_make_stamp_records_the_short_host_name():
@@ -116,6 +121,9 @@ def test_make_stamp_records_the_short_host_name():
     (SESSION, "h", ""),                           # no directory
     (SESSION, "h", None),
     (SESSION, 7, "/x"),                           # wrong-typed
+    (SESSION[:8] + "\n" + SESSION[8:], "h", "/x"),  # an id with a newline inside it
+    (SESSION, "h", "/x\n<!-- injected -->"),      # a control character smuggles a second line
+    (SESSION, "h\tx", "/x"),
 ])
 def test_make_stamp_refuses_anything_it_could_not_read_back(session, host, cwd):
     assert approval.make_stamp(session, host, cwd) is None
@@ -160,10 +168,38 @@ def test_the_reader_never_trusts_an_ambiguous_author(author):
 
 def test_the_reader_ignores_a_stamp_that_is_not_on_its_own_line():
     """A comment DISCUSSING the format — quoting a marker in backticks or mid-sentence — is not an
-    approval. Only a marker standing on its own line is read."""
+    approval."""
     line = approval.render_stamp(_stamp())
     for body in ("the marker looks like `%s`" % line, "see %s for the format" % line):
         assert approval.latest_stamp([_comment(body)], OWNER) is None
+
+
+_QUOTED_AUDIT = _approved(_stamp(OTHER_SESSION))
+
+
+@pytest.mark.parametrize("body", [
+    # an orchestrator explaining the format, quoting a whole audit comment in a code block
+    "Here is what an approval looks like:\n\n```\n%s\n```" % _QUOTED_AUDIT,
+    "~~~\n%s\n~~~" % _QUOTED_AUDIT,
+    # a fenced block that opens before the sentence and never closes
+    "```\n%s" % _QUOTED_AUDIT,
+    # a memo that pastes the marker on its own line, under some other first line
+    "Worker memo: copied for the record\n\n%s" % approval.render_stamp(_stamp(OTHER_SESSION)),
+    # the marker on its own line but NOT last: prose after it is a comment about it
+    "%s\n\nand that is how it is done." % _QUOTED_AUDIT,
+    # the dashboard's sentence, which never carries a stamp, with one bolted on
+    "Approved by William via command-center, 2026-11-06.\n\n%s"
+    % approval.render_stamp(_stamp(OTHER_SESSION)),
+    # a bare marker
+    approval.render_stamp(_stamp(OTHER_SESSION)),
+])
+def test_only_a_comment_shaped_like_an_audit_comment_carries_a_stamp(body):
+    """Every loop session posts as the owner's own login, so authorship cannot tell an approval
+    from a comment that merely QUOTES one. Shape can: the audit sentence first, the marker last,
+    no code fence. A quoted stamp is no stamp, and it never displaces the real, earlier one."""
+    assert approval.parse_stamp(body) is None
+    comments = [_comment(_approved(_stamp())), _comment(body)]
+    assert approval.latest_stamp(comments, OWNER) == _stamp()
 
 
 @pytest.mark.parametrize("later", [
@@ -187,9 +223,13 @@ def test_an_unstamped_approval_never_clears_an_earlier_stamp(later):
     '<!-- superlooper-approver {"session": "bad id!", "host": "h", "cwd": "/x"} -->',
     '<!-- superlooper-approver {"session": "%s", "host": 3, "cwd": "/x"} -->' % OTHER_SESSION,
     '<!-- superlooper-approver {"session": "%s", "host": "h", "cwd": ""} -->' % OTHER_SESSION,
+    '<!-- superlooper-approver {"session": "%s\\n", "host": "h", "cwd": "/x"} -->' % OTHER_SESSION,
+    '<!-- superlooper-approver {"session": "%s", "host": "h", "cwd": "/x\\u0000"} -->'
+    % OTHER_SESSION,
 ])
 def test_a_malformed_stamp_is_no_stamp_and_never_clears_an_earlier_one(garbage):
-    comments = [_comment(_approved(_stamp())), _comment("Approved.\n\n" + garbage)]
+    later = "Approved by William in conversation, 2026-11-07.\n\n" + garbage
+    comments = [_comment(_approved(_stamp())), _comment(later)]
     assert approval.latest_stamp(comments, OWNER) == _stamp()
     assert approval.latest_stamp(comments[1:], OWNER) is None
 
@@ -288,7 +328,19 @@ def test_any_one_launch_marker_is_enough(var):
 def test_a_plain_terminal_or_a_supervised_session_is_not_refused():
     assert approval.launched_by_runner({}) is None
     assert approval.launched_by_runner({"CLAUDE_CODE_SESSION_ID": SESSION, "HOME": "/h"}) is None
-    assert approval.launched_by_runner({"SL_ISSUE_ID": "  ", "SL_RUN_ROOT": ""}) is None
+
+
+@pytest.mark.parametrize("value", ["", "  ", None, 7])
+def test_a_blanked_or_wrong_typed_marker_still_counts(value):
+    """The launcher never leaves a marker out, so one that is PRESENT but blank is a launched session
+    that blanked it (`SL_ISSUE_ID= superlooper approve 5`). Fail closed: a wrong refusal costs the
+    owner a re-run; a wrong pass costs `agent-ready` applied by a loop session."""
+    assert approval.launched_by_runner({"SL_ISSUE_ID": value}) == "SL_ISSUE_ID"
+
+
+@pytest.mark.parametrize("env", [None, ["SL_ISSUE_ID"], "SL_ISSUE_ID=i7", 7])
+def test_an_unreadable_environment_is_refused(env):
+    assert approval.launched_by_runner(env) == approval.UNREADABLE_ENV
 
 
 def test_every_launch_marker_is_one_the_launcher_names():
@@ -382,9 +434,9 @@ def test_approve_performs_the_whole_ceremony_in_one_call(rig):
     bodies = [c["body"] for c in issue["comments"]]
     assert len(bodies) == 1
     assert bodies[0].startswith("Approved by William in conversation, %s." % _today())
-    assert approval.parse_stamps(bodies[0]) == [approval.Stamp(
+    assert approval.parse_stamp(bodies[0]) == approval.Stamp(
         session=SESSION, host=socket.gethostname().split(".")[0],
-        cwd=os.path.realpath(str(rig.cwd)))]
+        cwd=os.path.realpath(str(rig.cwd)))
 
 
 def test_the_stamp_the_verb_posts_is_the_one_the_reader_returns(rig):
@@ -452,6 +504,55 @@ def test_approve_refuses_inside_every_session_the_runner_launched(rig, tmp_path,
     assert rig.calls() == [], "the refusal must come before ANY GitHub call, reads included"
     assert "agent-ready" not in rig.issue(5)["labels"]
     assert "tok-123" not in r.stderr          # the launch token is never echoed
+
+
+def test_blanking_the_launch_markers_on_the_command_line_is_still_refused(rig, tmp_path):
+    """`SL_ISSUE_ID= SL_RUN_ROOT= … superlooper approve 5` from inside a worker: the fresh-agent
+    review's P1. Present-but-blank is a launched session. (`env -u` removes them outright; the worker
+    hook, which reads the AGENT's environment, is what denies that — test_pretooluse_hook.py.)"""
+    rig.github([_issue(5)])
+    r = rig.approve(5, env_over={var: "" for var in approval.LAUNCH_MARKERS})
+    assert r.returncode == 3, r.stdout + r.stderr
+    assert rig.calls() == []
+
+
+def _transcript(home, project_slug, session, cwds):
+    d = home / ".claude" / "projects" / project_slug
+    d.mkdir(parents=True, exist_ok=True)
+    lines = [json.dumps({"type": "user", "cwd": c, "sessionId": session}) for c in cwds]
+    (d / ("%s.jsonl" % session)).write_text("\n".join(['{"type": "summary"}'] + lines) + "\n")
+
+
+def test_the_stamp_records_the_directory_the_session_started_in(rig, tmp_path):
+    """A session's shell wanders (`cd skills/x` to run a suite), and so does the `cwd` on each of its
+    transcript records — measured on a live session. The agent files the transcript under the
+    directory the session STARTED in, which is the one a resume must run in: the first record."""
+    started = str(tmp_path / "the-project")
+    _transcript(tmp_path / "userhome", "-the-project", SESSION,
+                [started, started + "/skills/superlooper", started])
+    rig.github([_issue(5)])
+    assert rig.approve(5).returncode == 0
+    stamp = approval.parse_stamp(rig.issue(5)["comments"][0]["body"])
+    assert stamp.cwd == started
+    assert stamp.cwd != os.path.realpath(str(rig.cwd))
+
+
+def test_the_agents_own_config_dir_is_where_its_transcript_is_looked_for(rig, tmp_path):
+    started = str(tmp_path / "elsewhere")
+    cfg = tmp_path / "fleet-config"
+    d = cfg / "projects" / "-elsewhere"
+    d.mkdir(parents=True)
+    (d / ("%s.jsonl" % SESSION)).write_text(json.dumps({"cwd": started}) + "\n")
+    rig.github([_issue(5)])
+    assert rig.approve(5, env_over={identity.CONFIG_DIR_VAR: str(cfg)}).returncode == 0
+    assert approval.parse_stamp(rig.issue(5)["comments"][0]["body"]).cwd == started
+
+
+def test_with_no_transcript_the_stamp_falls_back_to_the_working_directory(rig):
+    rig.github([_issue(5)])
+    assert rig.approve(5).returncode == 0
+    stamp = approval.parse_stamp(rig.issue(5)["comments"][0]["body"])
+    assert stamp.cwd == os.path.realpath(str(rig.cwd))
 
 
 def test_an_unreadable_issue_is_not_approved_and_the_rest_still_are(rig):

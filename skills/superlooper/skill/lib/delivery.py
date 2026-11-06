@@ -187,6 +187,64 @@ def records(run_root, iid, agent="claude", env=None, tail_bytes=TAIL_BYTES):
         window = min(window * 8, MAX_TAIL_BYTES)
 
 
+# How much of a transcript's HEAD `session_directory` reads. The answer is in the first records the
+# agent writes, which are small; a head this size never needs widening, and a session whose first
+# 64KB carries no `cwd` at all is one this answers None for rather than read megabytes to settle.
+HEAD_BYTES = 64 * 1024
+
+
+def own_projects_root(env=None):
+    """Where THIS process's own agent keeps its transcripts — the caller's own session, not a
+    worker's: the config dir the agent itself was started under (`identity.CONFIG_DIR_VAR`), else
+    the default under HOME. Deliberately not `transcript_root`, which answers for the FLEET's
+    workers and ignores an inherited config dir on purpose; here the inherited one is exactly the
+    one in force. None when nothing resolves."""
+    env = os.environ if env is None else env
+    configured = env.get(identity.CONFIG_DIR_VAR) if hasattr(env, "get") else None
+    if isinstance(configured, str) and configured.strip():
+        return os.path.join(os.path.expanduser(configured.strip()), PROJECTS_DIRNAME)
+    home = env.get("HOME") if hasattr(env, "get") else None
+    if not isinstance(home, str) or not home.strip():
+        return None
+    return os.path.join(home, CONFIG_DIR_DEFAULT, PROJECTS_DIRNAME)
+
+
+def session_directory(session_id, env=None, head_bytes=HEAD_BYTES):
+    """The directory a live session was STARTED in, from its own transcript — or None (issue #537).
+
+    Why not the caller's `os.getcwd()`: a session's shell wanders (`cd skills/x` to run a suite),
+    but the agent files the transcript under the directory the session started in, and that is
+    the directory a later `--resume` must run in. Every record the agent writes carries the cwd
+    of that moment, so it wanders too — measured on a live session: two values, alternating. The
+    FIRST record carrying one is the start directory, and the file is found by id (`Transcript._path`,
+    which globs rather than rebuilding the agent's project-slug encoding).
+
+    None for every failure — no id, no root, no file, no `cwd` in the head — and the caller falls
+    back to its own working directory, which is right whenever the shell has not wandered."""
+    if not isinstance(session_id, str) or not session_id.strip():
+        return None
+    path = Transcript(root=own_projects_root(env), session_id=session_id.strip(), text="")._path()
+    if not path:
+        return None
+    try:
+        with open(path, "rb") as f:
+            raw = f.read(max(int(head_bytes), 1))
+    except OSError:
+        return None
+    lines = raw.decode("utf-8", "replace").splitlines()
+    if len(raw) >= head_bytes and lines:
+        lines = lines[:-1]                # the read almost certainly stopped mid-line; drop it
+    for line in lines:
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        cwd = rec.get("cwd") if isinstance(rec, dict) else None
+        if isinstance(cwd, str) and cwd.strip():
+            return cwd
+    return None
+
+
 def _tail(path, window):
     """``(parsed records, file size)`` for the last ``window`` bytes, or ``([], 0)``."""
     try:
