@@ -11,7 +11,8 @@ and nobody can answer a question — you are **UNATTENDED**. This brief is your 
 The owner's standing rule says what a consult may and may not do. **Read it before you decide:**
 
 - in this checkout: `{rule_path}`
-- if that file is not here, the gated installer published a copy: `{rule_mirror}`
+- if that file is not here, the gated installer published a copy:
+  `~/.claude/skills/superlooper/docs/ops/superlooper/references/consult-standing-rule.md`
 
 That document is the authority. This brief does not extend it — where the two ever seem to differ,
 **the rule wins, and you ESCALATE.**

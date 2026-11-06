@@ -166,7 +166,11 @@ SPAWNER_OPERATOR = "operator"
 # This runner's own launch outcomes. `recover` only at the `exited` tier — the only tier that
 # relaunches; it reads "ok" for a delivered NUDGE too, and an i336 lane whose auth died in-process
 # answers nudges all day while starting nothing.
-RUNNER_LAUNCH_ACTS = ("launch", "resolve_conflict")
+# `consult_start` (#538) runs the same launcher for a `c<N>` fork of an issue's approving session: a
+# verified consult is a session this machine demonstrably started, and a consult refused for a dead
+# credential is the same machine evidence a worker's refusal is. Its record names the WORKER's lane
+# id, which is the issue the consult was about.
+RUNNER_LAUNCH_ACTS = ("launch", "resolve_conflict", "consult_start")
 RUNNER_RELAUNCH_ACT = "recover"
 RUNNER_RELAUNCH_TIERS = ("exited",)
 RUNNER_DELIVERY_OK = "ok"

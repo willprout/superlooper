@@ -232,10 +232,12 @@ def test_every_fallback_reason_has_a_sentence():
 def test_the_standing_rule_exists_beside_the_triage_rule_and_the_brief_points_at_it():
     assert _RULE.is_file()
     assert (_REPO / consult.RULE_PATH) == _RULE
-    assert consult.RULE_MIRROR.endswith("/docs/ops/" + "superlooper/references/"
-                                        "consult-standing-rule.md")
+    # The fallback copy the brief names is exactly where the gated installer mirrors the rule.
+    import ops_docs
+    (dst,) = [d for src, d in ops_docs.OPS_DOCS if src == consult.RULE_PATH]
+    mirror = "~/.claude/skills/superlooper/" + "/".join(ops_docs.MIRROR_REL) + "/" + dst
     text = _packet()
-    assert consult.RULE_PATH in text and consult.RULE_MIRROR in text
+    assert consult.RULE_PATH in text and mirror in text
     rule = _RULE.read_text()
     for must in ("approving session", "Same machine only", "ESCALATE", "agent-ready",
                  "Goal", "Definition of done", "Boundaries", "no approver stamp"):

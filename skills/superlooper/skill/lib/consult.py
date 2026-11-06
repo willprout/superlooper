@@ -325,11 +325,12 @@ def qa_lines(qa_log, operator):
 
 # --------------------------------------------------------------------------- the packet
 
-# Where the consult reads its standing rule: in the approving checkout (this monorepo's own path),
-# else the copy the gated installer mirrors with the ops docs (`ops_docs.OPS_DOCS`, which
-# `tests/test_ops_docs.py` holds to the whole references directory).
+# Where the consult reads its standing rule in the approving checkout (this monorepo's own path).
+# The template also names the copy the gated installer mirrors with the ops docs — spelled in the
+# TEMPLATE, as the triage brief spells its own, because no engine script may name the installed
+# skill home (`tests/test_one_publish_door.py`); `tests/test_consult.py` pins that copy against
+# `ops_docs.OPS_DOCS`.
 RULE_PATH = "plugin/skills/superlooper/references/consult-standing-rule.md"
-RULE_MIRROR = "~/.claude/skills/superlooper/docs/ops/superlooper/references/consult-standing-rule.md"
 
 def _sub(template, mapping):
     """ONE-pass ``{name}`` substitution. A value is placed verbatim and never re-scanned, so a
@@ -369,7 +370,7 @@ def _comment_block(comments, owner, operator, ok=True):
 
 def render_packet(template, *, cid, num, title, body, question, comments, owner, operator,
                   repo_slug, dev_branch, branch_state, history, qa, outcome_path, home,
-                  approver_session, rule_paths=(RULE_PATH, RULE_MIRROR), comments_ok=True):
+                  approver_session, comments_ok=True):
     """The consult's whole brief. Everything the fork knows about now comes from here: its memory
     dates from approval time (and only from the approver's last compaction on), so the packet
     carries the issue as approved, its thread, the question, the branch/PR state and the history."""
@@ -385,7 +386,7 @@ def render_packet(template, *, cid, num, title, body, question, comments, owner,
         "branch_state": "\n".join(branch_state or []) or "_(nothing recorded)_",
         "history": "\n".join(hist) if hist else "_None — this is the issue's first handback._",
         "outcome_path": outcome_path, "outcome_format": outcome_format(),
-        "rule_path": rule_paths[0], "rule_mirror": rule_paths[1],
+        "rule_path": RULE_PATH,
         "timeout_minutes": str(TIMEOUT_SECONDS // 60),
     })
 
@@ -436,4 +437,4 @@ __all__ = ["ID_RE", "PREFIX", "consult_id", "is_consult_id", "issue_id_of", "TIM
            "MALFORMED", "HELD", "FALLBACK_REASONS", "fallback_sentence", "same_machine",
            "ANSWER", "ESCALATE", "Outcome", "ABSENT", "INCOMPLETE", "UNREADABLE", "READ",
            "END_LINE", "parse_outcome", "outcome_format", "HISTORY_ACTS", "history_lines",
-           "qa_lines", "RULE_PATH", "RULE_MIRROR", "render_packet", "MARKER", "answer_comment", "escalation_note"]
+           "qa_lines", "RULE_PATH", "render_packet", "MARKER", "answer_comment", "escalation_note"]
