@@ -42,6 +42,11 @@ def _clear_worker_launch_env(monkeypatch):
         "SL_SESSION_ID",
         "SL_RESUME",
         "SL_RESUME_SESSION_ID",
+        # The AGENT's own conversation id (issue #537). Every Claude Code session exports it —
+        # supervised or launched — so the suite always inherits it, and `superlooper approve`
+        # stamps whatever it finds. Inherited, a test would stamp the TEST RUNNER's own
+        # conversation onto its fixture issue and pass or fail on who happened to run the suite.
+        "CLAUDE_CODE_SESSION_ID",
         # Drift-check overrides (issue #39): a dogfooding machine may export these ambiently. If a
         # future test calls stack_doctor.engine_drift() without a FakeProbe, an ambient
         # SL_SOURCE_REPO/SL_GIT would send it to real git — against the "no test reaches a real

@@ -521,8 +521,14 @@ def main_stateful():
             st["next_comment_id"] = cid + 1
             url = ("https://github.com/fake/repo/issues/%s#issuecomment-%d"
                    % (ARGS[2], cid))
-            issue.setdefault("comments", []).append(
-                {"body": opt("--body"), "id": cid, "url": url})
+            posted = {"body": opt("--body"), "id": cid, "url": url}
+            # Real gh serves every comment with its `author.login`, and the owner-trust readers
+            # (the brief's amendments, the approver stamp #537) key on it. Signed only when the
+            # state names a `viewer` — the account this gh is logged in as — so every state written
+            # before this keeps serving exactly the comments it always did.
+            if isinstance(st.get("viewer"), str):
+                posted["author"] = {"login": st["viewer"]}
+            issue.setdefault("comments", []).append(posted)
             save_state(st)
         # Real gh PRINTS the new comment's permalink, and `gh.comment_link` reads it back — the
         # triage flight's nit close links the ledger ENTRY it just filed (#449). A fake that
