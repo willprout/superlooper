@@ -1293,7 +1293,9 @@ def _git_writes(tokens, start, end):
     if verb in _CONSULT_GIT_WRITES:
         return True
     if verb in _GIT_WRITE_SUBCOMMANDS:
-        return bool(args) and args[0] in _GIT_WRITE_SUBCOMMANDS[verb]
+        # The first NON-flag argument is the subcommand: `git remote -v add x u` still adds.
+        sub = next((t for t in args if not t.startswith("-")), None)
+        return sub in _GIT_WRITE_SUBCOMMANDS[verb]
     if verb == "symbolic-ref":
         return len([t for t in args if not t.startswith("-")]) >= 2 or "-d" in args \
             or "--delete" in args
@@ -1304,10 +1306,11 @@ def _git_writes(tokens, start, end):
                    or (t.startswith("-") and not t.startswith("--") and set(t[1:]) & short)
                    for t in args)
     if verb == "config":
-        if any(t in _GIT_CONFIG_READ_FLAGS for t in args):
-            return False
-        # `git config <key>` with one value-less key is a READ; anything with a value writes.
-        return len([t for t in args if not t.startswith("-")]) != 1
+        # A READ only when it says so (`--get`, `--list`, `get`, ...). The bare one-key form reads
+        # too, and is deliberately left denied: telling it apart from the one-argument writes
+        # (`--unset k`, `--remove-section s`, `edit`) is a parser this hook does not need, and the
+        # over-denial costs a consult nothing — `git config --get k` reads the same value.
+        return not any(t in _GIT_CONFIG_READ_FLAGS for t in args)
     return False
 
 
@@ -1332,7 +1335,8 @@ def _consult_bash_write(tokens):
                 gh_args = tokens[verb + 2:end]
                 if (any("mutation" in t.lower() for t in tokens)
                         or any(t == "--input" or t.startswith("--input=") or "=@" in t
-                               or t.startswith("@") for t in gh_args)):
+                               or t.startswith("@") or "$(" in t or "`" in t
+                               for t in gh_args)):
                     return True
                 continue
             if method is not None:

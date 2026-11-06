@@ -1539,7 +1539,18 @@ def test_review_round_2_consult_write_paths_are_denied(command):
     assert wp.run(_cbash(command), CONSULT_ENV) is not None, command
 
 
+@pytest.mark.parametrize("command", [
+    "git config --unset user.name", "git config --unset-all remote.origin.fetch",
+    "git config --remove-section remote.origin", "git config --local --unset core.hooksPath",
+    "git config edit", "git config user.email",            # the bare one-key read stays denied
+    "git remote -v add evil https://x", "git remote --verbose set-url origin x",
+    "gh api graphql -f query=\"$(cat m.graphql)\"", "gh api graphql -f query=`cat m.graphql`",
+])
+def test_confirmation_review_consult_write_paths_are_denied(command):
+    assert wp.run(_cbash(command), CONSULT_ENV) is not None, command
+
+
 @pytest.mark.parametrize("command", ["git remote -v", "git reflog -5", "git symbolic-ref HEAD",
-                                     "git config user.email"])
+                                     "git config --get user.email", "git remote get-url origin"])
 def test_review_round_2_consult_reads_stay_allowed(command):
     assert wp.run(_cbash(command), CONSULT_ENV) is None, command
