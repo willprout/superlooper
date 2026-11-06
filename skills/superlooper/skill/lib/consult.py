@@ -665,7 +665,7 @@ def render_handback_packet(template, *, cid, num, title, body, kind, what, comme
                   "decide: write the move you would make anyway, and your reasoning and "
                   "recommendation go to %s with it." % (operator, operator))
     else:
-        bright = "_Not a bright-line park: the move you choose is the one the runner carries out._"
+        bright = "_Not a bright line: the move you choose is the one the runner carries out._"
     if type(cap) is int and handback_number + 1 >= cap:
         cap_line = ("This is handback %d on this issue. The next one goes to %s regardless, with the "
                     "consult history attached (cap %d)." % (handback_number, operator, cap))

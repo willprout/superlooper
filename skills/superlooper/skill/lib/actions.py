@@ -3970,10 +3970,10 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                         route = handback_route(
                             iid, num, consult_mod.FROZEN,
                             consult_mod.handback_key(consult_mod.FROZEN, fsince),
-                            {"memo": f"{iid} has been frozen — no activity past the "
-                                     f"{events_mod.FREEZE_SECONDS // 60}-minute freeze threshold — "
-                                     f"for {int((now - fsince) // 60)} more minutes, and the loop's "
-                                     "context-free nudge did not wake it",
+                            {"memo": f"{iid} went quiet past the "
+                                     f"{events_mod.FREEZE_SECONDS // 60}-minute freeze threshold "
+                                     f"and has stayed frozen {int((now - fsince) // 60)} minutes "
+                                     "since; the loop's context-free nudge did not wake it",
                              "since": fsince})
                         if route is _HB_TAKEN:
                             continue
