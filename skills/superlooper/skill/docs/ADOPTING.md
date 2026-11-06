@@ -223,6 +223,7 @@ on dev.)
 | `session.freeze_seconds` | `2700` | The hard stall backstop (45 min) → the recovery ladder. |
 | `session.retry_cap` | `2` | Relaunch attempts before an issue is parked. |
 | `session.conflict_cap` | `2` | Conflict-regenerations before an issue is handed to William. |
+| `session.handback_cap` | `3` | Every park, bounce, frozen lane, dialog or host block on an issue goes first to a consult of the session that approved it (#539). The handback with this number — counting every consult on the issue since its approval — goes to William regardless, with the consult history attached. `0` or `1` sends every handback straight to William. |
 | `qa.nightly_cmd` | `null` | The full nightly QA command (e.g. a browser suite). `null` = no nightly loop yet. |
 | `qa.results_glob` | `null` | Where the nightly run writes JUnit XML the loop parses. |
 | `qa.retry_once` | `true` | Re-run a failing nightly once; a failure that clears on retry is a flake (stats only), a persistent one files a fix issue. |

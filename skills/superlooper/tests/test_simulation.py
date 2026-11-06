@@ -1111,6 +1111,103 @@ def test_a_question_the_approving_session_escalates_reaches_the_owner_with_its_r
 
 
 # =====================================================================================
+# the handback consult (#539): a park, a bounce, a freeze, a dialog or a host block goes FIRST to
+# the approving session's fork, which picks ONE move the runner carries out. Driven through the
+# same real chain as the question consult above, with a worker that BOUNCES.
+# =====================================================================================
+
+_BOUNCE_MEMO = ("BOUNCED: the target module moved since approval.\n\n"
+                "Proposed amendment: retarget the Goal at src/newmod.")
+
+
+def _relaunch_outcome(clarification="The module now lives at src/newmod; build there."):
+    return ("MOVE: RELAUNCH\nREASONING:\nThe owner ruled the module move in the approving "
+            "conversation.\nCLARIFICATION:\n%s\nEND\n" % clarification)
+
+
+def _moved(sim, sid):
+    return (sim.loop_issue(sid).get("handback") or {}).get("state") == "moved"
+
+
+def test_a_bounce_the_approving_session_relaunches_merges_without_the_owner(sim_factory):
+    sim = sim_factory()
+    num = sim.add_issue(title="Bounces on a premise the approver settled",
+                        scenario={"scenario": "bounce", "memo": _BOUNCE_MEMO})
+    sid, cid = "i%d" % num, "c%d" % num
+    _approved_by_a_stamped_session(sim, num)
+    sim.set_scenario(cid, {"scenario": "consult", "outcome": _relaunch_outcome()})
+
+    assert sim.tick_until(lambda: _moved(sim, sid), ticks=30), \
+        [(r.get("act"), r.get("outcome")) for r in sim.journal()]
+    sim.set_scenario(sid, {"scenario": "happy"})        # the relaunched session builds it
+    assert sim.tick_until(lambda: sim.loop_issue(sid).get("status") == "merged", ticks=40), \
+        [(r.get("act"), r.get("outcome")) for r in sim.journal()]
+
+    # the fork was a fork of the approver, under its own id
+    argv = _fork_argv(sim, num)
+    assert argv[argv.index("--resume") + 1] == _APPROVER and "--fork-session" in argv
+    # the decision went up marked as the approving session's; the bounce never reached the owner
+    marked = [m for m in sim.mutations("comment")
+              if m["body"].startswith("<!-- superlooper-consult -->")]
+    assert len(marked) == 1 and "src/newmod" in marked[0]["body"]
+    assert not [m for m in sim.mutations("comment") if _BOUNCE_MEMO in m["body"]]
+    assert not [m for m in sim.mutations("set_labels") if "needs-owner" in str(m.get("add"))]
+    assert not [m for m in sim.mutations("set_labels") if "agent-ready" in str(m.get("add"))]
+    assert not any("bounced" in ln for ln in sim.notify_lines())
+    # the relaunched session's brief carried the clarification, attributed to that session
+    brief_text = open(os.path.join(sim.home, "briefs", "%s.md" % sid)).read()
+    assert "src/newmod; build there" in brief_text and _APPROVER in brief_text
+    (rec,) = sim.journal("consult_outcome")
+    assert rec["outcome_kind"] == "moved" and rec["move"] == "relaunch"
+    assert rec["handback"] == "bounce"
+
+
+def test_a_bounce_the_approving_session_escalates_reaches_the_owner_as_today(sim_factory):
+    sim = sim_factory()
+    num = sim.add_issue(title="Bounces on a real fork",
+                        scenario={"scenario": "bounce", "memo": _BOUNCE_MEMO})
+    sid, cid = "i%d" % num, "c%d" % num
+    _approved_by_a_stamped_session(sim, num)
+    sim.set_scenario(cid, {"scenario": "consult",
+                           "outcome": "MOVE: ESCALATE\nREASONING:\nNever discussed when the work "
+                                      "was shaped.\nRECOMMENDATION:\nApprove the amendment.\nEND\n"})
+
+    assert sim.tick_until(lambda: sim.loop_issue(sid).get("status") == "bounced", ticks=30), \
+        [(r.get("act"), r.get("outcome")) for r in sim.journal()]
+    # today's bounce, byte for byte: the memo verbatim, needs-owner, a page...
+    assert [m for m in sim.mutations("comment") if _BOUNCE_MEMO in m["body"]]
+    assert "needs-owner" in sim.issue(num)["labels"]
+    assert any("bounced" in ln for ln in sim.notify_lines())
+    # ...plus the approving session's reasoning, as a marked comment of its own
+    (note,) = [m for m in sim.mutations("comment")
+               if m["body"].startswith("<!-- superlooper-consult -->")]
+    assert "Never discussed" in note["body"] and "Approve the amendment." in note["body"]
+    assert not os.path.exists(os.path.join(sim.home, "reports", "%s.md" % cid))
+
+
+def test_the_third_handback_goes_to_the_owner_with_the_consult_history(sim_factory):
+    sim = sim_factory()
+    num = sim.add_issue(title="Bounces every time",
+                        scenario={"scenario": "bounce", "memo": _BOUNCE_MEMO})
+    sid, cid = "i%d" % num, "c%d" % num
+    _approved_by_a_stamped_session(sim, num)
+    sim.set_scenario(cid, {"scenario": "consult",
+                           "outcome": _relaunch_outcome("Try once more.")})
+
+    assert sim.tick_until(lambda: sim.loop_issue(sid).get("status") == "bounced", ticks=90), \
+        [(r.get("act"), r.get("outcome")) for r in sim.journal()]
+    assert sim.loop_issue(sid).get("handback_consults") == 2, "two consults, then the cap"
+    moves = [r for r in sim.journal("consult_outcome") if r.get("outcome_kind") == "moved"]
+    assert len(moves) == 2
+    (note,) = [m for m in sim.mutations("comment")
+               if m["body"].startswith("<!-- superlooper-consult -->")
+               and "regardless" in m["body"]]
+    assert note["body"].count("chose to relaunch") == 2, note["body"]
+    assert "needs-owner" in sim.issue(num)["labels"]
+    assert any("bounced" in ln for ln in sim.notify_lines())
+
+
+# =====================================================================================
 # investigate: marker comment + parent:-linked child; parent closed; child WAITS
 # =====================================================================================
 

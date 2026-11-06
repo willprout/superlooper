@@ -21,6 +21,14 @@ loop is *meant* to be operated.
 **Diagnosis before repair, always.** The readout is read-only; run it fully before mutating
 anything. Most documented incidents needed rung 1–2 repairs or none at all.
 
+**Not every handback is yours.** An ISSUE-level handback goes first to a consult of the session
+that approved that issue (`c<N>`; the rule is the superlooper skill's
+`references/consult-standing-rule.md`, #538/#539). That covers a question, a park, a bounce, a
+frozen lane, a lane at a dialog and a lane the host reports blocked. Its move is posted on the
+issue, and a `c<N>` window you find open is a consult at work, not a stuck worker. This playbook
+keeps what belongs to no single issue: a stalled or dead runner, a GitHub or usage outage, a storm
+across lanes.
+
 ## Router — open the one reference the moment needs
 
 | Situation | Read | For |

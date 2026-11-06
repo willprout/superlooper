@@ -16,6 +16,13 @@ heartbeat_stale away from the debugger episode, caps restarts per rolling hour (
 loudly), and settles the reborn-but-booting runner. It is still pure: the CLI resolves the
 recorded anchor pane and executes the restart through resurrect-runner.sh.
 
+WHAT IS NOT ITS FIRST CALL (issue #539). An ISSUE-level handback — a park, a bounce, a frozen lane,
+a lane at a dialog, a lane the session host reports blocked — goes first to a consult of the session
+that approved the issue (`c<N>`; plugin/skills/superlooper/references/consult-standing-rule.md). It
+reaches the owner, and this module's ALERT signal for a dialog or a host block, only once that
+consult escalated it or could not decide. Nothing here changed for it: the watchdog and its repair
+session keep what belongs to no single issue — a stalled or dead runner, a GitHub or usage outage.
+
 Three signals, per the heartbeat/ALERT contract in plugin/skills/superlooper/references/runner-ops.md:
   heartbeat_stale  state/runner.heartbeat older than the configured bound. The heartbeat
                    marks tick PROGRESS (stamped at the END of a successful tick), so a

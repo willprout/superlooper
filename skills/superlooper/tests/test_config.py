@@ -61,7 +61,8 @@ def test_minimal_config_fills_defaults(tmp_path):
     assert cfg["models"] == {"worker": "opus[1m]", "debugger": "opus[1m]", "worker_effort": None,
                              "reviewer": "gpt-5.5", "reviewer_effort": "medium"}
     assert cfg["session"] == {"idle_seconds": 480, "freeze_seconds": 2700,
-                              "retry_cap": 2, "conflict_cap": 2, "checks_pending_cap": 10800}
+                              "retry_cap": 2, "conflict_cap": 2, "checks_pending_cap": 10800,
+                              "handback_cap": 3}
     assert cfg["qa"] == {"nightly_cmd": None, "results_glob": None, "retry_once": True,
                          "quarantine": [], "nightly_time": "02:00"}
     assert cfg["cleanup_merged_worktrees"] is True
@@ -176,6 +177,21 @@ def test_checks_pending_cap_default_and_validation(tmp_path):
     assert config.load(tmp_path)["session"]["checks_pending_cap"] == 600
     for bad in (-1, "soon", True, 1.5):
         _write_cfg(tmp_path, {"repo": "me/tool", "session": {"checks_pending_cap": bad}})
+        with pytest.raises(ValueError):
+            config.load(tmp_path)
+
+
+def test_handback_cap_default_and_validation(tmp_path):
+    # issue #539: a third handback on one issue goes to the owner regardless of the approving
+    # session's consult. Three is the default, and the owner can change it.
+    _write_cfg(tmp_path, {"repo": "me/tool"})
+    assert config.load(tmp_path)["session"]["handback_cap"] == 3
+    _write_cfg(tmp_path, {"repo": "me/tool", "session": {"handback_cap": 5}})
+    assert config.load(tmp_path)["session"]["handback_cap"] == 5
+    _write_cfg(tmp_path, {"repo": "me/tool", "session": {"handback_cap": 0}})
+    assert config.load(tmp_path)["session"]["handback_cap"] == 0
+    for bad in (-1, "three", True, 2.5, None):
+        _write_cfg(tmp_path, {"repo": "me/tool", "session": {"handback_cap": bad}})
         with pytest.raises(ValueError):
             config.load(tmp_path)
 

@@ -417,6 +417,42 @@ def _qa_block(qa, operator):
     return "".join(parts)
 
 
+def _notes_block(notes, operator):
+    """The approving session's clarifications (#539) as a BINDING section, or "" when there are
+    none. A consult that relaunched this issue after a handback — a park, a bounce, a freeze, a
+    dialog — may hand the fresh session a clarification; like a consult's answer (#538) it binds
+    this build but is that session's judgment, never the owner's own word, and is said to be so.
+    Fail closed like _qa_block: a wrong-typed arg is no block, a non-dict or empty note is skipped,
+    and every string is concatenated after substitution so a {placeholder} inside one stays literal."""
+    if not isinstance(notes, list):
+        return ""
+    items = []
+    for e in notes:
+        if not isinstance(e, dict):
+            continue
+        note = e.get("note")
+        if not (isinstance(note, str) and note.strip()):
+            continue
+        session = e.get("session") if isinstance(e.get("session"), str) else ""
+        why = e.get("handback") if isinstance(e.get("handback"), str) else ""
+        items.append((note.strip(), session, why.strip()))
+    if not items:
+        return ""
+    parts = [
+        "## The approving session's clarifications (BINDING — treat as approved text)\n\n"
+        "A prior session on this issue was about to be handed back to "
+        f"{operator} — parked, bounced, frozen or stuck. Before it reached {operator}, the loop "
+        "consulted a fork of the orchestration session that APPROVED this issue, which relaunched "
+        "it with the clarification below. It is binding for this build, but it is that session's "
+        f"judgment of what {operator} wanted, not {operator}'s own word.\n\n"
+    ]
+    for i, (note, session, why) in enumerate(items, 1):
+        who = f" (from the approving session `{session}`)" if session else ""
+        what = f"_The handback it answered:_ {why}\n\n" if why else ""
+        parts.append(f"**Clarification {i}{who}:**\n\n{what}{note}\n\n")
+    return "".join(parts)
+
+
 def _sub(text, mapping):
     """Sequential literal substitution of {key} -> value. Deliberately NOT str.format: the footer
     prose and the William body carry stray braces/backticks that format() would choke on, and only
@@ -426,7 +462,7 @@ def _sub(text, mapping):
     return text
 
 
-def build(parsed_issue, config, comments=None, qa=None):
+def build(parsed_issue, config, comments=None, qa=None, notes=None):
     """Render the full brief for one issue: William-approved body verbatim + any answered-question
     trail + any launch-time post-approval amendments + the mechanical footer. Does not mutate
     `parsed_issue`, `config`, `comments`, or `qa`.
@@ -439,7 +475,10 @@ def build(parsed_issue, config, comments=None, qa=None):
     `qa` (default None) is the durable answered-question log (#163): a list of {question, answer}
     dicts. On a relaunch after an owner's answer it renders a BINDING Q&A section so the fresh
     session inherits every settled decision. Empty/None/wrong-typed -> no block, a brief
-    byte-identical to a first launch (see _qa_block)."""
+    byte-identical to a first launch (see _qa_block).
+
+    `notes` (default None, #539) is the approving session's clarifications from a consult that
+    relaunched this issue after a handback. Empty/None/wrong-typed -> no block (see _notes_block)."""
     itype = parsed_issue.get("type")
     work_block, finish_deliverable, assumption_hint = _work_and_finish(itype)   # raises on invalid type
 
@@ -485,6 +524,7 @@ def build(parsed_issue, config, comments=None, qa=None):
     operator = _operator(config)               # the name every stranger-visible line signs with (#58)
     amendments = _amendments(comments, config)
     qa_block = _qa_block(qa, operator)         # the answered-question trail (#163), if any
+    qa_block += _notes_block(notes, operator)  # ...and the consult's clarifications (#539), if any
     post_approval_note = _post_approval_note(operator) if amendments else ""
 
     report_sections = _report_sections(config)
