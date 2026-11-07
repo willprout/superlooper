@@ -100,10 +100,16 @@ session; each one loads the playbook for that job:
 - The dashboard is the glance: departures, the field, arrivals, and the Needs You cards.
 - `superlooper status --repo <path>` — lanes, gate, freeze state, read from disk; works
   whether or not the runner is up.
-- The actual windows: the install writes an attach script, `viewer.command`, next to the
-  Herdr binary — double-click it for a window onto every running session. Watching is
-  optional in the strongest sense: nothing depends on the window being open, and closing
-  it kills no session.
+- The actual windows: a flight card's **Open session window** button puts a terminal
+  window showing that session in front of you. If no viewer is open it opens one; if one
+  is, it switches it to that session and brings it forward. The toast says which, or says
+  plainly why no window could be shown. The fixer card's button works the same way. The
+  viewer is `viewer.command`, which the install writes next to the Herdr binary; you can
+  also double-click it for a window onto every running session. It presents the fleet's
+  token from the token file, so it attaches on a fenced machine. A machine built before
+  #547 has a script that presents no token: re-run `superlooper fleet --install` once to
+  rewrite it. Watching is optional in the strongest sense: nothing depends on the window
+  being open, and closing it kills no session.
 - `tail -f <state home>/logs/runner.log` when you want the runner's own voice.
 
 ## Answering

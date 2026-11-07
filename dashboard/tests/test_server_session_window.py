@@ -37,7 +37,7 @@ class _RecordingSessionWindow:
     the engine — so the ROUTE contract (which repo, which number) is tested independently of the
     verb."""
 
-    def __init__(self, ok=True, outcome="focused", message="opened"):
+    def __init__(self, ok=True, outcome="opened", message="opened"):
         self.calls = []
         self._ok, self._outcome, self._message = ok, outcome, message
 
@@ -180,7 +180,7 @@ def test_open_over_a_real_socket_shells_the_engines_verb(monkeypatch, tmp_path):
         srv.server_close()
         th.join(timeout=5)
 
-    assert body["ok"] is True and body["outcome"] == "focused" and body["id"] == "i340"
+    assert body["ok"] is True and body["outcome"] == "opened" and body["id"] == "i340"
     # The fake logs its argv, so this pins the exact command the whole socket path produced — the
     # engine's read-only verb, scoped to the WATCHED checkout, targeting the derived lane.
     calls = [json.loads(ln) for ln in (tmp_path / "calls.jsonl").read_text().splitlines() if ln]

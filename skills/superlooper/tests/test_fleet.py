@@ -306,10 +306,79 @@ def test_the_shipped_server_template_is_a_real_plist_and_names_no_system_domain(
 
 
 def test_the_viewer_ships_as_an_artefact_and_never_as_something_an_install_registers():
-    text = fleet.render_viewer_command(binary=_BIN, session=fleet.SESSION_NAME)
+    text = fleet.render_viewer_command(binary=_BIN, session=fleet.SESSION_NAME,
+                                       token_file=fleet.token_file(_PREFIX))
     assert text.startswith("#!/bin/sh")
     assert _BIN in text and fleet.SESSION_NAME in text
     assert fleet.viewer_command(_PREFIX).endswith(".command")
+
+
+# ------------------------------------------------- the viewer presents the token (issue #547)
+
+def _sh_lines(text):
+    """The script's executable lines — comments and blank lines dropped."""
+    return [ln for ln in text.splitlines() if ln.strip() and not ln.lstrip().startswith("#")]
+
+
+def test_the_viewer_points_the_host_client_at_the_token_file_the_server_job_reads():
+    """Paid for on 2026-11-06: the viewer the install shipped was refused on every fenced machine
+    (`unauthorized: this socket requires a token`), and the same binary attached the moment it was
+    started with the token-file variable pointing at the fleet's token. So the script sets exactly
+    that variable, to exactly the path the server job is given — one file, read by both."""
+    token = fleet.token_file(_PREFIX)
+    text = fleet.render_viewer_command(binary=_BIN, session=fleet.SESSION_NAME, token_file=token)
+    lines = _sh_lines(text)
+    var = session_host.API_TOKEN_FILE_ENV_VAR
+    assert "%s='%s'" % (var, token) in lines, text
+    assert "export %s" % var in lines, text
+    # Set BEFORE the exec, or the client never sees it.
+    assert lines.index("export %s" % var) < next(i for i, ln in enumerate(lines)
+                                                 if ln.startswith("exec "))
+    # ...and it is the very path the server's own job is handed.
+    plist = fleet.render_server_plist(binary=_BIN, session=fleet.SESSION_NAME, token_file=token,
+                                      log_dir=fleet.log_dir(_PREFIX), path="/usr/bin:/bin")
+    assert plistlib.loads(plist.encode())["EnvironmentVariables"][var] == token
+
+
+def test_the_token_value_appears_nowhere_in_the_viewer_and_never_on_its_command_line(tmp_path):
+    """The token goes nowhere new (#547 boundary, #342 same-uid ruling): the client reads it from
+    the same 0600 file the server reads. Not inlined into the script — a `.command` is an ordinary
+    file anybody opens in an editor — and not in argv, which a same-uid reader is SERVED on macOS
+    (measured for #305). The script writes no log, so there is no third place for it to go."""
+    prefix = tmp_path / "fleet"
+    prefix.mkdir()
+    token = prefix / "token"
+    secret = "s3cr3t-fence-token-value-0123456789abcdef"
+    token.write_text(secret)
+    text = fleet.render_viewer_command(binary=fleet.host_binary(str(prefix)),
+                                       session=fleet.SESSION_NAME, token_file=str(token))
+    assert secret not in text
+    exec_line = next(ln for ln in _sh_lines(text) if ln.startswith("exec "))
+    assert exec_line == "exec %s" % " ".join(
+        fleet._sh_quote(a) for a in fleet.viewer_argv(fleet.host_binary(str(prefix)),
+                                                      fleet.SESSION_NAME))
+    assert session_host.API_TOKEN_ENV_VAR + "=" not in text, (
+        "the VALUE variable is the one that would carry the secret itself; only the FILE is named")
+    for ln in _sh_lines(text):
+        assert ">" not in ln and "tee" not in ln.split(), "the viewer writes nothing anywhere"
+
+
+@pytest.mark.parametrize("bad", ["relative/token", "", None])
+def test_a_viewer_with_no_absolute_token_path_is_refused_rather_than_rendered(bad):
+    # A relative path resolves against whatever directory the terminal starts the script in, which
+    # is a viewer that is refused by the fence for a reason nobody can see from the window.
+    with pytest.raises(ValueError):
+        fleet.render_viewer_command(binary=_BIN, session=fleet.SESSION_NAME, token_file=bad)
+
+
+def test_the_viewers_argv_is_spelled_once_for_the_script_and_for_finding_it():
+    # `superlooper focus-session` finds an attached viewer by its exact command line (the host's
+    # API has no way to list its clients — #547 finding 1), so the shape the script execs and the
+    # shape the finder looks for must be one function, or a re-spelling silently finds nothing.
+    assert fleet.viewer_argv(_BIN, fleet.SESSION_NAME) == [_BIN, "--session", fleet.SESSION_NAME]
+    text = fleet.render_viewer_command(binary=_BIN, session=fleet.SESSION_NAME,
+                                       token_file=fleet.token_file(_PREFIX))
+    assert "exec '%s' '--session' '%s'" % (_BIN, fleet.SESSION_NAME) in text
 
 
 # --------------------------------------------------------------- identity (c25, #300, #313)

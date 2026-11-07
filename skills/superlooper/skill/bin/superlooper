@@ -52,12 +52,14 @@
                   in-flight or mid-gate lane, so it is safe to run while the runner is live. A
                   t<N> triage flight is a subject too (#463): one that closed its own run by
                   default, one whose session merely died under --all
-  focus-session   bring ONE lane's session window to the front so you can watch it — and type into
-                  it — with your own eyes (issue #339). Read-only about the FLEET: it never spawns,
-                  sends, exits or kills, and it is not a viewer (the window it surfaces is the real
-                  interactive terminal). Four outcomes, all reportable: focused / no_window (the
-                  session ended or tidy closed it — an ordinary answer, not a failure) /
-                  host_unreachable / unknown_lane. A local ops UI shells this instead of reaching
+  focus-session   put a terminal window showing ONE lane in front of you so you can watch it — and
+                  type into it — with your own eyes (issues #339, #547): it focuses the lane, then
+                  switches and raises the attached fleet viewer, or opens one. Read-only about the
+                  FLEET: it never spawns, sends, exits or kills. Every outcome is reportable:
+                  opened / switched / no_window (the session ended or tidy closed it — an ordinary
+                  answer, not a failure) / host_unreachable / unknown_lane / no_display /
+                  open_failed / viewer_not_attached / viewer_not_on_screen. A local ops UI shells
+                  this instead of reaching
                   the session host itself
   janitor         propose GitHub-side cleanup (stale merged/superseded sl/* branches, open
                   `superseded` PRs, aged parked/needs-william issues, issues closed as
@@ -866,8 +868,12 @@ def cmd_fleet(args):
         print("  %s %s" % (wrote, plist))
 
         viewer = fleet.viewer_command(prefix)
+        # The viewer presents the token by the token FILE's path, exactly as the server job does
+        # (#547) — so a re-install REWRITES a pre-#547 script, which the fence refuses. The marker
+        # is what makes it ours to rewrite; the token value itself never enters it.
         wrote = _write_once(viewer, fleet.render_viewer_command(binary=binary,
-                                                                session=fleet.SESSION_NAME),
+                                                                session=fleet.SESSION_NAME,
+                                                                token_file=token),
                             fleet.VIEWER_MARKER, "viewer script")
         if wrote != "refused":
             os.chmod(viewer, 0o755)
@@ -6181,11 +6187,13 @@ def _emit_focus(args, result, repo=None):
     if getattr(args, "json", False):
         sys.stdout.write(json.dumps(result.as_dict(repo=repo)) + "\n")
         return
-    if result.outcome == focus_lib.FOCUSED:
-        # "the host moved its focus", not "it is on your screen": a screen shows it only where a
-        # viewer is attached to the session, which is a fact about the machine rather than the lane
-        # (fresh-agent review). Over-claiming here is what would send the owner looking for a
-        # window on a fleet host nobody is watching.
+    if result.outcome in (focus_lib.OPENED, focus_lib.SWITCHED):
+        # Since #547 the verb puts the WINDOW in front, not only the host's focus — and says which:
+        # a new terminal window opened, or the attached one switched and raised.
+        sys.stdout.write("%s: %s (%s).\n" % (result.id, result.detail, result.workspace))
+    elif result.outcome == focus_lib.FOCUSED:
+        # lib/focus's own success, which this verb no longer answers with (show_lane turns it into
+        # one of the two above, or a reason no window could be shown). Kept for completeness.
         sys.stdout.write("%s: the session host moved its focus to that window (%s).\n"
                          % (result.id, result.workspace))
     elif result.outcome == focus_lib.NO_WINDOW:
@@ -6195,14 +6203,24 @@ def _emit_focus(args, result, repo=None):
 
 
 def cmd_focus_session(args):
-    """Bring lane <id>'s session window to the front, and change nothing else anywhere.
+    """Put a terminal window showing lane <id> in front of the owner, and change nothing else.
 
-    The exit code names the outcome (lib/focus.EXIT_CODES): 0 focused, 3 no window, 4 the host
-    could not be reached, 5 unknown repo/id. NOT 2, which stays argparse's — it is also what an
-    installed engine too old for this verb exits with on `invalid choice`, and an outcome sharing
-    it would hide exactly that diagnosis. A caller that can parse JSON should branch on the
-    `outcome` field instead; the codes exist so a shell script does not have to.
+    Issue #547: the host's focus alone (the verb's whole effect before) showed nothing unless a
+    viewer happened to be attached, because the fleet's host runs windowless. So after the focus
+    this switches and raises an attached viewer, or opens one through the machine's normal handler
+    for the fleet's viewer script (lib/focus.show_lane). `superlooper debug` keeps calling
+    lib/focus.focus_lane directly and opens no window.
+
+    The exit code names the outcome (lib/focus.EXIT_CODES): 0 a window is in front (opened or
+    switched), 3 no window, 4 the host could not be reached, 5 unknown repo/id, 6 no GUI login
+    session, 7 the viewer could not be opened, 8 it opened but never attached, 9 a viewer is
+    attached outside any app on this screen. NOT 2, which stays
+    argparse's — it is also what an installed engine too old for this verb exits with on `invalid
+    choice`, and an outcome sharing it would hide exactly that diagnosis. A caller that can parse
+    JSON should branch on the `outcome` field instead; the codes exist so a shell script does not
+    have to.
     """
+    import fleet
     try:
         cfg = _load_config(args.repo)
         home = str(config_lib.state_home(cfg))
@@ -6218,7 +6236,7 @@ def cmd_focus_session(args):
         _emit_focus(args, result)
         return result.exit_code
 
-    result = focus_lib.focus_lane(home, getattr(args, "id", ""))
+    result = focus_lib.show_lane(home, getattr(args, "id", ""), fleet.prefix(_state_base()))
     _emit_focus(args, result, repo=cfg.get("repo"))
     return result.exit_code
 
@@ -6522,9 +6540,9 @@ def main(argv=None):
                              help="list the windows tidy would close, then close nothing")})
     add("focus-session", cmd_focus_session,
         description=(
-            "Bring ONE lane's session window to the front — the real, live, interactive terminal,\n"
-            "so you can watch it and type into it. It is read-only about the FLEET: it never\n"
-            "spawns, sends to, exits or kills a session, and it is not a viewer.\n"
+            "Put a terminal window showing ONE lane in front of you — the real, live, interactive\n"
+            "session, so you can watch it and type into it. It is read-only about the FLEET: it\n"
+            "never spawns, sends to, exits or kills a session.\n"
             "\n"
             "The lane id selects a window recorded for THIS repo and no other, so an i<N> from one\n"
             "repo can never focus another repo's session. All three session classes the launcher\n"
@@ -6532,11 +6550,14 @@ def main(argv=None):
             "flight — the unattended session judging the queue, and the one you most want to\n"
             "watch while it runs.\n"
             "\n"
-            "`focused` means the HOST moved its focus to that window; a screen shows it wherever a\n"
-            "viewer is attached to the session (see `superlooper fleet`).\n"
+            "The session host runs windowless, so its focus alone shows nothing (issue #547). After\n"
+            "focusing, this switches and raises the fleet's viewer if one is attached to this\n"
+            "screen, or opens one — the viewer script `superlooper fleet --install` writes, through\n"
+            "this machine's normal handler for it. Opening that viewer is the only thing it opens.\n"
             "\n"
             "Outcomes (the `outcome` field with --json; the exit code otherwise):\n"
-            "  focused           0  the host brought that window to the front\n"
+            "  opened            0  no viewer was attached; one was opened, showing the lane\n"
+            "  switched          0  the attached viewer now shows the lane, brought to the front\n"
             "  no_window         3  that lane has no window to raise — its window was closed, or\n"
             "                       it never opened one. An ordinary answer: render it as a fact\n"
             "                       about the lane, never as a failure\n"
@@ -6544,15 +6565,24 @@ def main(argv=None):
             "                       that say nothing about the window (never read as 'the\n"
             "                       session is gone')\n"
             "  unknown_lane      5  that repo is not one we know, or that is not a session id\n"
+            "  no_display        6  no GUI login session of yours at this machine's screen\n"
+            "  open_failed       7  the viewer could not be opened (no script, the handler failed,\n"
+            "                       or another tap is still opening it)\n"
+            "  viewer_not_attached 8  it opened, but no viewer attached in time (a pre-#547\n"
+            "                       viewer script is refused by the fence: re-run fleet --install)\n"
+            "  viewer_not_on_screen 9  a viewer is attached outside any app on this screen (tmux,\n"
+            "                       ssh): it now shows the lane, but no window was put in front\n"
             "\n"
-            "2 is left to argparse (a usage error, and what an engine too old for this verb exits\n"
-            "with) so it can never be mistaken for one of the four above."),
+            "Only opened and switched exit 0. Nothing but no_window, host_unreachable and\n"
+            "unknown_lane ever skips the window step, and none of those opens one. 2 is left to\n"
+            "argparse (a usage error, and what an engine too old for this verb exits with) so it\n"
+            "can never be mistaken for an outcome."),
         **{"--id": dict(default=None, metavar="i<N>",
                         help="the session whose window to raise: i<N> (an issue worker), d<N> "
                              "(a debugger session) or t<N> (a triage flight)"),
            "--json": dict(action="store_true",
                           help="emit a single JSON object (for a UI over the loop to parse) — "
-                               "branch on its `outcome` field, which carries all four answers")})
+                               "branch on its `outcome` field, which carries every answer")})
     add("request-restart", cmd_request_restart,
         **{"--check": dict(action="store_true",
                            help="report whether a live runner exists and write nothing "

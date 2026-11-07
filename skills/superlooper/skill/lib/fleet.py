@@ -591,14 +591,54 @@ def render_server_plist(*, binary, session, token_file, log_dir, path):
             .replace("{path}", _xml(path)))
 
 
-def render_viewer_command(*, binary, session):
-    """The owner's attach script — a `.command` file, double-clickable and Login-Item-registerable."""
+def viewer_argv(binary, session):
+    """The viewer's command line — what the script execs, and what finding an attached one matches.
+
+    Spelled ONCE because two callers depend on it agreeing. The script below execs it; and
+    `superlooper focus-session` finds a viewer that is already attached by looking for a process
+    with exactly this command line (issue #547), because the pinned host's API cannot list its
+    clients — no `status`, `session` or snapshot field says whether anybody is attached (read out
+    of the pinned release's own `src/cli/status.rs` and `src/api/schema/session.rs`). A re-spelling
+    in either place would make the finder silently find nothing and open a second window.
+    """
+    return [str(binary), "--session", str(session)]
+
+
+def render_viewer_command(*, binary, session, token_file):
+    """The owner's attach script — a `.command` file, double-clickable and Login-Item-registerable.
+
+    **It presents the fleet token, and it does it the way the server job does** (issue #547): by
+    pointing the host client at the token FILE, never by carrying the token. Before #547 it carried
+    neither, and on a fenced machine — every fleet machine — the host refused it outright with
+    `unauthorized: this socket requires a token` (measured on the mini, 2026-11-06). The client
+    reads the file itself (the carried patch's `client_token`), so the secret is in no script, no
+    command line and no log: the only new reader is a viewer the owner started, reading the same
+    `0600` file the server reads, which is the same-uid exposure #342 already ruled acceptable.
+
+    Absolute paths only: a terminal starts a `.command` in whatever directory it likes, so a
+    relative token path would produce a viewer the fence refuses for a reason nobody can see from
+    the window.
+    """
+    for name, value in (("binary", binary), ("token_file", token_file)):
+        if not str(value or "").startswith("/"):
+            raise ValueError("%s must be absolute — a terminal starts the viewer from a directory "
+                             "of its own choosing, so %r would resolve to nothing" % (name, value))
+    var = session_host.API_TOKEN_FILE_ENV_VAR
     return ("#!/bin/sh\n"
-            "# superlooper fleet viewer (issue #309). Attaches to the fleet's session in a real\n"
-            "# terminal. Nothing load-bearing depends on this being open: #302 measured the pinned\n"
-            "# build reviving hosted agents with no client ever attached, which retired plan\n"
-            "# §5.4's workaround. Register it as a Login Item only if you want the window.\n"
-            "exec %s --session %s\n" % (_sh_quote(binary), _sh_quote(session)))
+            "# superlooper fleet viewer (issues #309, #547). Attaches to the fleet's session in a\n"
+            "# real terminal. Nothing load-bearing depends on this being open: #302 measured the\n"
+            "# pinned build reviving hosted agents with no client ever attached, which retired plan\n"
+            "# §5.4's workaround. The dashboard's Open session window button opens this script for\n"
+            "# you when no viewer is attached; register it as a Login Item only if you want the\n"
+            "# window at every login.\n"
+            "#\n"
+            "# The fleet's control socket is fenced (#305), so the client must present the fleet\n"
+            "# token. It is handed the PATH of the 0600 token file the server job reads, and reads\n"
+            "# the token from there itself: the token is not in this file and never on a command line.\n"
+            "%s=%s\n"
+            "export %s\n"
+            "exec %s\n" % (var, _sh_quote(token_file), var,
+                           " ".join(_sh_quote(a) for a in viewer_argv(binary, session))))
 
 
 def _sh_quote(value):

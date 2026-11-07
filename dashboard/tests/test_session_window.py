@@ -102,15 +102,56 @@ def test_an_unwatched_repo_is_refused_before_any_subprocess(fixtures):
     assert calls(fixtures) == [], "an unwatched repo must never reach a subprocess"
 
 
-# =============================== the four outcomes ===============================
+# =============================== the engine's outcomes ===============================
+#
+# Issue #547. One tap puts a terminal window on the lane in front of the owner — the engine opens a
+# viewer when none is attached, or switches and raises the attached one — and the answer says WHICH.
+# When no window could be shown it says so plainly and reports no success.
 
-def test_a_focused_window_is_an_honest_success(fixtures):
+def test_an_opened_window_is_an_honest_success_that_says_a_window_opened(fixtures):
     res = verb().open(SLUG, 340)
     assert res["ok"] is True
-    assert res["outcome"] == "focused"
+    assert res["outcome"] == "opened"
     assert res["id"] == "i340"
     assert res["error"] is None
-    # The claim is the ENGINE's, not a bigger one: the HOST moved its focus.
+    assert res["message"] == "SL-340 — opened a terminal window on it"
+
+
+def test_a_switched_window_is_an_honest_success_that_says_it_switched(fixtures, monkeypatch):
+    monkeypatch.setenv("SL_FOCUS_OUTCOME", "switched")
+    res = verb().open(SLUG, 340)
+    assert (res["ok"], res["outcome"], res["error"]) == (True, "switched", None)
+    assert res["message"].startswith("SL-340 — switched the open terminal window")
+    assert "opened" not in res["message"], "a switch must never read as a second window"
+
+
+@pytest.mark.parametrize("outcome, words", [
+    ("no_display", "no GUI login session"),
+    ("open_failed", "could not open"),
+    ("viewer_not_attached", "no viewer attached"),
+    ("viewer_not_on_screen", "not inside any app on this screen"),
+])
+def test_no_window_on_screen_is_said_plainly_and_reports_no_success(fixtures, monkeypatch,
+                                                                    outcome, words):
+    # One per way no window could be put in front of the owner: no GUI login session, a failed
+    # opener, a viewer that never attached. The engine's own sentence, never a success.
+    monkeypatch.setenv("SL_FOCUS_OUTCOME", outcome)
+    res = verb().open(SLUG, 340)
+    assert res["ok"] is False
+    assert res["outcome"] == outcome
+    assert words in res["message"] and res["error"] == res["message"]
+
+
+def test_a_pre_547_engines_focus_is_no_success_and_names_the_republish(fixtures, monkeypatch):
+    # `focused` is what an INSTALLED engine from before #547 answers: the host moved its focus and
+    # nothing opened a window for it, so the screen may well show nothing — the very report #547 was
+    # filed on. The dashboard cannot vouch for a window it was never told about, so it claims none,
+    # and names the remedy (the publish drift lib/engine exists for).
+    monkeypatch.setenv("SL_FOCUS_OUTCOME", "focused")
+    res = verb().open(SLUG, 340)
+    assert res["ok"] is False
+    assert res["outcome"] == "focused"
+    assert "bin/install.sh" in res["error"]
     assert "focus" in res["message"].lower()
 
 
@@ -150,7 +191,9 @@ def test_every_outcome_carries_the_same_keys(fixtures, monkeypatch):
     # that has to test for a missing key writes a different branch per answer, which is how one of
     # the four ends up unhandled (the engine's own rule, kept on this side of the wire too).
     seen = []
-    for outcome in ("focused", "no_window", "host_unreachable", "unknown_lane"):
+    for outcome in ("opened", "switched", "focused", "no_window", "host_unreachable",
+                    "unknown_lane", "no_display", "open_failed", "viewer_not_attached",
+                    "viewer_not_on_screen"):
         monkeypatch.setenv("SL_FOCUS_OUTCOME", outcome)
         seen.append(set(verb().open(SLUG, 340)))
     assert all(keys == seen[0] for keys in seen)
@@ -314,6 +357,23 @@ def test_opening_a_fixers_window_shells_the_same_read_only_verb(fixtures):
     assert "--id" in argv and argv[argv.index("--id") + 1] == "d4"
     assert res["ok"] is True and res["id"] == "d4"
     assert "d4" in res["message"], "the sentence must name the fixer the owner tapped"
+
+
+@pytest.mark.parametrize("outcome, ok", [("opened", True), ("switched", True),
+                                          ("no_display", False), ("open_failed", False),
+                                          ("viewer_not_attached", False),
+                                          ("viewer_not_on_screen", False)])
+def test_a_fixers_window_opens_or_switches_exactly_as_a_flights_does(fixtures, monkeypatch,
+                                                                       outcome, ok):
+    # DoD: the fixer card's open button behaves the same way — it is the same engine verb behind
+    # the same `_focus`, so the answer differs only in how the lane is named.
+    monkeypatch.setenv("SL_FOCUS_OUTCOME", outcome)
+    fixer = verb(binary=FAKE).open_debugger(SLUG, "d4")
+    flight = verb(binary=FAKE).open(SLUG, 340)
+    assert (fixer["ok"], fixer["outcome"]) == (ok, outcome) == (flight["ok"], flight["outcome"])
+    if ok:
+        assert fixer["message"].startswith("fixer d4 — ")
+        assert fixer["message"][len("fixer d4"):] == flight["message"][len("SL-340"):]
 
 
 def test_a_fixer_whose_window_is_gone_reads_as_a_fact_not_a_failure(fixtures, monkeypatch):

@@ -141,8 +141,9 @@
     if (!s || !s.present) return "";
     return '<button class="btn ghost drawer-session" data-act="session-window"' +
       ' data-repo="' + esc(d.repo) + '" data-num="' + esc(d.num) + '"' +
-      ' title="Bring this session’s own window to the front — the real terminal, so you can' +
-      ' watch it and type into it. Nothing about the loop changes.">' +
+      ' title="Put a terminal window on this session in front of you — the real terminal, so you' +
+      ' can watch it and type into it. Opens one if none is open; otherwise switches the open' +
+      ' one here. Nothing about the loop changes.">' +
       // U+1F5A5 (desktop computer), not the more literal U+1F5D4 "window": that codepoint has no
       // glyph in the platform emoji font and renders as tofu — checked in the real browser, not
       // guessed. It sits in the same family as the Sweep bin and the Fixer wrench already here.

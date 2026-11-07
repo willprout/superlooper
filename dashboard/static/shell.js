@@ -401,8 +401,9 @@
     // opened, or one that 400s when tapped, is the same lie in a different costume.
     var open = f.session
       ? '<button class="tf-open" data-act="session-window" data-repo="' + esc(slug) + '"' +
-          ' data-fixer="' + esc(f.lane) + '" title="Bring this fixer’s own session window to the' +
-          ' front — the real terminal, so you can watch it and type into it.">' +
+          ' data-fixer="' + esc(f.lane) + '" title="Put a terminal window on this fixer’s session' +
+          ' in front of you — the real terminal, so you can watch it and type into it. Opens one if' +
+          ' none is open; otherwise switches the open one here.">' +
           '\u{1F5A5}\uFE0F Open session window</button>'
       : "";
     return '<span class="trouble-fixer ' + esc(f.outcome) + '" title="' + esc(f.headline) + '">' +

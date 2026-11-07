@@ -195,11 +195,12 @@ _JANITOR_PATHS = {"/api/janitor/propose": "propose", "/api/janitor": "execute"}
 _FIXER_PATHS = {"/api/fixer/check": "preflight", "/api/fixer": "execute"}
 
 # The Open-session-window endpoint (issue #340) — the newest member of the local-command class and
-# the only ONE-STEP one. It shells the engine's read-only `superlooper focus-session` to bring a
-# flight's own window to the front (owner ruling 2026-07-30: a button on the card that opens that
-# session's window — attach, which is proven — instead of observe-stream plumbing). There is no
-# preflight and no confirm gate because the verb changes nothing about the loop: it opens a window
-# the owner already owns. Since issue #458 it also takes a launched FIXER's own `d<N>` seat, so the
+# the only ONE-STEP one. It shells the engine's `superlooper focus-session` to put a terminal
+# window on a flight's session in front of the owner (owner ruling 2026-07-30: a button on the card
+# that opens that session's window — attach, which is proven — instead of observe-stream plumbing;
+# since #547 the ENGINE opens the fleet's viewer when none is attached, or switches the open one).
+# There is no preflight and no confirm gate because the verb changes nothing about the loop: it
+# opens a window onto sessions the owner already owns. Since issue #458 it also takes a launched FIXER's own `d<N>` seat, so the
 # fixer the trouble banner now names can be opened from the banner too — one verb, two lane shapes.
 _SESSION_WINDOW_PATH = "/api/session-window"
 
@@ -606,8 +607,9 @@ def route(method, path, snapshot_provider, static_root, *, actions=None, body=b"
     ``fixer`` (a ``lib.fixer.Fixer``) backs the Deploy Fixer endpoints (issue #141), which compose a
     readout from the CURRENT snapshot and shell ``superlooper debug`` to launch one interactive
     sl-debugger session (issue #144). ``session_window`` (a ``lib.session_window.SessionWindow``)
-    backs the Open-session-window endpoint (issue #340), which shells the engine's read-only
-    ``superlooper focus-session`` to bring one flight's own window to the front."""
+    backs the Open-session-window endpoint (issue #340), which shells the engine's
+    ``superlooper focus-session`` to put a terminal window on one flight's session in front of the
+    owner (opening the fleet's viewer, or switching the open one — issue #547)."""
     clean = path.split("?", 1)[0]
     if method == "POST":
         return _route_post(clean, body, origin, host, actions, snapshot_provider, desk, tidy,
