@@ -12,6 +12,7 @@ module reads those back. The report's CURRENT-state facts (report date, freeze m
 queue, usage) arrive via `view` — the live snapshot the runner/CLI assembles for the report; its
 keys are documented on morning() below.
 """
+import consult as consult_mod
 import math
 
 WEEK_SECONDS = 7 * 24 * 3600
@@ -365,7 +366,10 @@ def _consults(records, repo, window_start, decided_only=False):
             continue
         link = _issue_link(repo, num)
         kind = r.get("outcome_kind")
-        if decided_only and kind not in ("answered", "escalated"):
+        if decided_only and kind not in ("answered", "escalated", "moved"):
+            continue
+        if r.get("handback") in consult_mod.HANDBACK_KINDS:
+            lines.append(_handback_consult_line(r, num, link))
             continue
         if kind == "answered":
             lines.append(f"- #{num} — answered by its approving session; the worker was relaunched "
@@ -378,6 +382,26 @@ def _consults(records, repo, window_start, decided_only=False):
             lines.append(f"- #{num} — the question fell back to you: {why or 'reason unrecorded'}"
                          f" — {link}")
     return lines
+
+
+def _handback_consult_line(r, num, link):
+    """One handback consult's line (#539): what was about to reach the owner, and what its
+    approving session did with it. A MOVE is the loop deciding on his behalf, so it reads first."""
+    what = consult_mod.KIND_WORDS.get(r.get("handback"), "a handback")
+    kind = r.get("outcome_kind")
+    if kind == "moved":
+        move = r.get("move")
+        did = consult_mod.MOVE_SENTENCES.get(move, move or "act")
+        if move == consult_mod.WAIT and type(r.get("minutes")) is int:
+            did = "hold it %d minutes before it reaches you" % r["minutes"]
+        return (f"- #{num} — {what} went to its approving session first, which chose to {did} "
+                f"(marked on the issue as not yours) — {link}")
+    if kind == "escalated":
+        fu = f", and filed follow-up #{r['follow_up']} for you" if r.get("follow_up") else ""
+        return (f"- #{num} — {what} went to its approving session first, which escalated it to "
+                f"you with its reasoning{fu} — {link}")
+    why = r.get("sentence") if isinstance(r.get("sentence"), str) else r.get("reason")
+    return f"- #{num} — {what} reached you as before: {why or 'reason unrecorded'} — {link}"
 
 
 # The channel's proof is the newest text that reached the phone (issue #495). Past this age with none,

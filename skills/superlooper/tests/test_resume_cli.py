@@ -181,6 +181,15 @@ def test_the_resume_is_attended_because_a_person_typed_it(rig):
     assert rig.launch_calls()[0]["ATTENDED"] == "1"
 
 
+def test_a_resume_the_runner_drives_for_a_consult_is_unattended(rig):
+    # (#539) The handback consult's RESUME move rides this verb from the runner, where nobody is at
+    # the pane: the revived session must be told so, exactly as a runner-launched worker is, or it
+    # would ask its own in-window question and sit at a dialog nobody watches.
+    rig.record_session("d3")
+    assert run(rig, "resume", "d3", "--json", "--unattended").returncode == 0
+    assert rig.launch_calls()[0]["ATTENDED"] == ""
+
+
 # --------------------------- refusals ---------------------------
 
 def test_a_lane_with_no_recorded_id_is_refused_plainly(rig):

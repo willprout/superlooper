@@ -85,7 +85,7 @@ def test_the_source_family_starter_set_is_registered():
     all: adopt creates the whole set from LABELS, and doctor reports what a repo is missing. The
     six values here are the STARTER set, not a closed one (see the open-family test below)."""
     for name in ("source:orchestration", "source:build", "source:investigation",
-                 "source:debugger", "source:qa", "source:dashboard-flag"):
+                 "source:debugger", "source:qa", "source:dashboard-flag", "source:consult"):
         spec = labels.label_spec(name)
         assert spec is not None, ("%s must be in the §C.2 set, or adopt never creates it and every "
                                   "session told to apply it is refused by gh" % name)
@@ -126,11 +126,29 @@ def test_source_qa_is_runner_managed_and_the_rest_of_the_family_is_not():
         assert all(step.get("name") != name for step in labels.label_migration_plan(set()))
 
 
+def test_source_consult_is_runner_managed_and_is_what_the_consult_files_with():
+    """Issue #539: a consult's FOLLOW_UP is filed BY THE RUNNER carrying `source:consult`, so it
+    self-heals exactly as `source:qa` does — a repo adopted before #539 gets it at boot."""
+    import consult
+    color, desc = labels.label_spec("source:consult")
+    assert color and "(runner-managed)" in desc
+    assert consult.FOLLOW_UP_SOURCE == "source:consult"
+    assert {"kind": "create", "name": "source:consult"} in labels.label_migration_plan(
+        [n for n, _c, _d in labels.LABELS if n != "source:consult"])
+    for t in (*consult.FOLLOW_UP_TYPES, "type:fix", "", None, "agent-ready"):
+        names = consult.follow_up_labels(t)
+        for name in names:
+            assert labels.label_spec(name) is not None, (t, name)
+        assert "agent-ready" not in names and not any(n.startswith("pre-authorized:")
+                                                       for n in names)
+
+
 def test_runner_managed_subset_is_the_tagged_set():
     # exactly the labels the RUNNER writes as machinery — derived from the description tag, so the
     # LABELS list is the one place the vocabulary is defined.
     assert set(labels.runner_managed_labels()) == {"in-progress", "needs-owner", "parked",
-                                                   "awaiting-answer", "source:qa"}
+                                                   "awaiting-answer", "source:qa",
+                                                   "source:consult"}
     for name in labels.runner_managed_labels():
         color, desc = labels.label_spec(name)
         assert "(runner-managed)" in desc and color   # every runner-managed label has a real spec
@@ -139,13 +157,16 @@ def test_runner_managed_subset_is_the_tagged_set():
 def test_missing_runner_labels_fails_closed_on_garbage():
     assert labels.missing_runner_labels(set(n for n, _c, _d in labels.LABELS)) == []
     assert labels.missing_runner_labels(
-        {"agent-ready", "in-progress", "parked", "awaiting-answer", "source:qa"}) == ["needs-owner"]
+        {"agent-ready", "in-progress", "parked", "awaiting-answer", "source:qa",
+         "source:consult"}) == ["needs-owner"]
     # a wrong-typed / garbage read is treated as EMPTY -> every runner-managed label reads missing,
     # never as "all present" (the repo's fail-open-on-wrong-typed defect class).
     assert set(labels.missing_runner_labels("garbage")) == {"in-progress", "needs-owner", "parked",
-                                                            "awaiting-answer", "source:qa"}
+                                                            "awaiting-answer", "source:qa",
+                                                            "source:consult"}
     assert set(labels.missing_runner_labels(None)) == {"in-progress", "needs-owner", "parked",
-                                                       "awaiting-answer", "source:qa"}
+                                                       "awaiting-answer", "source:qa",
+                                                       "source:consult"}
 
 
 def test_plan_is_empty_when_already_applied():
@@ -153,7 +174,8 @@ def test_plan_is_empty_when_already_applied():
     assert labels.label_migration_plan(have) == []
     # needs-william already renamed away AND needs-owner present -> still a no-op (idempotent).
     assert labels.label_migration_plan(
-        ["needs-owner", "in-progress", "parked", "awaiting-answer", "source:qa"]) == []
+        ["needs-owner", "in-progress", "parked", "awaiting-answer", "source:qa",
+         "source:consult"]) == []
 
 
 def test_plan_creates_a_missing_runner_managed_label():
@@ -166,7 +188,8 @@ def test_plan_renames_needs_william_first_and_does_not_recreate_it():
     # the 2026-07-13 storm's exact shape: the repo still carries the OLD needs-william and lacks the
     # NEW needs-owner. The plan renames in place (preserving every issue that carries it) and must
     # NOT then also try to create needs-owner (the rename already produced it).
-    have = ["needs-william", "in-progress", "parked", "awaiting-answer", "source:qa", "agent-ready"]
+    have = ["needs-william", "in-progress", "parked", "awaiting-answer", "source:qa",
+            "source:consult", "agent-ready"]
     plan = labels.label_migration_plan(have)
     assert plan == [{"kind": "rename", "old": "needs-william", "new": "needs-owner"}]
 
@@ -185,13 +208,14 @@ def test_plan_renames_and_still_creates_other_missing_labels():
     assert plan[0] == {"kind": "rename", "old": "needs-william", "new": "needs-owner"}
     created = [s["name"] for s in plan if s["kind"] == "create"]
     # NOT needs-owner (the rename produced it); LABELS order, so awaiting-answer comes after parked
-    assert created == ["in-progress", "parked", "awaiting-answer", "source:qa"]
+    assert created == ["in-progress", "parked", "awaiting-answer", "source:qa", "source:consult"]
 
 
 def test_plan_does_not_rename_when_needs_owner_already_exists():
     # both old and new present (a mid-migration repo): renaming would collide, so the rename is
     # skipped and only genuinely-missing labels are created.
-    have = ["needs-william", "needs-owner", "in-progress", "parked", "awaiting-answer", "source:qa"]
+    have = ["needs-william", "needs-owner", "in-progress", "parked", "awaiting-answer", "source:qa",
+            "source:consult"]
     assert labels.label_migration_plan(have) == []
 
 
@@ -199,4 +223,4 @@ def test_plan_creates_every_runner_managed_label_from_scratch():
     plan = labels.label_migration_plan([])
     assert plan == [{"kind": "create", "name": n}
                     for n in ("in-progress", "needs-owner", "parked", "awaiting-answer",
-                              "source:qa")]
+                              "source:qa", "source:consult")]

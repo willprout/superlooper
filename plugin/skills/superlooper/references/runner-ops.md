@@ -369,8 +369,9 @@ Sections:
 - **Parked / needs-owner** — with the memo comment for each, so you can act without digging.
 - **Bounces** — issues a worker bounced on premise drift, each with its proposed amendment.
 - **Owner questions** — durable questions workers handed you overnight (see "Answering a question").
-- **Approver consults** — every question a fork of its approving session answered, escalated to you,
-  or could not take (and why), each linked to its issue. Absent on a night with none.
+- **Approver consults** — every question a fork of its approving session answered, every park,
+  bounce, freeze or stuck lane it moved, escalated to you, or could not take (and why), each linked
+  to its issue. Absent on a night with none.
 - **Conflict regenerations this week** — the tuning metric: if this climbs, tighten `affinity` or
   reduce `lanes`; if it's always zero, you can loosen. This is how you turn the parallelism dial.
 - **Wanders** — PRs whose actual diff touched areas the issue didn't declare in `touches:`.
@@ -463,6 +464,52 @@ config.
   `model:<x>`/`effort:<x>` label you create and apply works. An **unknown** value fails the launch
   loudly and the retry cap parks the issue — so a typo surfaces as a parked issue with a memo, not
   a silent wrong-model run.
+
+### Who answers a handback first
+
+**The approving session, then you (#538, #539).** Everything the command center would put in front
+of you about one issue goes first to a fork of the orchestration session that approved that issue:
+
+- a worker's question;
+- a park, whatever its cause;
+- a bounce;
+- a frozen lane;
+- a lane sitting at a dialog;
+- a lane the session host reports blocked.
+
+The runner launches the fork (`c<N>`) in that session's own directory, with the issue, its thread,
+the branch and PR, and every earlier handback. Nothing is posted, no label moves and nobody pages
+you while it decides. The issue's status is left alone, so a frozen lane keeps its lane.
+
+For a question the fork answers or escalates (see "Answering a question" below). For any other
+handback it picks one move, and the runner carries it out:
+
+- **relaunch** the issue fresh, optionally with a clarification for the new brief;
+- **resume** the interrupted session's conversation (`superlooper resume`);
+- **end** a stuck session and relaunch;
+- **wait** a bounded time;
+- file an unapproved **follow-up** issue;
+- **escalate** to you.
+
+Each move it makes is posted on the issue as the approving session's decision, never yours, and
+lands in the morning report. A move outside that set is refused and reaches you naming what was
+asked for. A park on a bright line (a diff reaching `.superlooper/**` or `.github/workflows/**`)
+reaches you whatever the fork decides.
+
+**When it comes straight to you, exactly as before:**
+
+- the issue has no approver stamp, or the stamp names another machine or no transcript is here;
+- the fork fails to launch or decide within 20 minutes;
+- a usage ceiling or launch hold keeps it from starting;
+- the issue has reached its handback cap.
+
+The handback cap is the third handback on one issue by default. That one comes to you regardless,
+with the consult history attached; `session.handback_cap` changes it. An escalation carries the
+fork's reasoning and recommendation as its own marked comment on the issue.
+
+**What never goes to a consult:** a fault that belongs to no single issue — a stalled or dead
+runner, a GitHub or usage outage, a session whose account login died. Those stay with the watchdog
+and its repair session, below. The rule is `consult-standing-rule.md`.
 
 ### Answering a question
 

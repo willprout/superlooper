@@ -105,7 +105,10 @@ the runner's own `in-progress` stamp, the approval the loop already acted on. It
 its own: the answer is posted under a distinct `<!-- superlooper-consult -->` marker that says it is
 the approving session's word and not William's, and every consult appears in the morning report.
 Anything that would change the approved Goal, Definition of done or Boundaries is escalated to
-William, never answered.
+William, never answered. Since #539 it also sees every other handback on such an issue first: a
+park, a bounce, a frozen lane, a dialog or a host block. It picks one move from a closed set
+(relaunch, resume, end and relaunch, wait, an unapproved follow-up, escalate), and a relaunch
+likewise rides the runner's own stamp with nobody applying `agent-ready`.
 
 ## Pre-authorizing a foreseeable owner-gate stop (issue #165)
 

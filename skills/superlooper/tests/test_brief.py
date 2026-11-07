@@ -780,3 +780,27 @@ def test_an_owner_only_trail_renders_exactly_as_before(_sl_home):
     qa = [{"question": "q?", "answer": "yes"}]
     out = brief.build(_issue(), _cfg(_sl_home, operator="William"), qa=qa)
     assert _QA_HEADER in out and "A1 (from William):**" in out
+
+
+# --------------------------- #539: the approving session's clarification ---------------------------
+
+def test_a_consult_clarification_is_binding_and_attributed_away_from_the_owner(_sl_home):
+    notes = [{"note": "Use approach A; the review step flaked.", "session": _SESSION,
+              "handback": "frozen and already relaunched 2 times (cap 2) — parking",
+              "move": "relaunch", "kind": "park"}]
+    out = brief.build(_issue(), _cfg(_sl_home, operator="William"), notes=notes)
+    block = out.split("# Loop contract")[0]
+    assert "BINDING" in block and "Use approach A; the review step flaked." in block
+    assert _SESSION in block and "frozen and already relaunched" in block
+    assert "not William's own word" in block
+
+
+@pytest.mark.parametrize("notes", [None, [], "x", [None, {"note": ""}, {"note": 5}]])
+def test_no_clarification_is_a_brief_byte_identical_to_before(_sl_home, notes):
+    cfg = _cfg(_sl_home, operator="William")
+    assert brief.build(_issue(), cfg, notes=notes) == brief.build(_issue(), cfg)
+
+
+def test_a_brace_inside_a_clarification_stays_literal(_sl_home):
+    out = brief.build(_issue(), _cfg(_sl_home), notes=[{"note": "keep {branch} literal"}])
+    assert "keep {branch} literal" in out

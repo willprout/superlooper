@@ -121,8 +121,13 @@ _NESTED_DEFAULTS = {
     # The merge decision stays fail-closed — pending never merges — this only bounds the wait so a
     # required check that never reports can't hold a green PR gating forever, silently. Default
     # 10800 (3h) clears any real CI run; a huge value effectively disables the bound.
+    # handback_cap (issue #539): the handback a consult of the issue's approving session no longer
+    # sees. Every park, bounce, freeze, dialog or host block on an issue goes to that session first;
+    # the cap-th one (counting the handback consults since the owner's approval; a worker's questions
+    # keep their own two-question cap) goes to the owner regardless, with the consult history
+    # attached. 0 or 1 sends every handback straight to the owner, exactly as before.
     "session": {"idle_seconds": 480, "freeze_seconds": 2700, "retry_cap": 2, "conflict_cap": 2,
-                "checks_pending_cap": 10800},
+                "checks_pending_cap": 10800, "handback_cap": 3},
     "qa": {"nightly_cmd": None, "results_glob": None, "retry_once": True,
            "quarantine": [], "nightly_time": "02:00"},
     # notify.quiet_hours (issue #164): an OPT-IN window during which routine owner-DECISION pages (a
@@ -478,7 +483,8 @@ def _validate_and_fill(raw):
         if not isinstance(v, str) or not v.strip():
             _err(f"'models.{rk}' must be a non-empty string (the cross-reviewer pin has no valid "
                  f"null — a review must never inherit the machine-global Codex config), got {v!r}")
-    for sk in ("idle_seconds", "freeze_seconds", "retry_cap", "conflict_cap", "checks_pending_cap"):
+    for sk in ("idle_seconds", "freeze_seconds", "retry_cap", "conflict_cap", "checks_pending_cap",
+               "handback_cap"):
         v = out["session"][sk]
         if isinstance(v, bool) or not isinstance(v, int) or v < 0:
             _err(f"'session.{sk}' must be an integer >= 0, got {v!r}")

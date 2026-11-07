@@ -5903,7 +5903,7 @@ def _resume_facts(home, iid, session_id, worktree, note):
     return facts
 
 
-def _resume_launch(cfg, repo, home, pane, iid, session_id, worktree):
+def _resume_launch(cfg, repo, home, pane, iid, session_id, worktree, attended=True):
     """Run the revive through the SAME launcher every other session uses. Returns
     ``(rc, stdout, stderr, spawned)``; never raises. Mirrors _debugger_shim_run's contract.
 
@@ -5934,8 +5934,10 @@ def _resume_launch(cfg, repo, home, pane, iid, session_id, worktree):
            # who this machine is now.
            "SL_EXPECT_GH_LOGIN": "",
            # A PERSON typed this, so the PreToolUse deny (#185) must not tell the revived session
-           # that nobody is at the pane — the same reasoning as `debug`'s owner tap.
-           "SL_ATTENDED": "1",
+           # that nobody is at the pane — the same reasoning as `debug`'s owner tap. The ONE
+           # exception is `--unattended` (#539): the runner carrying out a consult's RESUME move,
+           # where nobody is at the pane and the session must be told so, as any worker is.
+           "SL_ATTENDED": "1" if attended else "",
            "SL_AGENT": cfg.get("agent") if cfg.get("agent") in ("claude", "codex") else "claude"}
     argv = [script, iid] if is_worker else [script, "--cwd", worktree or os.path.abspath(repo), iid]
     try:
@@ -6125,7 +6127,8 @@ def cmd_resume(args):
 
         rc, out, err, spawned = _resume_launch(cfg, args.repo, home, _watchdog_pane(state_dir),
                                                iid, session_id,
-                                               worktree)
+                                               worktree,
+                                               attended=not getattr(args, "unattended", False))
     finally:
         if debug_lock:
             _watchdog_release_lock(debug_lock)
@@ -6597,7 +6600,11 @@ def main(argv=None):
                           help="emit a single JSON object (for a UI over the loop to parse)"),
            "--operator": dict(default=None, help="who asked — named in the journal line (audit)"),
            "--source": dict(default=None,
-                            help="what asked (audit only; default 'cli')")})
+                            help="what asked (audit only; default 'cli')"),
+           "--unattended": dict(action="store_true",
+                                help="nobody is at the revived session's pane — the runner "
+                                     "carrying out a consult's RESUME move (#539); the session is "
+                                     "told so, as any runner-launched worker is")})
     add("janitor", cmd_janitor,
         **{"--dry-run": dict(action="store_true",
                              help="list the proposals and change NOTHING anywhere"),
