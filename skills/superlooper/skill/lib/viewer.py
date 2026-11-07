@@ -17,8 +17,9 @@ viewer script execs (``fleet.viewer_argv`` — spelled once for both), and it co
 screen unless its ancestry shows it is remote — an ssh or mosh session is attached but in no window
 the owner here can be shown. The app it runs in is the outermost app bundle above it, when there is
 one; when there is not (a terminal whose shells are re-parented away from the app, a viewer inside
-tmux) it is still attached — so a tap never opens a second one beside it — it just cannot be raised
-by app, and the answer says so.
+tmux — perhaps one left running over ssh) it is still attached, so a tap never opens a second one
+beside it, but nothing shows it is in a window on this screen: the answer is no success and says
+how to get one here. A viewer with no terminal at all is drawing into no window and does not count.
 
 **What this does not see**, stated rather than discovered: ``ps`` vis-encodes control and non-ASCII
 bytes in a command line, so a fleet prefix whose path carries them never matches and every tap would
@@ -112,11 +113,15 @@ def _bundle(args):
     not a terminal anybody looks at, so it does not count."""
     if not args.startswith("/") or _APP_EXEC not in args:
         return None
-    head = args[:args.index(_APP_EXEC)]
-    if ".app" not in head:
+    head = args[:args.index(_APP_EXEC)] + "/"
+    if ".app/" not in head:
         return None
-    bundle = head[:head.index(".app") + len(".app")]
-    if ".framework/" in bundle:
+    # A path COMPONENT ending in ".app" — not the substring, which `/Users/will.appleton/` carries.
+    bundle = head[:head.index(".app/") + len(".app")]
+    # The executable must BE that path: a command line that only mentions an app further along
+    # (`login -pf will /Applications/Foo.app/…`, `/bin/sh /Applications/…`) is not one. App names
+    # carry spaces, so the test is for a second path or a flag, never for a space.
+    if " /" in bundle or " -" in bundle or ".framework/" in bundle:
         return None
     return bundle
 
@@ -160,9 +165,9 @@ def find(procs, argv, exclude=()):
     """The attached viewer to raise, or ``None``. PURE.
 
     A viewer is a process whose command line is exactly ``argv`` — so the server (the same binary
-    and session plus ``server``) never matches — that is not attached from an ssh/mosh session.
-    Its ``app`` is ``None`` when no app bundle sits above it (it is still attached; it just cannot
-    be activated by app). Of several, one in an app wins over one in none, then the newest (highest
+    and session plus ``server``) never matches — that has a terminal and is not attached from an ssh/mosh session.
+    Its ``app`` is ``None`` when no app bundle sits above it: it is still attached — so a tap never
+    opens a second viewer beside it — but nothing shows it is in a window on this screen. Of several, one in an app wins over one in none, then the newest (highest
     pid) — the one the owner most recently opened. ``exclude`` lists pids that do not count, which
     is how "a NEW viewer attached" is asked after an open.
     """
@@ -171,6 +176,8 @@ def find(procs, argv, exclude=()):
     for p in procs or ():
         if p.args != want or p.pid in exclude or is_remote(procs, p.pid):
             continue
+        if not _TTY_RE.match(p.tty or ""):
+            continue                    # no terminal at all: it is drawing into no window
         cand = Attached(p.pid, p.tty, app_of(procs, p.pid))
         if best is None or (cand.app is not None, cand.pid) > (best.app is not None, best.pid):
             best = cand

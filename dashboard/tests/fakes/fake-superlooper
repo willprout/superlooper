@@ -391,6 +391,11 @@ _FOCUS_DETAIL = {
                            "attached to the fleet within 10s. A window may be showing why; the "
                            "usual cause is a viewer script from before #547, which the fenced host "
                            "refuses — `superlooper fleet --install` rewrites it",
+    "viewer_not_on_screen": "a viewer is already attached (pid 901 on ttys901), but not inside any "
+                            "app on this screen — tmux, an ssh session, or a terminal that runs its "
+                            "shells apart from its app. It now shows %s, but no window could be put "
+                            "in front of you: bring that terminal forward yourself, or close that "
+                            "viewer and tap again to open one here",
     "focused": "the host moved its focus to workspace ws-340; a viewer attached to this session "
                "follows it",
     "no_window": "no session window is recorded for %s — it has not launched, its session ended, "
@@ -400,10 +405,10 @@ _FOCUS_DETAIL = {
 }
 _FOCUS_EXIT = {"focused": 0, "no_window": 3, "host_unreachable": 4, "unknown_lane": 5,
                "opened": 0, "switched": 0, "no_display": 6, "open_failed": 7,
-               "viewer_not_attached": 8}
+               "viewer_not_attached": 8, "viewer_not_on_screen": 9}
 # The answers in which the host DID focus the lane, so the engine's JSON names its workspace.
 _FOCUS_HAS_WORKSPACE = ("focused", "host_unreachable", "opened", "switched", "no_display",
-                        "open_failed", "viewer_not_attached")
+                        "open_failed", "viewer_not_attached", "viewer_not_on_screen")
 
 
 def route_focus_session():

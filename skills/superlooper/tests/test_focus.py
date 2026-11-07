@@ -766,18 +766,6 @@ def test_focus_session_is_documented_in_the_clis_own_help():
         assert word in verb.stdout, "`focus-session --help` must document %s" % word
 
 
-def test_an_attached_viewer_with_no_app_is_switched_never_joined_by_a_second(tmp_path):
-    prefix = _fleet(tmp_path)
-    _record(tmp_path / "home", "i547", "w9:p1", "w9")
-    screen = FakeScreen(prefix)
-    screen.rows += [viewer.Proc(900, 1, "??", "/opt/homebrew/bin/tmux"),
-                    viewer.Proc(901, 900, "ttys901", " ".join(screen.argv))]
-    got = _show(tmp_path, screen)
-    assert got.outcome == focus_lib.SWITCHED and got.ok
-    assert screen.opened == [] and screen.activated == []
-    assert "not brought to the front" in got.detail
-
-
 def test_the_focus_waits_its_turn_behind_a_tap_still_opening(tmp_path):
     # Fresh-agent review: with the focus OUTSIDE the lock, tap B's focus could land between tap A's
     # focus and A's viewer attaching — A would report its own lane while the window drew B's. So
@@ -791,3 +779,20 @@ def test_the_focus_waits_its_turn_behind_a_tap_still_opening(tmp_path):
         got = _show(tmp_path, FakeScreen(prefix), door=door)
     assert got.outcome == focus_lib.OPEN_FAILED
     assert door.sessions == [], "no focus was moved while another tap held the window"
+
+
+def test_a_viewer_attached_outside_any_app_is_never_called_a_window_in_front(tmp_path):
+    # Fresh-agent review round 2: a viewer in tmux left running over ssh is attached, and nothing
+    # on THIS screen shows it. Opening a second viewer beside it is still refused (that is how a
+    # tap per minute became a window per minute), but the answer may not be a success: there is
+    # no evidence of any window, and it says how to get one here.
+    prefix = _fleet(tmp_path)
+    _record(tmp_path / "home", "i547", "w9:p1", "w9")
+    screen = FakeScreen(prefix)
+    screen.rows += [viewer.Proc(900, 1, "??", "/opt/homebrew/bin/tmux"),
+                    viewer.Proc(901, 900, "ttys901", " ".join(screen.argv))]
+    got = _show(tmp_path, screen)
+    assert got.outcome == focus_lib.VIEWER_NOT_ON_SCREEN and not got.ok
+    assert got.exit_code not in (0, 2)
+    assert screen.opened == [] and screen.activated == []
+    assert "901" in got.detail and "close that viewer" in got.detail

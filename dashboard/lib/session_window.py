@@ -36,9 +36,9 @@ host, holds no token and opens nothing itself.
 
 **Every outcome is the engine's, and they stay apart.** ``focus-session --json`` answers
 ``opened`` / ``switched`` — the two successes, and the toast says which — or ``no_window`` /
-``host_unreachable`` / ``unknown_lane``, or one of the three ways no window could be put on screen
-(``no_display`` / ``open_failed`` / ``viewer_not_attached``), each in the engine's own words and
-none a success. ``no_window`` is the COMMON answer, not a failure: a lane whose session exited, or
+``host_unreachable`` / ``unknown_lane``, or one of the ways no window could be put on screen
+(``no_display`` / ``open_failed`` / ``viewer_not_attached`` / ``viewer_not_on_screen``), each in
+the engine's own words and none a success. ``no_window`` is the COMMON answer, not a failure: a lane whose session exited, or
 whose window ``superlooper tidy`` closed, has no window to raise. It is surfaced in the engine's own
 words — never a silent success, never flattened into a generic error, and never confused with "the
 host would not answer" (absence of signal must not read as "your session is gone"). ``focused`` is
@@ -300,8 +300,8 @@ class SessionWindow:
             # A body without an outcome is a body we cannot read. Say that; never infer one.
             return self._answer(repo, num, iid, None,
                                 "superlooper focus-session gave no readable answer for %s" % label)
-        # Every other outcome — no_window, host_unreachable, unknown_lane, the three ways no window
-        # could be shown, and one a LATER engine invents — is reported in the engine's own words. ``ok`` is derived from the outcome rather than trusted from the body, so a
+        # Every other outcome — no_window, host_unreachable, unknown_lane, the ways no window could
+        # be shown, and one a LATER engine invents — is reported in the engine's own words. ``ok`` is derived from the outcome rather than trusted from the body, so a
         # future ``{"ok": true, "outcome": "no_window"}`` could never toast a success over a window
         # that was never opened.
         return self._answer(repo, num, iid, outcome,

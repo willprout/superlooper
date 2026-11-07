@@ -129,6 +129,7 @@ def test_a_switched_window_is_an_honest_success_that_says_it_switched(fixtures, 
     ("no_display", "no GUI login session"),
     ("open_failed", "could not open"),
     ("viewer_not_attached", "no viewer attached"),
+    ("viewer_not_on_screen", "not inside any app on this screen"),
 ])
 def test_no_window_on_screen_is_said_plainly_and_reports_no_success(fixtures, monkeypatch,
                                                                     outcome, words):
@@ -191,7 +192,8 @@ def test_every_outcome_carries_the_same_keys(fixtures, monkeypatch):
     # the four ends up unhandled (the engine's own rule, kept on this side of the wire too).
     seen = []
     for outcome in ("opened", "switched", "focused", "no_window", "host_unreachable",
-                    "unknown_lane", "no_display", "open_failed", "viewer_not_attached"):
+                    "unknown_lane", "no_display", "open_failed", "viewer_not_attached",
+                    "viewer_not_on_screen"):
         monkeypatch.setenv("SL_FOCUS_OUTCOME", outcome)
         seen.append(set(verb().open(SLUG, 340)))
     assert all(keys == seen[0] for keys in seen)
@@ -359,7 +361,8 @@ def test_opening_a_fixers_window_shells_the_same_read_only_verb(fixtures):
 
 @pytest.mark.parametrize("outcome, ok", [("opened", True), ("switched", True),
                                           ("no_display", False), ("open_failed", False),
-                                          ("viewer_not_attached", False)])
+                                          ("viewer_not_attached", False),
+                                          ("viewer_not_on_screen", False)])
 def test_a_fixers_window_opens_or_switches_exactly_as_a_flights_does(fixtures, monkeypatch,
                                                                        outcome, ok):
     # DoD: the fixer card's open button behaves the same way — it is the same engine verb behind

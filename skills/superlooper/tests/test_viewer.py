@@ -292,3 +292,24 @@ def test_a_viewer_that_never_turns_up_is_given_up_on_at_the_bound():
     clock = _Clock(appear=99)
     assert viewer.wait_for_new(clock, _ARGV, set(), seconds=10, settle=1.0) is None
     assert 10 <= clock.t <= 10.5
+
+
+# ---------------------------------------------------------- fresh-agent review, round 2
+
+def test_a_viewer_with_no_terminal_is_no_window_anywhere():
+    # Parented to launchd with no controlling terminal (`??`): whatever it is, it is drawing into
+    # no window, so it is not an attached viewer and must not stop a tap opening one.
+    table = _ps((1, 0, "??", "/sbin/launchd"), (930, 1, "??", " ".join(_ARGV)))
+    assert viewer.find(viewer.parse_ps(table), _ARGV) is None
+
+
+@pytest.mark.parametrize("args, bundle", [
+    ("/Users/will.appleton/Applications/Ghostty.app/Contents/MacOS/ghostty",
+     "/Users/will.appleton/Applications/Ghostty.app"),
+    ("/usr/bin/login -pf will /Applications/Foo.app/Contents/MacOS/foo", None),
+    ("/bin/sh /Applications/Foo.app/Contents/MacOS/foo", None),
+    ("/Applications/VMware Fusion.app/Contents/MacOS/VMware Fusion --x", "/Applications/VMware Fusion.app"),
+    ("-zsh", None),
+])
+def test_the_bundle_is_read_from_the_executable_path_only(args, bundle):
+    assert viewer._bundle(args) == bundle

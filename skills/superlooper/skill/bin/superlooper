@@ -58,7 +58,8 @@
                   FLEET: it never spawns, sends, exits or kills. Every outcome is reportable:
                   opened / switched / no_window (the session ended or tidy closed it — an ordinary
                   answer, not a failure) / host_unreachable / unknown_lane / no_display /
-                  open_failed / viewer_not_attached. A local ops UI shells this instead of reaching
+                  open_failed / viewer_not_attached / viewer_not_on_screen. A local ops UI shells
+                  this instead of reaching
                   the session host itself
   janitor         propose GitHub-side cleanup (stale merged/superseded sl/* branches, open
                   `superseded` PRs, aged parked/needs-william issues, issues closed as
@@ -6212,7 +6213,8 @@ def cmd_focus_session(args):
 
     The exit code names the outcome (lib/focus.EXIT_CODES): 0 a window is in front (opened or
     switched), 3 no window, 4 the host could not be reached, 5 unknown repo/id, 6 no GUI login
-    session, 7 the viewer could not be opened, 8 it opened but never attached. NOT 2, which stays
+    session, 7 the viewer could not be opened, 8 it opened but never attached, 9 a viewer is
+    attached outside any app on this screen. NOT 2, which stays
     argparse's — it is also what an installed engine too old for this verb exits with on `invalid
     choice`, and an outcome sharing it would hide exactly that diagnosis. A caller that can parse
     JSON should branch on the `outcome` field instead; the codes exist so a shell script does not
@@ -6568,10 +6570,13 @@ def main(argv=None):
             "                       or another tap is still opening it)\n"
             "  viewer_not_attached 8  it opened, but no viewer attached in time (a pre-#547\n"
             "                       viewer script is refused by the fence: re-run fleet --install)\n"
+            "  viewer_not_on_screen 9  a viewer is attached outside any app on this screen (tmux,\n"
+            "                       ssh): it now shows the lane, but no window was put in front\n"
             "\n"
-            "Nothing but no_window, host_unreachable and unknown_lane ever skips the window step,\n"
-            "and none of those opens one. 2 is left to argparse (a usage error, and what an engine\n"
-            "too old for this verb exits with) so it can never be mistaken for an outcome."),
+            "Only opened and switched exit 0. Nothing but no_window, host_unreachable and\n"
+            "unknown_lane ever skips the window step, and none of those opens one. 2 is left to\n"
+            "argparse (a usage error, and what an engine too old for this verb exits with) so it\n"
+            "can never be mistaken for an outcome."),
         **{"--id": dict(default=None, metavar="i<N>",
                         help="the session whose window to raise: i<N> (an issue worker), d<N> "
                              "(a debugger session) or t<N> (a triage flight)"),

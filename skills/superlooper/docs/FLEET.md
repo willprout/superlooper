@@ -123,9 +123,11 @@ order:
    window. The host's focus is what every attached client draws, so step 1 already switched it.
    The pinned host's API cannot list its clients, so "attached" is read from the process table:
    a process running exactly the script's command line and not under an ssh or mosh session. The
-   app it is in is the outermost app bundle above it. A viewer with no app above it (tmux, or a
-   terminal that runs its shells apart from the app) still counts as attached, so a tap never
-   opens a second one beside it. The answer then says it could not be brought to the front.
+   app it is in is the outermost app bundle above it. A viewer with no app above it (tmux,
+   perhaps left running over ssh, or a terminal that runs its shells apart from the app) still
+   counts as attached, so a tap never opens a second one beside it. Nothing shows that it is in
+   a window on this screen, though, so the answer is `viewer_not_on_screen`, which is no success,
+   and it says how to get a window here. A viewer with no terminal at all does not count.
 4. **Otherwise the script is opened with this machine's normal handler** (`open viewer.command`),
    and the answer waits up to 10s for the new viewer to attach. That is `opened`, or
    `open_failed` / `viewer_not_attached` in words that say which.

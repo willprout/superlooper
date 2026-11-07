@@ -85,13 +85,14 @@ UNKNOWN_LANE = "unknown_lane"
 # Two successes, and they stay apart because the owner should be told which happened:
 OPENED = "opened"                     # no viewer was attached; one was opened, showing the lane
 SWITCHED = "switched"                 # a viewer was attached; it now shows the lane, raised
-# ...and three ways no window could be put in front of him, each said plainly and none a success:
+# ...and four ways no window could be put in front of him, each said plainly and none a success:
 NO_DISPLAY = "no_display"             # no GUI login session of this user at the screen
 OPEN_FAILED = "open_failed"           # the viewer could not be opened (handler, script, a busy tap)
 VIEWER_NOT_ATTACHED = "viewer_not_attached"   # it opened, but no viewer attached in time
+VIEWER_NOT_ON_SCREEN = "viewer_not_on_screen"  # a viewer is attached, in no app on this screen
 
 OUTCOMES = (FOCUSED, NO_WINDOW, HOST_UNREACHABLE, UNKNOWN_LANE,
-            OPENED, SWITCHED, NO_DISPLAY, OPEN_FAILED, VIEWER_NOT_ATTACHED)
+            OPENED, SWITCHED, NO_DISPLAY, OPEN_FAILED, VIEWER_NOT_ATTACHED, VIEWER_NOT_ON_SCREEN)
 
 # The answers that mean "something is in front of you now". FOCUSED is lib/focus's own success and
 # stays one for `superlooper debug`, which calls focus_lane and opens no window (#547 boundary).
@@ -127,7 +128,8 @@ LANE_ID_RE = re.compile(r"^[idt][0-9]+$")
 # "that repo or that id is not one we know", which is the one diagnosis that would stop it being
 # reported. So the four outcomes start above argparse's range and 2 stays argparse's.
 EXIT_CODES = {FOCUSED: 0, NO_WINDOW: 3, HOST_UNREACHABLE: 4, UNKNOWN_LANE: 5,
-              OPENED: 0, SWITCHED: 0, NO_DISPLAY: 6, OPEN_FAILED: 7, VIEWER_NOT_ATTACHED: 8}
+              OPENED: 0, SWITCHED: 0, NO_DISPLAY: 6, OPEN_FAILED: 7, VIEWER_NOT_ATTACHED: 8,
+              VIEWER_NOT_ON_SCREEN: 9}
 
 # How long the one control call may hang. Short on purpose: the caller is a person who tapped a
 # button and is watching for their window, and a wedged host must produce an honest
@@ -317,7 +319,8 @@ def show_lane(home, iid, fleet_prefix, host=None, screen=None, session=None,
     3. **A viewer already attached on this screen** is switched (step 1 did that — the host's focus
        is what every attached client draws) and brought forward: ``switched``, no second window.
        One with no app above it (tmux, a terminal that runs its shells apart from its app) is
-       still switched and never joined by a second, and the answer says it could not be raised.
+       switched too and never joined by a second — but it is ``viewer_not_on_screen``, no success,
+       since nothing shows a window in front of the owner; the answer says how to get one here.
     4. **Otherwise the viewer script is opened** by the machine's normal handler and the answer
        waits, bounded, for a NEW viewer to attach: ``opened``, or ``open_failed`` /
        ``viewer_not_attached`` in words that say which.
@@ -367,6 +370,18 @@ def show_lane(home, iid, fleet_prefix, host=None, screen=None, session=None,
                               "is already attached cannot be told — nothing was opened, rather "
                               "than risk a second window")
             attached = viewer.find(procs, argv)
+            if attached is not None and attached.app is None:
+                # Attached, but in no app on this screen — tmux, perhaps left running over ssh, or a
+                # terminal that runs its shells apart from its app. It now draws the lane (step 1),
+                # and a second viewer is still not opened beside it; but nothing shows a window is
+                # in front of the owner, so this is no success (fresh-agent review, round 2).
+                return answer(VIEWER_NOT_ON_SCREEN,
+                              "a viewer is already attached (pid %d on %s), but not inside any app "
+                              "on this screen — tmux, an ssh session, or a terminal that runs its "
+                              "shells apart from its app. It now shows %s, but no window could be "
+                              "put in front of you: bring that terminal forward yourself, or close "
+                              "that viewer and tap again to open one here"
+                              % (attached.pid, attached.tty, got.id))
             if attached is not None:
                 raised, why = viewer.bring_forward(screen, attached)
                 if raised and not why:
