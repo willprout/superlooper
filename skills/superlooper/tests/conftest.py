@@ -215,6 +215,23 @@ def _never_reach_real_session_host(monkeypatch, _clear_worker_launch_env):
 
 
 @pytest.fixture(autouse=True)
+def _never_reach_the_real_screen(monkeypatch):
+    # Same ratchet, for the window side of Open session window (issue #547). `lib/viewer` reads the
+    # process table to tell whether a viewer is attached, opens the viewer script through the
+    # machine's own handler, activates the viewer's app and raises its terminal window. On a
+    # dogfooding machine every one of those is REAL: a test that forgot to inject a screen would pop
+    # a terminal window onto the owner's display, or raise his live viewer, on every suite run —
+    # the toast-spam incident with a window instead of a toast. Fail closed: no console means "no
+    # GUI login session", an absent ps means "could not look", an absent opener exits 127, and a
+    # device directory that cannot exist holds no terminal to write to. Tests that exercise a seam
+    # set their own value in-body (their monkeypatch wins) or inject a fake screen.
+    monkeypatch.setenv("SL_PS", "/nonexistent/superlooper-test-ps")
+    monkeypatch.setenv("SL_OPEN", "/nonexistent/superlooper-test-open")
+    monkeypatch.setenv("SL_CONSOLE", "/nonexistent/superlooper-test-console")
+    monkeypatch.setenv("SL_TTY_DIR", "/nonexistent/superlooper-test-dev")
+
+
+@pytest.fixture(autouse=True)
 def _never_probe_the_real_control_socket(monkeypatch):
     # The same ratchet as the four above, one step sideways: the thing at risk is not a BINARY but
     # the host's control SOCKET (issue #331). `doctor --stack`'s `host state capture` block opens

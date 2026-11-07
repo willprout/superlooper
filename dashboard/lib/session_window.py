@@ -26,15 +26,27 @@ same one this dashboard already renders — not an address on any host: the engi
 window through THIS repo's recorded marker, which is what keeps one repo's ``i310`` from ever
 raising another repo's window.
 
-**All four outcomes are the engine's, and they stay apart.** ``focus-session --json`` answers
-``focused`` / ``no_window`` / ``host_unreachable`` / ``unknown_lane``, and the middle one is the
-COMMON answer, not a failure: a lane whose session exited, or whose window ``superlooper tidy``
-closed, has no window to raise. It is surfaced in the engine's own words — never a silent success,
-never flattened into a generic error, and never confused with "the host would not answer" (absence
-of signal must not read as "your session is gone"). ``outcome`` is ``None`` for the one case the
-engine did not answer at all: a missing CLI, a timeout, or an INSTALLED engine too old to know the
-verb (the publish-drift gap ``lib/engine`` exists to name — it exits 2 with no JSON, and reading
-that as "unknown lane" would hide the one diagnosis that leads to the fix).
+**A window in front of the owner, not just the host's focus** (issue #547). Owner ruling,
+2026-11-06: clicking this button opens a terminal window, even when no terminal is attached to the
+fleet's session (the issue quotes the ruling verbatim). Until then the engine moved the session host's focus and stopped,
+the host runs windowless, and this button toasted a success over an empty screen. Now the engine
+verb puts the window there itself — it switches and raises the viewer already attached, or opens
+one — and says which. Opening it is the ENGINE's act, behind the one door; this file still names no
+host, holds no token and opens nothing itself.
+
+**Every outcome is the engine's, and they stay apart.** ``focus-session --json`` answers
+``opened`` / ``switched`` — the two successes, and the toast says which — or ``no_window`` /
+``host_unreachable`` / ``unknown_lane``, or one of the three ways no window could be put on screen
+(``no_display`` / ``open_failed`` / ``viewer_not_attached``), each in the engine's own words and
+none a success. ``no_window`` is the COMMON answer, not a failure: a lane whose session exited, or
+whose window ``superlooper tidy`` closed, has no window to raise. It is surfaced in the engine's own
+words — never a silent success, never flattened into a generic error, and never confused with "the
+host would not answer" (absence of signal must not read as "your session is gone"). ``focused`` is
+what an INSTALLED engine from before #547 still answers, and it is no longer a success here: it is
+the empty-screen report itself, so it names the republish instead. ``outcome`` is ``None`` for the
+one case the engine did not answer at all: a missing CLI, a timeout, or an INSTALLED engine too old
+to know the verb (the publish-drift gap ``lib/engine`` exists to name — it exits 2 with no JSON, and
+reading that as "unknown lane" would hide the one diagnosis that leads to the fix).
 
 The CLI to run is the CONFIGURED path (config's ``superlooper_cli``), but ``SL_SUPERLOOPER``
 overrides it — exactly so ``tests/conftest.py`` can point every test at an absent binary by default
@@ -46,17 +58,23 @@ import os
 import re
 import subprocess
 
-# Per-call hard timeout (seconds). The engine grants its own single control call 10s (lib/focus's
-# CALL_SECONDS) precisely because a person is watching for their window; this leaves room for that
-# plus process start-up, and no more — a wedged host must produce an honest failure while the owner
-# is still looking at the screen. A module constant, not a literal, so a test can shrink it and trip
-# the timeout path in a fraction of a second (mirrors tidy._DEFAULT_TIMEOUT).
-_DEFAULT_TIMEOUT = 20
+# Per-call hard timeout (seconds). The engine grants its one control call 10s (lib/focus's
+# CALL_SECONDS) and, since #547, a freshly opened viewer 10s more to attach (VIEWER_ATTACH_SECONDS,
+# plus its 1s settle and the opener's own 5s bound) — each bound because a person is watching for
+# their window. This leaves room for those plus process start-up, and no more: a wedged host or a
+# viewer that never comes up must produce an honest failure while the owner is still looking at the
+# screen. The common case is a second or two. A module constant, not a literal, so a test can
+# shrink it and trip the timeout path in a fraction of a second (mirrors tidy._DEFAULT_TIMEOUT).
+_DEFAULT_TIMEOUT = 40
 
 VERB = "session-window"
 
-# The engine's word for "the host brought that window to the front" — the only outcome that is a
-# success. Spelled once here so nothing below has to decide it twice.
+# The engine's two words for "a terminal window showing that lane is in front of you" (#547) — the
+# only outcomes that are a success. Spelled once here so nothing below has to decide it twice.
+OPENED = "opened"          # no viewer was attached; the engine opened one on the lane
+SWITCHED = "switched"      # the attached viewer now shows the lane, brought forward
+# What an INSTALLED engine from before #547 answers: the host moved its focus, and nothing opened a
+# window for it. Once this module's only success; now the empty-screen report the issue was about.
 FOCUSED = "focused"
 
 
@@ -190,8 +208,9 @@ class SessionWindow:
     Two entry points and no confirm gate between them, because the verb is one tap: it opens a
     window the owner already owns and changes nothing (contrast Tidy/Restart/Janitor, every one
     of which closes, restarts or deletes something). :meth:`open` names a FLIGHT, :meth:`open_debugger`
-    a fixer's own seat (issue #458); both go through the same :meth:`_focus`, so the engine's four
-    outcomes are rendered once."""
+    a fixer's own seat (issue #458); both go through the same :meth:`_focus`, so the engine's
+    outcomes are rendered once — and a fixer's window opens or switches exactly as a flight's does
+    (#547)."""
 
     def __init__(self, superlooper_cli, repo_paths, timeout=None):
         self._binary = superlooper_cli
@@ -208,13 +227,15 @@ class SessionWindow:
                 "outcome": outcome, "message": message, "error": None if ok else message}
 
     def open(self, repo, num):
-        """Bring THIS flight's session window to the front, by shelling the engine's read-only
-        ``focus-session`` verb. Changes nothing about the loop, this repo, or that session's work.
+        """Put a terminal window showing THIS flight's session in front of the owner, by shelling
+        the engine's ``focus-session`` verb. Changes nothing about the loop, this repo, or that
+        session's work — the engine's only new act is opening the fleet's viewer (#547).
 
-        ``ok`` is true for exactly one answer — the host moved its focus to that window. Every other
-        answer carries the engine's own words in ``error``/``message`` and its own ``outcome``, so
-        the caller can render "that lane has no window" as the ordinary fact it is rather than as a
-        failure, and can tell it apart from a host that would not answer at all.
+        ``ok`` is true for exactly two answers — a viewer window was opened on the lane, or the one
+        already attached was switched to it. Every other answer carries the engine's own words in
+        ``error``/``message`` and its own ``outcome``, so the caller can render "that lane has no
+        window" as the ordinary fact it is rather than as a failure, and can tell it apart from a
+        host that would not answer at all and from a screen nothing could be put on.
         """
         return self._focus(repo, num, lane_id(num), "SL-%s" % num,
                            "%r is not a flight number — there is no lane to open" % (num,))
@@ -238,7 +259,7 @@ class SessionWindow:
     def _focus(self, repo, num, iid, label, bad_target):
         """One focus attempt, whichever lane shape asked for it. ``label`` is how the lane is NAMED
         back to the owner ("SL-340", "fixer d4") — the only difference between the two callers, so
-        the four outcomes cannot drift into two vocabularies for the same four answers."""
+        the outcomes cannot drift into two vocabularies for the same answers."""
         path = self._paths.get(repo)
         if path is None:
             # An unwatched repo is refused BEFORE any subprocess — the command runner only ever acts
@@ -257,20 +278,30 @@ class SessionWindow:
         outcome = body.get("outcome")
         detail = body.get("detail")
         detail = detail.strip() if isinstance(detail, str) else ""
-        if outcome == FOCUSED:
-            # The engine's claim, in the engine's terms: the HOST moved its focus. Not "it is on
-            # your screen" — a screen shows it only where a viewer is attached, which is a fact
-            # about the machine rather than about the lane, and over-claiming here would send the
-            # owner hunting for a window that came up somewhere he is not looking.
-            return self._answer(repo, num, iid, FOCUSED,
-                                "%s — the session host moved its focus to that window" % label,
+        if outcome in (OPENED, SWITCHED):
+            # The engine's claim, in the engine's words, which say WHICH happened — a new window, or
+            # the one already open switched to this lane (and whether it could be raised).
+            return self._answer(repo, num, iid, outcome,
+                                "%s — %s" % (label, detail or (
+                                    "opened a terminal window on it" if outcome == OPENED else
+                                    "switched the open terminal window to it")),
                                 ok=True)
+        if outcome == FOCUSED:
+            # Only an installed engine from before #547 says this. The HOST moved its focus — and a
+            # screen shows that only where a viewer happens to be attached, which is exactly the
+            # empty screen #547 was filed on. Claiming a success here would repeat it; so it is
+            # reported as the publish drift it is, with the remedy named.
+            return self._answer(repo, num, iid, FOCUSED,
+                                "%s — the session host moved its focus to that window, but this "
+                                "machine's installed engine predates opening a terminal window for "
+                                "it, so nothing may be on your screen — re-run bin/install.sh to "
+                                "publish the engine that does" % label)
         if not isinstance(outcome, str) or not outcome.strip():
             # A body without an outcome is a body we cannot read. Say that; never infer one.
             return self._answer(repo, num, iid, None,
                                 "superlooper focus-session gave no readable answer for %s" % label)
-        # Every other outcome — including one a LATER engine invents — is reported in the engine's
-        # own words. ``ok`` is derived from the outcome rather than trusted from the body, so a
+        # Every other outcome — no_window, host_unreachable, unknown_lane, the three ways no window
+        # could be shown, and one a LATER engine invents — is reported in the engine's own words. ``ok`` is derived from the outcome rather than trusted from the body, so a
         # future ``{"ok": true, "outcome": "no_window"}`` could never toast a success over a window
         # that was never opened.
         return self._answer(repo, num, iid, outcome,

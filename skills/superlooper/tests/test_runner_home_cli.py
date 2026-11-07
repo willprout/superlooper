@@ -287,6 +287,33 @@ def test_the_build_up_is_what_writes_the_arming_file(rig):
     assert "ok   launch gate" in r.stdout, r.stdout
 
 
+def test_a_reinstall_rewrites_a_viewer_script_that_predates_the_token(rig):
+    # Issue #547. Every machine built before it carries the tokenless viewer, which the fence
+    # refuses — so "the viewer presents the token" is true only once the install has rewritten the
+    # file already on disk. The marker is what makes it ours to rewrite; this pins that it does.
+    import fleet
+    import session_host
+    _built_host(rig)
+    prefix = Path(rig.env["SL_HOME"]) / "fleet"
+    viewer = prefix / "viewer.command"
+    viewer.write_text(  # the script exactly as `fleet --install` wrote it before #547
+        "#!/bin/sh\n"
+        "# superlooper fleet viewer (issue #309). Attaches to the fleet's session in a real\n"
+        "# terminal. Nothing load-bearing depends on this being open: #302 measured the pinned\n"
+        "# build reviving hosted agents with no client ever attached, which retired plan\n"
+        "# §5.4's workaround. Register it as a Login Item only if you want the window.\n"
+        "exec '%s' --session 'fleet'\n" % fleet.host_binary(str(prefix)))
+
+    r = cli(rig, "fleet", "--install")
+    text = viewer.read_text()
+    assert "%s='%s'" % (session_host.API_TOKEN_FILE_ENV_VAR, prefix / "token") in text, (
+        r.stdout + r.stderr)
+    assert "wrote %s" % viewer in r.stdout
+    assert viewer.stat().st_mode & 0o111, "still double-clickable"
+    # ...and the secret the same install minted is not in it.
+    assert (prefix / "token").read_text().strip() not in text
+
+
 def test_a_reinstall_does_not_revert_the_one_edit_the_file_advertises(rig):
     # The file and the docs offer exactly one supported edit — change the value to `off`. An
     # install that stamped `required` back over it would make that instruction false the first

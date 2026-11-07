@@ -91,11 +91,14 @@ Field by field:
   `~/.claude/skills/superlooper/bin/superlooper`, `~` expanded). Change it only if your skill lives
   elsewhere. Tidy always asks first (it shows exactly which windows it will close) and only ever
   closes *finished* sessions — never one still building. The same CLI backs the flight card's
-  **Open session window** button, which brings that one session's window to the front so you can
-  watch it — and type into it — with your own eyes. Nothing about the loop changes, and if that
-  lane has no window (its session ended, or Tidy closed it) the button says so in the engine's own
-  words rather than pretending it worked. It needs an installed engine new enough to carry
-  `superlooper focus-session`; an older one is named plainly on the first tap.
+  **Open session window** button, which puts a terminal window showing that one session in front
+  of you so you can watch it — and type into it — with your own eyes: it opens the fleet's viewer
+  if none is open, or switches the open one to that session and brings it forward, and the toast
+  says which. Nothing about the loop changes, and if that lane has no window (its session ended,
+  or Tidy closed it) — or no window could be put on screen — the button says so in the engine's own
+  words rather than pretending it worked. It needs an installed engine new enough to open the
+  window itself (`superlooper focus-session`, since #547); an older one is named plainly on the
+  first tap, with the republish that fixes it.
 - **`fun`** — the joy toggles. `master` gates them all; each mechanic (the Solari board and its
   clack, airline liveries, the living clock, the corner counter, the incident sign) has its own
   switch. **All on by default** — the animated airfield is the point. Dial one back only if you

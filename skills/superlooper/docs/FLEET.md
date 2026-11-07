@@ -43,7 +43,7 @@ apart, and it does it by asking the socket what a *worker* would ask.
 | `<host config dir>/config.toml` | the host's settings (plan §2) | **shared** with any session already on this machine — see below |
 | `<host config dir>/agent-detection/<agent>.toml` | the screen-state override | a snapshot of the host's own manifest plus one rule |
 | `~/Library/LaunchAgents/com.superlooper.session-host.plist` | the server login item | `gui/$UID` only |
-| `<prefix>/viewer.command` | the optional viewer | written, never registered |
+| `<prefix>/viewer.command` | the optional viewer | written, never registered; presents the token by its file (#547) |
 
 `<prefix>` is `<state base>/fleet` — hung off the state base and never off a repo, because the host
 is **one server for the whole machine**. A per-repo prefix would mean two repos, two hosts, two
@@ -100,6 +100,44 @@ attached, which retired plan §5.4's "keep a viewer attached" workaround (delete
 2026-08-05). So `viewer.command` is written into the prefix and left there; register it as a Login
 Item yourself if you want the window. Nothing in the build-up depends on it, and the judge never
 asks about it.
+
+**It presents the fleet token, by the token file** (issue #547). The fence refuses every client
+that presents no token, and the viewer is a client: before #547 the script carried none, and on
+the mini double-clicking it got `herdr: unauthorized: this socket requires a token`. Now it sets
+`HERDR_API_TOKEN_FILE` to the same `<prefix>/token` path the server's plist names, and the client
+reads the token from that file itself. The token value is in no script, no command line and no log.
+The one new reader is a viewer you started, reading the same `0600` file the server reads, which is
+the same-uid exposure #342 accepted. Re-running `superlooper fleet --install` rewrites a pre-#547
+script, because the marker makes it the install's own.
+
+**The dashboard opens it for you** (issue #547). Owner ruling, 2026-11-06: one tap on Open session
+window must put a terminal window on that session in front of the owner, whether or not a viewer
+is attached. `superlooper focus-session`, the engine verb behind the button, does it in this
+order:
+
+1. **It moves the host's focus to the lane, through the one door.** If the lane has no window, or
+   the host does not answer, the verb stops there and opens nothing.
+2. **It checks for a GUI login session of this user at the screen.** If there is none, the answer
+   is `no_display`.
+3. **A viewer already attached on this screen is switched and brought forward**, with no second
+   window. The host's focus is what every attached client draws, so step 1 already switched it.
+   The pinned host's API cannot list its clients, so "attached" is read from the process table:
+   a process running exactly the script's command line, inside an app.
+4. **Otherwise the script is opened with this machine's normal handler** (`open viewer.command`),
+   and the answer waits up to 10s for the new viewer to attach. That is `opened`, or
+   `open_failed` / `viewer_not_attached` in words that say which.
+
+Measured on a private fenced server while building this: a client that attaches *after* the focus
+lands on the focused workspace, so the window comes up already on the lane. A tokenless client is
+refused and exits in about 40ms. That is why a new viewer counts as attached only once it has been
+alive for a second.
+
+Bringing a viewer forward uses no Automation (Apple Events) grant. Scripting the terminal app
+would need one, and the grant would go to whichever process asked, which on this machine can be
+the session host whose panes are the workers. Instead it writes two xterm window operations to the
+viewer's own terminal (de-iconify and raise, which is output to the terminal and never input to
+anything) and activates the viewer's app through LaunchServices. `superlooper debug`'s own focus and
+the watchdog's debugger are unchanged: they open no window.
 
 ---
 

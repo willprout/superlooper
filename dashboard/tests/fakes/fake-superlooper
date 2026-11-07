@@ -21,7 +21,7 @@ the exact keys so a test proves ONLY the tapped subset was sent.
 
 And the Open-session-window button's shell (issue #340; see ``route_focus_session``):
 
-    superlooper focus-session --repo <path> --id i<N> --json   → one of the engine's four outcomes
+    superlooper focus-session --repo <path> --id i<N> --json   → one of the engine's outcomes
 
 It also models the Restart button's shell (issue #116; see ``route_request_restart``):
 
@@ -368,12 +368,29 @@ def route_debug():
     sys.exit(0)
 
 
-# The engine's four outcomes, each with the REAL detail sentence `superlooper focus-session --json`
+# The engine's outcomes, each with the REAL detail sentence `superlooper focus-session --json`
 # prints for it (skill/lib/focus.py + skill/lib/session_host.py) and the REAL exit code
 # (focus.EXIT_CODES). Copied verbatim so lib/session_window is exercised against the true contract
 # — including the property the dashboard leans on hardest: `no_window` is an ordinary answer with an
 # explanatory sentence, not an error string.
+#
+# Since issue #547 the verb puts a WINDOW in front (focus.show_lane): `opened` and `switched` are its
+# two successes and the three after `unknown_lane` are the ways no window could be shown. `focused`
+# is what an INSTALLED engine from before #547 still answers — the host moved its focus and nothing
+# opened a window for it — so it is modelled as that older engine reported it (ok true).
 _FOCUS_DETAIL = {
+    "opened": "opened a terminal window on it",
+    "switched": "switched the open terminal window to it and brought it to the front",
+    "no_display": "no window can be put in front of you: there is no GUI login session for this "
+                  "user at this machine's screen (it is at the login window, another user is in "
+                  "front, or this ran over ssh). The session host did move its focus to %s, so a "
+                  "viewer you attach later will show it",
+    "open_failed": "this machine could not open /home/pat/.superlooper/fleet/viewer.command (exit "
+                   "1: LSOpenURLsWithRole() failed with error -10810)",
+    "viewer_not_attached": "/home/pat/.superlooper/fleet/viewer.command was opened, but no viewer "
+                           "attached to the fleet within 10s. A window may be showing why; the "
+                           "usual cause is a viewer script from before #547, which the fenced host "
+                           "refuses — `superlooper fleet --install` rewrites it",
     "focused": "the host moved its focus to workspace ws-340; a viewer attached to this session "
                "follows it",
     "no_window": "no session window is recorded for %s — it has not launched, its session ended, "
@@ -381,7 +398,12 @@ _FOCUS_DETAIL = {
     "host_unreachable": "could not ask the host to focus workspace ws-340 (rc=1; unauthorized)",
     "unknown_lane": "no loop state for %s: [Errno 2] no such file or directory",
 }
-_FOCUS_EXIT = {"focused": 0, "no_window": 3, "host_unreachable": 4, "unknown_lane": 5}
+_FOCUS_EXIT = {"focused": 0, "no_window": 3, "host_unreachable": 4, "unknown_lane": 5,
+               "opened": 0, "switched": 0, "no_display": 6, "open_failed": 7,
+               "viewer_not_attached": 8}
+# The answers in which the host DID focus the lane, so the engine's JSON names its workspace.
+_FOCUS_HAS_WORKSPACE = ("focused", "host_unreachable", "opened", "switched", "no_display",
+                        "open_failed", "viewer_not_attached")
 
 
 def route_focus_session():
@@ -390,7 +412,8 @@ def route_focus_session():
     window (issue #339). The dashboard only shells it and never names a session host, so this fake
     is the whole of what a session-window test may see of a window.
 
-    ``SL_FOCUS_OUTCOME`` picks which of the four the engine answers (default ``focused``);
+    ``SL_FOCUS_OUTCOME`` picks which outcome the engine answers (default ``opened``, the #547
+    engine's success when no viewer is attached);
     ``SL_FOCUS_GARBAGE=1`` prints non-JSON so a test can exercise the unparseable path; and
     ``SL_FOCUS_UNKNOWN_VERB=1`` models an INSTALLED engine that predates the verb — argparse's
     `invalid choice` on stderr, rc 2, and no JSON at all, which is the publish-drift case the
@@ -403,13 +426,14 @@ def route_focus_session():
     if os.environ.get("SL_FOCUS_GARBAGE"):
         sys.stdout.write("not json — the CLI misbehaved\n")
         sys.exit(0)
-    outcome = os.environ.get("SL_FOCUS_OUTCOME") or "focused"
+    outcome = os.environ.get("SL_FOCUS_OUTCOME") or "opened"
     iid = opt("--id") or ""
     detail = _FOCUS_DETAIL.get(outcome, "")
     if "%s" in detail:
         detail = detail % (opt("--repo") if outcome == "unknown_lane" else iid)
-    out = {"ok": outcome == "focused", "verb": "focus-session", "id": iid, "outcome": outcome,
-           "workspace": "ws-340" if outcome in ("focused", "host_unreachable") else None,
+    out = {"ok": outcome in ("focused", "opened", "switched"), "verb": "focus-session",
+           "id": iid, "outcome": outcome,
+           "workspace": "ws-340" if outcome in _FOCUS_HAS_WORKSPACE else None,
            "repo": "will-titan/command-center", "detail": detail}
     sys.stdout.write(json.dumps(out) + "\n")
     sys.exit(_FOCUS_EXIT.get(outcome, 1))
