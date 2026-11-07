@@ -764,3 +764,30 @@ def test_focus_session_is_documented_in_the_clis_own_help():
                           capture_output=True, text=True, timeout=60)
     for word in ("--id", "--json", "--repo", "no_window", "host_unreachable", "unknown_lane"):
         assert word in verb.stdout, "`focus-session --help` must document %s" % word
+
+
+def test_an_attached_viewer_with_no_app_is_switched_never_joined_by_a_second(tmp_path):
+    prefix = _fleet(tmp_path)
+    _record(tmp_path / "home", "i547", "w9:p1", "w9")
+    screen = FakeScreen(prefix)
+    screen.rows += [viewer.Proc(900, 1, "??", "/opt/homebrew/bin/tmux"),
+                    viewer.Proc(901, 900, "ttys901", " ".join(screen.argv))]
+    got = _show(tmp_path, screen)
+    assert got.outcome == focus_lib.SWITCHED and got.ok
+    assert screen.opened == [] and screen.activated == []
+    assert "not brought to the front" in got.detail
+
+
+def test_the_focus_waits_its_turn_behind_a_tap_still_opening(tmp_path):
+    # Fresh-agent review: with the focus OUTSIDE the lock, tap B's focus could land between tap A's
+    # focus and A's viewer attaching — A would report its own lane while the window drew B's. So
+    # the whole tap, focus included, runs under the lock; a tap that cannot get it focuses nothing.
+    import fcntl
+    prefix = _fleet(tmp_path)
+    _record(tmp_path / "home", "i547", "w9:p1", "w9")
+    door = FakeDoor()
+    with open(str(prefix / focus_lib.VIEWER_LOCK), "w") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        got = _show(tmp_path, FakeScreen(prefix), door=door)
+    assert got.outcome == focus_lib.OPEN_FAILED
+    assert door.sessions == [], "no focus was moved while another tap held the window"

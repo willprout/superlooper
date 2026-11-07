@@ -200,3 +200,95 @@ def test_no_test_reaches_the_real_screen_by_default():
     assert real.open("/x/viewer.command")[0] == 127
     assert real.activate(_TERMINAL)[0] == 127
     assert real.raise_tty("ttys004")[0] is False
+
+
+# ---------------------------------------------------------- fresh-agent review, round 1
+
+def test_a_viewer_with_no_app_above_it_is_still_attached_so_no_second_one_opens():
+    # tmux inside Terminal, or a terminal that runs its shells apart from its app (re-parented to
+    # launchd): the viewer is real and on this screen. Missing it would open a second viewer on
+    # every tap — and miss the new one too, reporting "never attached" over a working window.
+    table = _ps((1, 0, "??", "/sbin/launchd"),
+                (900, 1, "??", "/opt/homebrew/bin/tmux new-session"),
+                (910, 900, "ttys020", "-zsh"),
+                (920, 910, "ttys020", " ".join(_ARGV)))
+    assert viewer.find(viewer.parse_ps(table), _ARGV) == viewer.Attached(920, "ttys020", None)
+
+
+def test_a_viewer_in_an_app_is_preferred_over_one_in_none():
+    table = _TABLE + _ps((900, 1, "??", "/opt/homebrew/bin/tmux"),
+                         (920, 900, "ttys020", " ".join(_ARGV)))
+    assert viewer.find(viewer.parse_ps(table), _ARGV).pid == 520
+
+
+def test_the_app_is_the_outermost_bundle_and_never_a_frameworks_stub():
+    code = "/Applications/Visual Studio Code.app"
+    table = _ps((1, 0, "??", "/sbin/launchd"),
+                (300, 1, "??", code + "/Contents/Frameworks/Code Helper (Plugin).app/Contents/"
+                                      "MacOS/Code Helper (Plugin) --type=utility"),
+                (310, 300, "ttys030", " ".join(_ARGV)),
+                (400, 1, "??", "/Library/Frameworks/Python.framework/Versions/3.14/Resources/"
+                               "Python.app/Contents/MacOS/Python drive.py"),
+                (410, 400, "ttys040", " ".join(_ARGV)))
+    procs = viewer.parse_ps(table)
+    assert viewer.app_of(procs, 310) == code, "activate the IDE, not its helper"
+    assert viewer.app_of(procs, 410) is None, "a runtime's stub app is no terminal"
+
+
+def test_a_helper_binary_under_resources_is_not_an_app():
+    table = _ps((1, 0, "??", "/sbin/launchd"),
+                (300, 1, "??", "/Applications/cmux.app/Contents/Resources/bin/cmux"),
+                (310, 300, "ttys030", " ".join(_ARGV)))
+    assert viewer.app_of(viewer.parse_ps(table), 310) is None
+
+
+def test_an_attached_viewer_that_cannot_be_activated_by_app_says_so():
+    class S:
+        def raise_tty(self, tty):
+            return True, ""
+
+        def activate(self, app):
+            raise AssertionError("there is no app to activate")
+    raised, why = viewer.bring_forward(S(), viewer.Attached(920, "ttys020", None))
+    assert raised is False and "which app" in why
+
+
+def test_an_explicit_env_fails_closed_for_every_seam_it_does_not_name(tmp_path):
+    # A test that injects one seam must not reach the REAL others through the defaults.
+    scr = viewer.Screen(env={"SL_CONSOLE": str(tmp_path / "absent")})
+    assert scr.processes() is None
+    assert scr.open("/x/viewer.command")[0] == 127
+    assert scr.raise_tty("ttys004")[0] is False
+
+
+class _Clock:
+    """A screen whose viewer appears at ``appear`` seconds and stays."""
+
+    def __init__(self, appear, pid=777):
+        self.t, self.appear, self.pid = 0.0, appear, pid
+
+    def processes(self):
+        rows = [viewer.Proc(1, 0, "??", "/sbin/launchd"),
+                viewer.Proc(500, 1, "??", _TERMINAL + "/Contents/MacOS/Terminal")]
+        if self.t >= self.appear:
+            rows.append(viewer.Proc(self.pid, 500, "ttys004", " ".join(_ARGV)))
+        return rows
+
+    def now(self):
+        return self.t
+
+    def sleep(self, s):
+        self.t += s
+
+
+def test_a_viewer_that_turns_up_near_the_bound_still_gets_its_settle():
+    clock = _Clock(appear=9.8)
+    got = viewer.wait_for_new(clock, _ARGV, set(), seconds=10, settle=1.0)
+    assert got is not None and got.pid == 777
+    assert clock.t <= 10 + 1.0 + 0.5, "allowed its settle, and no more"
+
+
+def test_a_viewer_that_never_turns_up_is_given_up_on_at_the_bound():
+    clock = _Clock(appear=99)
+    assert viewer.wait_for_new(clock, _ARGV, set(), seconds=10, settle=1.0) is None
+    assert 10 <= clock.t <= 10.5

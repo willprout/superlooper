@@ -106,9 +106,10 @@ session; each one loads the playbook for that job:
   plainly why no window could be shown. The fixer card's button works the same way. The
   viewer is `viewer.command`, which the install writes next to the Herdr binary; you can
   also double-click it for a window onto every running session. It presents the fleet's
-  token from the token file, so it attaches on a fenced machine. Watching is optional in
-  the strongest sense: nothing depends on the window being open, and closing it kills no
-  session.
+  token from the token file, so it attaches on a fenced machine. A machine built before
+  #547 has a script that presents no token: re-run `superlooper fleet --install` once to
+  rewrite it. Watching is optional in the strongest sense: nothing depends on the window
+  being open, and closing it kills no session.
 - `tail -f <state home>/logs/runner.log` when you want the runner's own voice.
 
 ## Answering

@@ -259,6 +259,13 @@ VIEWER_SETTLE_SECONDS = 1.0
 VIEWER_LOCK = "viewer.lock"
 
 
+def _lock_seconds(attach, settle):
+    """How long a tap waits for the one ahead of it: that tap's worst case — its focus call, a
+    process-table read, the opener, the attach wait and its settle — plus a beat. Past it the
+    answer is "another tap is still opening", never a second viewer."""
+    return CALL_SECONDS + viewer.PS_SECONDS + viewer.OPEN_SECONDS + attach + settle + 2
+
+
 @contextlib.contextmanager
 def _one_tap_at_a_time(fleet_prefix, screen, seconds):
     """Hold the fleet's viewer lock for the body, waiting up to ``seconds`` for it. Yields whether
@@ -296,6 +303,9 @@ def show_lane(home, iid, fleet_prefix, host=None, screen=None, session=None,
     The dashboard's Open session window button rides this, through ``superlooper focus-session``.
     It is :func:`focus_lane` and then the window — never instead of it:
 
+    0. **One tap at a time.** The whole tap — the focus included — runs under the fleet's viewer
+       lock, so a double tap cannot open two viewers, nor move the focus under a viewer still
+       attaching for the other lane.
     1. **The host's focus, through the one door, first.** Anything but ``focused`` — the lane has
        no window, the host would not answer, the id is not ours — is returned exactly as
        :func:`focus_lane` gave it, and NO viewer is opened: there is nothing to show.
@@ -306,6 +316,8 @@ def show_lane(home, iid, fleet_prefix, host=None, screen=None, session=None,
        is opened: otherwise the answer is a terminal launched where nobody can see it.
     3. **A viewer already attached on this screen** is switched (step 1 did that — the host's focus
        is what every attached client draws) and brought forward: ``switched``, no second window.
+       One with no app above it (tmux, a terminal that runs its shells apart from its app) is
+       still switched and never joined by a second, and the answer says it could not be raised.
     4. **Otherwise the viewer script is opened** by the machine's normal handler and the answer
        waits, bounded, for a NEW viewer to attach: ``opened``, or ``open_failed`` /
        ``viewer_not_attached`` in words that say which.
@@ -317,33 +329,37 @@ def show_lane(home, iid, fleet_prefix, host=None, screen=None, session=None,
     Never raises. ``host`` and ``screen`` are injected for the tests; ``session`` names the host
     session the viewer attaches to (the fleet's, unless a caller says otherwise).
     """
-    got = focus_lane(home, iid, host=host)
-    if got.outcome != FOCUSED:
-        return got
     screen = screen if screen is not None else viewer.Screen()
     attach = VIEWER_ATTACH_SECONDS if attach_seconds is None else attach_seconds
     settle = VIEWER_SETTLE_SECONDS if settle_seconds is None else settle_seconds
-    ws = got.workspace
+    argv = fleet.viewer_argv(fleet.host_binary(str(fleet_prefix)), session or fleet.SESSION_NAME)
+    script = fleet.viewer_command(str(fleet_prefix))
+    asked = iid.strip() if isinstance(iid, str) else ""
+    got = None
 
     def answer(outcome, detail):
-        return Result(outcome, got.id, workspace=ws, detail=detail)
+        return Result(outcome, got.id if got else asked,
+                      workspace=got.workspace if got else "", detail=detail)
 
     try:
-        if not screen.console_is_ours():
-            return answer(NO_DISPLAY,
-                          "no window can be put in front of you: there is no GUI login session for "
-                          "this user at this machine's screen (it is at the login window, another "
-                          "user is in front, or this ran over ssh). The session host did move its "
-                          "focus to %s, so a viewer you attach later will show it" % got.id)
-        argv = fleet.viewer_argv(fleet.host_binary(str(fleet_prefix)),
-                                 session or fleet.SESSION_NAME)
-        script = fleet.viewer_command(str(fleet_prefix))
-        with _one_tap_at_a_time(fleet_prefix, screen,
-                                attach + settle + viewer.OPEN_SECONDS + 5) as held:
+        # The WHOLE tap runs under the lock, the host's focus included (fresh-agent review): were
+        # the focus outside it, a second tap's focus could land between this tap's focus and its
+        # viewer attaching, and this tap would report its own lane while the window drew another.
+        with _one_tap_at_a_time(fleet_prefix, screen, _lock_seconds(attach, settle)) as held:
             if not held:
                 return answer(OPEN_FAILED,
                               "another Open session window tap is still opening the viewer; "
-                              "nothing was opened beside it — tap again in a moment")
+                              "nothing was focused or opened beside it — tap again in a moment")
+            got = focus_lane(home, iid, host=host)
+            if got.outcome != FOCUSED:
+                return got
+            if not screen.console_is_ours():
+                return answer(NO_DISPLAY,
+                              "no window can be put in front of you: there is no GUI login session "
+                              "for this user at this machine's screen (it is at the login window, "
+                              "another user is in front, or this ran over ssh). The session host "
+                              "did move its focus to %s, so a viewer you attach later will show it"
+                              % got.id)
             procs = screen.processes()
             if procs is None:
                 return answer(OPEN_FAILED,
@@ -377,6 +393,7 @@ def show_lane(home, iid, fleet_prefix, host=None, screen=None, session=None,
                               "fleet --install` rewrites it" % (script, attach))
             return answer(OPENED, "opened a terminal window on it")
     except Exception as e:                  # never raises: the caller is a UI rendering an answer
-        return answer(OPEN_FAILED, "opening the window failed inside the engine (%s: %s); the "
-                                   "session host did move its focus to %s"
-                      % (type(e).__name__, e, got.id))
+        return answer(OPEN_FAILED, "opening the window failed inside the engine (%s: %s)%s"
+                      % (type(e).__name__, e,
+                         "; the session host did move its focus to %s" % got.id
+                         if got is not None and got.outcome == FOCUSED else ""))

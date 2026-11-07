@@ -122,7 +122,10 @@ order:
 3. **A viewer already attached on this screen is switched and brought forward**, with no second
    window. The host's focus is what every attached client draws, so step 1 already switched it.
    The pinned host's API cannot list its clients, so "attached" is read from the process table:
-   a process running exactly the script's command line, inside an app.
+   a process running exactly the script's command line and not under an ssh or mosh session. The
+   app it is in is the outermost app bundle above it. A viewer with no app above it (tmux, or a
+   terminal that runs its shells apart from the app) still counts as attached, so a tap never
+   opens a second one beside it. The answer then says it could not be brought to the front.
 4. **Otherwise the script is opened with this machine's normal handler** (`open viewer.command`),
    and the answer waits up to 10s for the new viewer to attach. That is `opened`, or
    `open_failed` / `viewer_not_attached` in words that say which.
@@ -136,8 +139,12 @@ Bringing a viewer forward uses no Automation (Apple Events) grant. Scripting the
 would need one, and the grant would go to whichever process asked, which on this machine can be
 the session host whose panes are the workers. Instead it writes two xterm window operations to the
 viewer's own terminal (de-iconify and raise, which is output to the terminal and never input to
-anything) and activates the viewer's app through LaunchServices. `superlooper debug`'s own focus and
-the watchdog's debugger are unchanged: they open no window.
+anything) and activates the viewer's app through LaunchServices. Terminal honours both operations
+(measured: a minimized viewer behind another app and another Terminal window came back frontmost).
+A terminal that ignores them still comes forward as an app, with its own front window, and a viewer
+in a background tab stays in its tab. The whole tap runs under `<prefix>/viewer.lock`, the host's
+focus included, so a double tap cannot open two viewers. `superlooper debug`'s own focus and the
+watchdog's debugger are unchanged: they open no window.
 
 ---
 

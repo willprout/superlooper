@@ -1,8 +1,8 @@
 """The window side of Open session window (issue #547): find, open and raise the fleet's viewer.
 
-Owner ruling, 2026-11-06: "When I click that button, it should open a terminal window, even if
-terminal is not running with the herdr session." Before #547 the button moved the session host's
-focus and stopped there — and the host runs windowless, so nothing appeared unless a viewer happened
+Owner ruling, 2026-11-06 (quoted verbatim in issue #547): clicking Open session window opens a
+terminal window, even when no terminal is attached to the fleet's session. Before #547 the button
+moved the session host's focus and stopped there — and the host runs windowless, so nothing appeared unless a viewer happened
 to be attached. This module is the half of the fix that has nothing to do with the host: whether a
 viewer window is on this screen, opening one, and bringing an attached one forward. ``lib/focus``
 composes it with the host's own focus, which goes through the one door (``lib/session_host``) and
@@ -13,9 +13,16 @@ attached: its ``status`` reports the local binary and the server, its session li
 running/stopped, and its snapshot carries workspaces, tabs, panes and agents — no clients (read out
 of the pinned release's own ``src/cli/status.rs``, ``src/cli.rs`` and ``src/api/schema/session.rs``).
 So the answer comes from the OS: a viewer is a process whose command line is EXACTLY the one the
-viewer script execs (``fleet.viewer_argv`` — spelled once for both) and whose ancestry reaches an
-app bundle, i.e. a terminal app on this screen. A client attached over ssh, or nested inside a
-session-host pane, is attached but in no window the owner can be shown, so it does not count.
+viewer script execs (``fleet.viewer_argv`` — spelled once for both), and it counts as on THIS
+screen unless its ancestry shows it is remote — an ssh or mosh session is attached but in no window
+the owner here can be shown. The app it runs in is the outermost app bundle above it, when there is
+one; when there is not (a terminal whose shells are re-parented away from the app, a viewer inside
+tmux) it is still attached — so a tap never opens a second one beside it — it just cannot be raised
+by app, and the answer says so.
+
+**What this does not see**, stated rather than discovered: ``ps`` vis-encodes control and non-ASCII
+bytes in a command line, so a fleet prefix whose path carries them never matches and every tap would
+open a window. The default prefix (``~/.superlooper/fleet``) carries none.
 
 **What it runs.** Three things, each named where it is done:
 
@@ -31,8 +38,8 @@ session-host pane, is attached but in no window the owner can be shown, so it do
   pane or a session.
 
 Every edge is a method on :class:`Screen` and every one has an environment override, the same
-shape as ``SL_GH`` / ``SL_HERDR``, so the conftest can point all of them at paths that cannot exist
-(the "no test reaches a real external binary" ratchet — here, the owner's real display).
+shape as ``SL_GH``, so the conftest can point all of them at paths that cannot exist (the "no test
+reaches a real external binary" ratchet — here, the owner's real display).
 """
 import os
 import re
@@ -46,10 +53,13 @@ Proc = namedtuple("Proc", "pid ppid tty args")
 # An attached viewer: its pid, its controlling terminal, and the app bundle it is running in.
 Attached = namedtuple("Attached", "pid tty app")
 
-# What marks an ancestor as a GUI app — the executable inside a bundle. Deliberately the MacOS/
-# directory, not merely ".app/": an app's helper binaries live under Contents/Resources/ (cmux's own
-# CLI does), and those are not the app the window belongs to.
-_APP_EXEC = ".app/Contents/MacOS/"
+# What marks an ancestor as a GUI app — an executable inside a bundle's Contents/MacOS/. Not merely
+# ".app/": an app's helper binaries also live under Contents/Resources/ (cmux's own CLI does), and
+# those are not the app a window belongs to.
+_APP_EXEC = "/Contents/MacOS/"
+
+# Ancestors that mean "this viewer is attached from somewhere else, not on this screen".
+_REMOTE = ("sshd", "mosh-server")
 
 # How far up the tree an app may be. A terminal app is the viewer's grandparent (app -> login ->
 # viewer); the bound is only there so a corrupt table cannot keep the walk going.
@@ -93,42 +103,77 @@ def parse_ps(text):
     return out
 
 
-def app_of(procs, pid):
-    """The app bundle ``pid`` runs in — its nearest ancestor that is an app's own executable — or
-    ``None``. PURE. Survives a cycle and a missing parent (a process table is a snapshot, and a
-    parent can exit between the rows)."""
+def _bundle(args):
+    """The app bundle a command line's executable lives in, or ``None``. PURE.
+
+    The OUTERMOST bundle, because a helper nested inside an app (an IDE's ``Code Helper
+    (Plugin).app`` under ``Contents/Frameworks/``) is not what to activate — the app it belongs to
+    is. A bundle inside a ``.framework`` (``Python.framework/…/Python.app``) is a runtime's stub,
+    not a terminal anybody looks at, so it does not count."""
+    if not args.startswith("/") or _APP_EXEC not in args:
+        return None
+    head = args[:args.index(_APP_EXEC)]
+    if ".app" not in head:
+        return None
+    bundle = head[:head.index(".app") + len(".app")]
+    if ".framework/" in bundle:
+        return None
+    return bundle
+
+
+def _is_remote(args):
+    first = args.split(" ", 1)[0]
+    return os.path.basename(first).startswith(_REMOTE) or args.startswith(_REMOTE)
+
+
+def _ancestry(procs, pid):
+    """``pid``'s ancestors, nearest first. PURE. Survives a cycle and a missing parent (a process
+    table is a snapshot, and a parent can exit between the rows)."""
     by_pid = {p.pid: p for p in procs}
-    seen = set()
+    out, seen = [], set()
     cur = by_pid.get(pid)
     for _ in range(_MAX_DEPTH):
         if cur is None or cur.pid in seen:
-            return None
+            break
         seen.add(cur.pid)
-        parent = by_pid.get(cur.ppid)
-        if parent is not None and _APP_EXEC in parent.args:
-            return parent.args[:parent.args.index(_APP_EXEC) + len(".app")]
-        cur = parent
+        cur = by_pid.get(cur.ppid)
+        if cur is not None and cur.pid not in seen:
+            out.append(cur)
+    return out
+
+
+def app_of(procs, pid):
+    """The app bundle ``pid`` runs in — the bundle of its nearest app ancestor — or ``None``."""
+    for anc in _ancestry(procs, pid):
+        bundle = _bundle(anc.args)
+        if bundle:
+            return bundle
     return None
+
+
+def is_remote(procs, pid):
+    """Is ``pid`` running under an ssh/mosh session — attached, but not on this screen?"""
+    return any(_is_remote(anc.args) for anc in _ancestry(procs, pid))
 
 
 def find(procs, argv, exclude=()):
     """The attached viewer to raise, or ``None``. PURE.
 
     A viewer is a process whose command line is exactly ``argv`` — so the server (the same binary
-    and session plus ``server``) never matches — running inside an app on this screen. Of several,
-    the newest (highest pid) wins: it is the one the owner most recently opened. ``exclude`` lists
-    pids that do not count, which is how "a NEW viewer attached" is asked after an open.
+    and session plus ``server``) never matches — that is not attached from an ssh/mosh session.
+    Its ``app`` is ``None`` when no app bundle sits above it (it is still attached; it just cannot
+    be activated by app). Of several, one in an app wins over one in none, then the newest (highest
+    pid) — the one the owner most recently opened. ``exclude`` lists pids that do not count, which
+    is how "a NEW viewer attached" is asked after an open.
     """
     want = " ".join(str(a) for a in argv)
     best = None
     for p in procs or ():
-        if p.args != want or p.pid in exclude:
+        if p.args != want or p.pid in exclude or is_remote(procs, p.pid):
             continue
-        app = app_of(procs, p.pid)
-        if app is None:
-            continue
-        if best is None or p.pid > best.pid:
-            best = Attached(p.pid, p.tty, app)
+        cand = Attached(p.pid, p.tty, app_of(procs, p.pid))
+        if best is None or (cand.app is not None, cand.pid) > (best.app is not None, best.pid):
+            best = cand
     return best
 
 
@@ -147,10 +192,17 @@ class Screen:
     """
 
     def __init__(self, env=None):
+        # An EXPLICIT env (a test's) fails closed for every seam it does not name: a missing key
+        # resolves to a path that cannot exist, never to the real binary (fresh-agent review). Only
+        # the process environment — production, or the conftest's neutralized one — has defaults.
+        self._explicit = env is not None
         self.env = os.environ if env is None else env
 
     def _get(self, name, default):
-        return self.env.get(name) or default
+        value = self.env.get(name)
+        if value:
+            return value
+        return "/nonexistent/unset-" + name if self._explicit else default
 
     def console_is_ours(self):
         """Is there a GUI login session for THIS user in front of the machine?
@@ -235,6 +287,10 @@ def bring_forward(screen, attached):
     came forward with its own front window.
     """
     ok_tty, why_tty = screen.raise_tty(attached.tty)
+    if attached.app is None:
+        return False, ("could not tell which app it is running in (no app sits above it — tmux, or "
+                       "a terminal that runs its shells apart from the app), so it was not brought "
+                       "to the front")
     rc, err = screen.activate(attached.app)
     if rc != 0:
         return False, ("could not bring %s to the front (%s)"
@@ -253,6 +309,7 @@ def wait_for_new(screen, argv, before, seconds, settle, poll=0.25):
     """
     deadline = screen.now() + seconds
     first = None
+    seen_at = None
     while True:
         procs = screen.processes()
         got = find(procs, argv, exclude=before) if procs is not None else None
@@ -260,10 +317,12 @@ def wait_for_new(screen, argv, before, seconds, settle, poll=0.25):
         if got is None:
             first = None
         elif first is None or first.pid != got.pid:
-            first = got
-            seen_at = now
+            first, seen_at = got, now
         elif now - seen_at >= settle:
             return got
-        if now >= deadline:
+        # A viewer first seen near the bound is still allowed its settle (fresh-agent review): one
+        # that turned up at 9.8s of 10 is a cold terminal launch, not a refusal, and cutting it off
+        # would report "never attached" over a working window.
+        if now >= (deadline if first is None else max(deadline, seen_at + settle)):
             return None
         screen.sleep(poll)
