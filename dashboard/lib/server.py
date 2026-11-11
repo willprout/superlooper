@@ -961,8 +961,9 @@ _LIVE_AIR = (flights.TAXI_OUT, flights.TAKEOFF, flights.DOWNWIND, flights.BASE_T
 # by circuit position; off-path states grouped after). Server-side so the JS sorts by a supplied
 # number and never encodes the circuit order itself (design record B.1). Unknown ⇒ 99 (sorts last).
 _STAGE_RANK = {s: i for i, s in enumerate(flights.CIRCUIT_STAGES)}
-for _i, _s in enumerate((flights.HOLDING, flights.STRANDED, flights.SESSION_FROZEN,
-                         flights.MERGES_FREEZE, flights.PARKED, flights.AWAITING),
+for _i, _s in enumerate((flights.HOLDING, flights.CONSULTING, flights.STRANDED,
+                         flights.SESSION_FROZEN, flights.MERGES_FREEZE, flights.PARKED,
+                         flights.AWAITING),
                         start=len(flights.CIRCUIT_STAGES)):
     _STAGE_RANK[_s] = _i
 
@@ -1056,6 +1057,11 @@ def _flight_note(flight, memo):
         return (memo or "awaiting your decision").strip().replace("\n", " ")[:90]
     if stage == flights.HOLDING:
         return "holding — number 2 for landing"
+    if stage == flights.CONSULTING:
+        # #545: never the question itself — that reads as something to answer, and it isn't his yet.
+        if flight.get("consult_phase") == flights.CONSULT_HANDING_OVER:
+            return "question on its way to you — it reaches your Questions once posted"
+        return "consulting the approving session — nothing needed from you yet"
     if stage == flights.STRANDED:
         return "stranded at the gate — report filed, runner hasn't landed it"
     if flight.get("merged"):
@@ -1710,6 +1716,10 @@ def _assemble_repo(repo, config, now, gh_mod, diff_reader, last_seen=None, concl
             # #163: the durable owner-decision question this flight is waiting on (loopstate), so the
             # Questions surface can show it and offer the Answer action.
             "pending_question": st.get("pending_question"),
+            # #538's consult record and the post-once stamp, read exactly as the engine writes them,
+            # so a consulting flight can tell "being considered" from "on its way to you" (#545).
+            "question_posted": st.get("question_posted"),
+            "consult": st.get("consult"),
         }
         f = flights.build_flight(issue, flight_repo)
         f["display"] = _project_display(f, name, jslice, issue["activity_mtime"], now)

@@ -191,6 +191,50 @@ def test_drawer_off_path_state_is_named_in_plain_words():
     assert cur["stage"] == flights.DOWNWIND                        # honest position, not teleported
 
 
+def test_drawer_consulting_says_who_is_considering_and_that_nothing_is_needed_yet():
+    # Issue #545: a question the approving session is considering. The drawer names that in plain
+    # words, quotes the question (it is posted nowhere until the consult decides), offers NO decision
+    # verb — it is not William's question yet — and keeps the plane at its honest leg.
+    q = "QUESTION: which?\nOPTIONS: a / b\nRECOMMENDATION: a"
+    f = _flight(stage=flights.CONSULTING, circuit_stage=flights.DOWNWIND, question=q,
+                memo=None)
+    d = cards.flight_drawer(f, [], "r", "Air")
+    assert d["off_path"]["state"] == flights.CONSULTING
+    plain = d["off_path"]["plain"].lower()
+    assert "approv" in plain and "considering" in plain and "nothing" in plain
+    assert d["off_path"]["question"] == q
+    assert d["decision"] is None
+    cur = next(s for s in d["circuit"] if s["current"])
+    assert cur["stage"] == flights.DOWNWIND
+
+
+def test_drawer_consulting_hand_over_stops_claiming_a_fork_is_considering_it():
+    # Fresh-agent review of #545: once the question is posted (or the fork never launched) nobody is
+    # considering it — the note must say it is on its way to the owner, still with no verb.
+    f = _flight(stage=flights.CONSULTING, circuit_stage=flights.DOWNWIND, question="Q?",
+                consult_phase=flights.CONSULT_HANDING_OVER, memo=None)
+    d = cards.flight_drawer(f, [], "r", "Air")
+    plain = d["off_path"]["plain"].lower()
+    assert "considering" not in plain
+    assert "you" in plain and "questions" in plain
+    assert d["off_path"]["state"] == flights.CONSULTING
+    assert d["off_path"]["question"] == "Q?"
+    assert d["decision"] is None
+
+
+def test_drawer_off_path_note_carries_no_question_for_other_states():
+    # The quoted question belongs to the consulting note only; an amber decision shows its question
+    # on the Questions card, and a parked note never grows a stray empty quote.
+    for stage in (flights.PARKED, flights.AWAITING, flights.HOLDING, flights.SESSION_FROZEN):
+        d = cards.flight_drawer(_flight(stage=stage, question="Q?"), [], "r", "Air")
+        assert d["off_path"].get("question") is None, stage
+
+
+def test_every_off_path_state_has_plain_words():
+    for stage in flights.OFF_PATH_STATES:
+        assert cards.OFF_PATH_PLAIN.get(stage), stage
+
+
 def test_drawer_stranded_gate_names_the_gate_and_holds_its_final_position(tmp_path):
     # A stranded gate's drawer (issue #22) must tell the owner where the problem is — the GATE, not a
     # dead session — and keep the plane AT its honest final position (the gate) on the circuit rail.

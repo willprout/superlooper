@@ -353,8 +353,9 @@ def test_at_stand_is_never_session_frozen_for_lack_of_a_contrail():
 
 def test_the_off_path_states_are_pairwise_distinct():
     # The core §5 honesty guarantee: every off-path state demands an opposite response, so no two
-    # collapse. Six of them now, since a stranded gate (issue #22) joined the set.
-    assert len(set(flights.OFF_PATH_STATES)) == len(flights.OFF_PATH_STATES) == 6
+    # collapse. Seven of them now: a stranded gate (issue #22) joined the set, then a question the
+    # approving session is considering (issue #545).
+    assert len(set(flights.OFF_PATH_STATES)) == len(flights.OFF_PATH_STATES) == 7
 
 
 def test_session_frozen_and_merges_freeze_are_different_values():
@@ -367,6 +368,133 @@ def test_awaiting_marker_is_not_amber_owner_decision():
     # state/awaiting/<id> is a worker's OWN long-background-wait touch (loop contract), not a
     # decision waiting on William — it must not render as the amber awaiting state.
     assert flights.flight_stage("running", session_started=True, long_wait=True) == flights.DOWNWIND
+
+
+# =============================== consulting (issue #545, over the engine's #538) ===============================
+# A worker exited cleanly on a question and a fork of the session that APPROVED the issue is
+# considering it before William is asked. It is its own off-path state: not in the air (no worker is
+# running), not queued, not amber (nothing is asked of William yet), and never a dead session.
+
+def test_consulting_is_its_own_off_path_state():
+    assert flights.flight_stage("consulting") == flights.CONSULTING
+    assert flights.CONSULTING in flights.OFF_PATH_STATES
+    assert flights.CONSULTING not in flights.CIRCUIT_STAGES
+
+
+def test_consulting_is_never_an_owner_decision_nor_any_other_off_path_state():
+    # §5: states that demand different responses never share a value. Consulting asks NOTHING of
+    # William, so above all it is never the amber AWAITING that puts a card in front of him.
+    for other in (flights.PARKED, flights.AWAITING, flights.HOLDING, flights.SESSION_FROZEN,
+                  flights.STRANDED, flights.MERGES_FREEZE):
+        assert flights.CONSULTING != other
+    assert flights.OFF_PATH_STATES.count(flights.CONSULTING) == 1
+    assert flights.flight_stage("consulting") != flights.AWAITING
+
+
+# The engine's consulting branch has two short-lived tails in which the status is still `consulting`
+# but no fork is considering anything (fresh-agent review of #545): the question comment already
+# LANDED and only its label move is retrying (`question_posted`), or the fork never launched
+# (`consult.state == "fallback"`). The board must not keep saying "a fork is considering it" there —
+# a label retry once ran silently for ~9h (i310) — yet it is not a Questions card either: the
+# engine trusts no answer until the post settles, so an Answer typed in that window would be lost.
+
+def test_consult_phase_is_considering_while_the_fork_runs():
+    assert flights.consult_phase("consulting", False, {"state": "running"}) == \
+        flights.CONSULT_CONSIDERING == "considering"
+
+
+def test_consult_phase_is_handing_over_once_the_question_is_posted():
+    assert flights.consult_phase("consulting", True, {"state": "running"}) == \
+        flights.CONSULT_HANDING_OVER == "handing-over"
+
+
+def test_consult_phase_is_handing_over_when_the_fork_never_launched():
+    assert flights.consult_phase("consulting", False,
+                                 {"state": "fallback", "reason": "launch_failed"}) == \
+        flights.CONSULT_HANDING_OVER
+
+
+def test_consult_phase_reads_only_the_engines_own_values():
+    # Only the engine's boolean and its exact state word may claim a hand-over; a hand-edited or
+    # half-written record reads as the status says — considering — and never raises.
+    for posted, rec in ((None, None), ("true", {}), (1, []), (False, "fallback"),
+                        (False, {"state": "FALLBACK"}), (False, {"state": ["fallback"]})):
+        assert flights.consult_phase("consulting", posted, rec) == flights.CONSULT_CONSIDERING
+
+
+def test_consult_phase_is_none_off_the_consulting_status():
+    for status in ("running", "awaiting_answer", "ready", None, ["consulting"]):
+        assert flights.consult_phase(status, True, {"state": "fallback"}) is None
+
+
+def test_build_flight_carries_the_consult_phase():
+    base = {"id": "i9", "num": 9, "status": "consulting", "journal": []}
+    repo = {"now": 1000, "idle_seconds": 480, "freeze_seconds": 2700}
+    assert flights.build_flight(dict(base, consult={"state": "running"}), repo)["consult_phase"] \
+        == flights.CONSULT_CONSIDERING
+    handing = flights.build_flight(dict(base, question_posted=True,
+                                        consult={"state": "running"}), repo)
+    assert handing["consult_phase"] == flights.CONSULT_HANDING_OVER
+    assert handing["stage"] == flights.CONSULTING      # still not his question: no Questions card
+    assert handing["awaiting_reason"] is None
+    assert flights.build_flight(dict(base, status="running"), repo)["consult_phase"] is None
+
+
+def test_consulting_holds_whatever_leg_its_markers_suggest():
+    # The bug: with no handling, the status fell through to the circuit and the markers the exited
+    # worker left behind placed it on a leg as an ordinary in-air flight.
+    for markers in ({}, {"launched": True}, {"session_started": True},
+                    {"session_started": True, "report_present": True}):
+        assert flights.flight_stage("consulting", **markers) == flights.CONSULTING, markers
+
+
+def test_a_consulting_flight_whose_worker_activity_aged_out_is_not_a_dead_session():
+    # The worker exited ON PURPOSE and its activity file only ages from there. Time must never turn
+    # a question being considered into a frozen session (grey, dimmed, a pill alarm).
+    for live in (flights.FRESH, flights.IDLE, flights.FROZEN, None):
+        assert flights.flight_stage("consulting", liveness=live, session_started=True) == \
+            flights.CONSULTING
+
+
+def test_a_parked_or_bounced_marker_still_outranks_consulting():
+    # Precedence fails toward the owner: a bounce memo on disk is his decision whatever the status.
+    assert flights.flight_stage("consulting", bounced=True) == flights.AWAITING
+
+
+def test_build_flight_names_consulting_and_carries_its_question():
+    q = "QUESTION: which?\nOPTIONS: a / b\nRECOMMENDATION: a"
+    f = flights.build_flight({"id": "i9", "num": 9, "status": "consulting", "pending_question": q,
+                              "activity_mtime": 1000, "journal": [{"ts": 900, "act": "launch",
+                                                                   "id": "i9", "num": 9}]},
+                             {"now": 1000 + 4000, "idle_seconds": 480, "freeze_seconds": 2700})
+    assert f["stage"] == flights.CONSULTING
+    assert f["awaiting_reason"] is None           # not a Questions card
+    assert f["question"] == q
+    # Its plane is drawn where it really was (§5 — in place, never teleported): the leg it was on.
+    assert f["circuit_stage"] == flights.DOWNWIND
+    assert flights.CONSULTING in flights._PLACED_AT_CIRCUIT
+    assert f["phase"] is None
+
+
+def test_a_consulting_flight_trails_no_exhaust_and_is_never_spinning():
+    # Contrail and the spinning warning are both readings of a RUNNING worker's activity file. In
+    # the first minutes after the worker exits to consult, that file is still fresh — read as-is, the
+    # held plane would puff a crisp contrail (a working flight) and, over a repetitive journal window,
+    # wear "SPINNING? · ALIVE · PROGRESS FLAT". Neither is true: no worker is running.
+    repeat = [{"ts": 990 - i, "act": "nudge", "id": "i9", "num": 9} for i in range(12)]
+    f = flights.build_flight({"id": "i9", "num": 9, "status": "consulting", "activity_mtime": 995,
+                              "journal": repeat},
+                             {"now": 1000, "idle_seconds": 480, "freeze_seconds": 2700})
+    assert f["stage"] == flights.CONSULTING
+    assert f["progress"]["flat"] is True             # the window really is repetitive…
+    assert f["spinning"] is False                    # …but there is no worker to be spinning
+    assert f["contrail"] == "none"
+    # The same facts on a RUNNING flight still raise the warning — the gate is the stage, not a
+    # weakened heuristic.
+    g = flights.build_flight({"id": "i9", "num": 9, "status": "running", "activity_mtime": 995,
+                              "journal": repeat},
+                             {"now": 1000, "idle_seconds": 480, "freeze_seconds": 2700})
+    assert g["spinning"] is True and g["contrail"] == "crisp"
 
 
 # =============================== stranded at the gate (issue #22 / §5) ===============================

@@ -79,7 +79,23 @@ OFF_PATH_PLAIN = {
     flights.STRANDED: ("stranded at the gate — the session finished and filed its report, but the "
                        "gate never landed it; the problem is at the runner/gate, not the session"),
     flights.MERGES_FREEZE: "landings paused — a repair flight is out; builds keep flying",
+    # Issue #545 (engine #538). Says WHO is considering it and that nothing is asked of the owner
+    # yet: only an escalation or a fallback makes it his question, and then it arrives as a Questions
+    # card in its own right.
+    flights.CONSULTING: ("consulting the approving session — the worker stopped on a question, and "
+                         "a fork of the session that approved this issue is considering it. Nothing "
+                         "is needed from you yet: if it answers, the worker resumes; if it can't, "
+                         "the question comes to you."),
 }
+
+
+# A consult's hand-over tail (#545, fresh-agent review): the status is still `consulting`, but the
+# question was already posted or the fork never launched — nobody is considering it. Still no verb:
+# the engine trusts no answer until the hand-over settles, and then it is a Questions card.
+CONSULT_HANDOVER_PLAIN = ("handing the question to you — no session is weighing it any more: the "
+                          "approving session's fork never started, or the loop is already posting the "
+                          "question on the issue. It reaches your Questions list once that hand-off "
+                          "completes.")
 
 
 # =============================== the card kind — the four decisions ===============================
@@ -634,7 +650,14 @@ def flight_drawer(flight, journal_slice, slug, name, title=None, hhmm=None, oper
 
     off = None
     if stage in OFF_PATH_PLAIN:
-        off = {"state": stage, "plain": OFF_PATH_PLAIN[stage]}
+        off = {"state": stage, "plain": OFF_PATH_PLAIN[stage], "question": None}
+        # A consult's question is posted NOWHERE until the consult decides (#538), so the drawer is
+        # the one place it can be read meanwhile. Quoted under the note, read-only: no verb rides
+        # with it, because it is not the owner's question yet.
+        if stage == flights.CONSULTING:
+            off["question"] = flight.get("question")
+            if flight.get("consult_phase") == flights.CONSULT_HANDING_OVER:
+                off["plain"] = CONSULT_HANDOVER_PLAIN
 
     # The drawer's action verbs are the SERVER's, not the JS's (design record B.1): a bounced flight
     # must fire bounce-yes (its distinct audit trail), and the conflict-cap Discuss-default (§8) must

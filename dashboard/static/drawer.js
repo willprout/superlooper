@@ -57,8 +57,14 @@
       return '<span class="' + cls + '" title="' + esc(s.desc) + '">' +
         '<span class="rail-dev">' + esc(s.label) + '</span>' + flavor + '</span>';
     }).join('<span class="rail-arm"></span>');
+    // A consult's question (issue #545) rides on the off-path note, quoted and read-only — it is
+    // posted nowhere until the consult decides, and it is not the owner's to answer yet.
+    var q = d.off_path && d.off_path.question
+      ? '<div class="drawer-offpath-q">' + esc(d.off_path.question) + '</div>'
+      : "";
     var off = d.off_path
-      ? '<div class="drawer-offpath state-' + esc(d.off_path.state) + '">' + esc(d.off_path.plain) + '</div>'
+      ? '<div class="drawer-offpath state-' + esc(d.off_path.state) + '">' + esc(d.off_path.plain) +
+        q + '</div>'
       : "";
     return '<div class="drawer-section"><div class="drawer-label">CIRCUIT</div>' +
       '<div class="drawer-rail">' + steps + '</div>' + off + '</div>';
