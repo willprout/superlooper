@@ -275,13 +275,17 @@ def _triage_runs_dir(state_home):
     return os.path.join(state_home, "triage", "runs")
 
 
-# The ONE place session id -> role -> fallback is decided. `i<N>`, `d<N>` and `t<N>` are exactly the
-# shapes lib/launch.py's own mode guards enforce (`^i[0-9]+$` for a worker, `^d[0-9]+$` for --cwd
-# since #194, `^t[0-9]+$` for the triage flight since #448), so this cannot recognize a session the
-# loop cannot launch — and it stays in step with the launcher in BOTH directions: a seat retired
-# there falls out of here (which is why `a<N>` is gone), and a seat ADDED there must arrive here in
-# the same change, or the new class is handed every hazard this module exists to deny. ASCII digits
-# only, deliberately: `str.isdigit()` would also accept unicode digits that no launcher can produce.
+# The ONE place session id -> role -> fallback is decided. `i<N>`, `d<N>`, `t<N>` and `c<N>` are
+# exactly the shapes lib/launch.py's own mode guards enforce (`^i[0-9]+$` for a worker, `^d[0-9]+$`
+# for --cwd since #194, `^t[0-9]+$` for the triage flight since #448, `^c[0-9]+$` for the consult
+# since #538), so this cannot recognize a session the loop cannot launch — and it stays in step
+# with the launcher in BOTH directions: a seat retired there falls out of here (which is why `a<N>`
+# is gone), and a seat ADDED there must arrive here in the same change, or the new class is handed
+# every hazard this module exists to deny. Since #540 that is a test, not a memory:
+# tests/test_pretooluse_hook.py reads `launch.MODES` / `launch._MODE_GUARDS` and fails while any
+# mode the launcher can start resolves to no role here, and while this table knows a shape no mode
+# produces. ASCII digits only, deliberately: `str.isdigit()` would also accept unicode digits that
+# no launcher can produce.
 _ROLES = {"i": ("worker", _worker_ask_reason),
           "d": ("debugger", _debugger_ask_reason),
           "t": ("triage", _triage_ask_reason),

@@ -32,12 +32,16 @@ Two layers under test:
 """
 import json
 import os
+import re
 import shlex
 import shutil
+import string
 import subprocess
+import types
 
 import pytest
 
+import launch
 import worker_pretooluse as wp
 
 HERE = os.path.dirname(__file__)
@@ -1554,3 +1558,129 @@ def test_confirmation_review_consult_write_paths_are_denied(command):
                                      "git config --get user.email", "git remote get-url origin"])
 def test_review_round_2_consult_reads_stay_allowed(command):
     assert wp.run(_cbash(command), CONSULT_ENV) is None, command
+
+
+# ------------------ #540: every session class the launcher can start has a role ------------------
+# `_role` fails OPEN on an id shape it does not know, on purpose. So a session class the launcher
+# gains WITHOUT a role here is denied nothing: not the AskUserQuestion strand, not the pattern-kill,
+# not `agent-ready` / `pre-authorized:*`. It has happened once (#448's `t<N>` shipped bare until
+# #462 gave it a role) and #536 measured it again: the payload denied under a `t<N>` is allowed
+# under an unknown letter. The module's own comment says a new seat "must arrive here in the same
+# change"; these tests hold that rule at the moment a launcher mode is added (the point-of-error
+# principle, #215/#225) instead of leaving it to whoever remembers.
+#
+# The guard reads the launcher's OWN tables at call time: `launch.MODES` (what `_mode_of` admits)
+# and `launch._MODE_GUARDS` (the id shape `_launch` holds each mode to). `pane_environment` hands
+# the pane that same guarded id as SL_ISSUE_ID, and it is the id `_role` reads. A mode added there
+# is checked here with no edit to this file.
+
+# The ids tried against each mode's shape: a one- or two-letter prefix and a number. Wide on
+# purpose, but a shape none of them fits is NEVER a silent pass: the guard fails and names the
+# mode, and the fix is to widen this list, not to skip the mode.
+_ID_NUMBERS = ("0", "1", "7", "540", "99999")
+_ID_PREFIXES = (tuple(string.ascii_letters)
+                + tuple(a + b for a in string.ascii_lowercase for b in string.ascii_lowercase))
+_CANDIDATE_IDS = tuple(p + n for p in _ID_PREFIXES for n in _ID_NUMBERS) + (
+    # The ids #462's own fail-open test names, plus malformed neighbours of the real shapes. No
+    # launcher mode accepts any of them today.
+    "", "i", "iabc", "7", "worker", "x9", "i7x", "d", "a5", "a-1", "I7",
+    "i-1", "c", "c5x", "t-1", "d.3")
+
+_APPROVAL_LABEL_CALLS = ("gh issue edit 4 --add-label agent-ready",
+                         "gh issue edit 4 --add-label pre-authorized:referee")
+
+
+def _accepts(mode, sid):
+    """Would the launcher take `sid` for `mode`? The same `.match` `_launch` runs."""
+    guard = launch._MODE_GUARDS.get(mode)
+    return guard is not None and bool(guard.match(sid))
+
+
+def _launchable_ids(mode):
+    """The candidate ids the launcher would accept for `mode`, by its own id guard."""
+    return [sid for sid in _CANDIDATE_IDS if _accepts(mode, sid)]
+
+
+def _launcher_modes_without_a_role():
+    """Every launcher mode whose sessions the PreToolUse deny module would leave unguarded, as one
+    sentence each. Empty means in step."""
+    problems = []
+    for mode in launch.MODES:
+        guard = launch._MODE_GUARDS.get(mode)
+        if guard is None:
+            problems.append("launcher mode %r is admitted by launch.MODES but has no id guard in "
+                            "launch._MODE_GUARDS" % (mode,))
+            continue
+        ids = _launchable_ids(mode)
+        if not ids:
+            problems.append("launcher mode %r takes ids shaped %r and none of this guard's "
+                            "candidate ids fit it: widen _CANDIDATE_IDS, never skip the mode"
+                            % (mode, guard.pattern))
+            continue
+        unguarded = [sid for sid in ids if wp._role(sid) is None]
+        if unguarded:
+            problems.append("launcher mode %r starts sessions like %r, which "
+                            "worker_pretooluse._role resolves to NO role, so every hazard the hook "
+                            "denies (agent-ready included) stays open for them: give the class its "
+                            "role in worker_pretooluse in the same change" % (mode, unguarded[0]))
+    return problems
+
+
+def test_every_session_mode_the_launcher_can_start_has_a_role():
+    # Today's classes, pinned so the guard can never pass by reading an empty or renamed table.
+    for mode in ("worker", "debugger", "triage", "consult"):
+        assert mode in launch.MODES, "the guard must be reading the launcher's live mode table"
+        assert _launchable_ids(mode), "the guard must actually sample %r's id shape" % mode
+    assert _launcher_modes_without_a_role() == []
+
+
+@pytest.mark.parametrize("shape", [
+    r"^s[0-9]+$",        # a new letter: sampled, and `_role` knows nothing of it
+    r"^se-[0-9]+$",      # a shape the sampler cannot fit: must fail closed, not pass vacuously
+])
+def test_a_launcher_mode_added_without_its_role_trips_the_guard(monkeypatch, shape):
+    # Simulated: no production mode is added. The new class goes into the launcher's own tables...
+    monkeypatch.setattr(launch, "MODES", launch.MODES + ("seance",))
+    monkeypatch.setitem(launch._MODE_GUARDS, "seance", re.compile(shape))
+    # ...where the launcher's real mode reader now admits it: a class the launcher can start.
+    assert launch._mode_of(types.SimpleNamespace(mode="seance", cwd=None)) == "seance"
+    # Counted on the seance alone, so a REAL drift elsewhere reports once, in the test above.
+    assert len([p for p in _launcher_modes_without_a_role() if "'seance'" in p]) == 1
+    with pytest.raises(AssertionError):
+        test_every_session_mode_the_launcher_can_start_has_a_role()
+
+
+def test_the_guard_clears_once_the_role_arrives_in_the_same_change(monkeypatch):
+    # The other half of the simulation: the guard is satisfiable, not merely red. Give `s<N>` a role
+    # beside its launcher mode and the same check passes.
+    monkeypatch.setattr(launch, "MODES", launch.MODES + ("seance",))
+    monkeypatch.setitem(launch._MODE_GUARDS, "seance", re.compile(r"^s[0-9]+$"))
+    known = wp._role
+    monkeypatch.setattr(wp, "_role", lambda sid: (("seance", wp._worker_ask_reason)
+                                                  if re.match(r"^s[0-9]+$", sid) else known(sid)))
+    assert _launcher_modes_without_a_role() == []
+
+
+def test_every_launcher_mode_is_denied_the_approval_labels(tmp_path):
+    # The hazard #536 measured, put to the hook's decision core (`run`) for one id of every class
+    # the launcher can start, whatever classes that comes to be.
+    for mode in launch.MODES:
+        sid = _launchable_ids(mode)[0]
+        env = {"SL_ISSUE_ID": sid, "SL_RUN_ROOT": str(tmp_path)}
+        for command in _APPROVAL_LABEL_CALLS:
+            assert wp.run(_pre("Bash", {"command": command}), env), (mode, sid, command)
+
+
+def test_an_id_shape_no_launcher_mode_produces_still_denies_nothing(tmp_path):
+    # #462's fail-open posture, unchanged and now checked against the launcher itself: `_role`
+    # recognises no shape the launcher cannot start (the retired `a<N>` stays out), and such a
+    # session is denied nothing, approval labels included.
+    unlaunchable = [sid for sid in _CANDIDATE_IDS
+                    if not any(_accepts(mode, sid) for mode in launch.MODES)]
+    assert "a5" in unlaunchable and "x9" in unlaunchable     # #462's own unknown ids
+    assert [sid for sid in unlaunchable if wp._role(sid) is not None] == []
+    for sid in unlaunchable:
+        env = {"SL_ISSUE_ID": sid, "SL_RUN_ROOT": str(tmp_path)}
+        for command in _APPROVAL_LABEL_CALLS:
+            assert wp.run(_pre("Bash", {"command": command}), env) is None, (sid, command)
+        assert wp.run(_pre("AskUserQuestion", {}), env) is None, sid

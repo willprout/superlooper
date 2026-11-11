@@ -107,6 +107,9 @@ WORKER = "worker"
 DEBUGGER = "debugger"
 TRIAGE = "triage"
 CONSULT = "consult"
+# A class added here needs a role in lib/worker_pretooluse.py's `_ROLES` in the SAME change: that
+# module denies nothing to an id shape it does not know. tests/test_pretooluse_hook.py reads this
+# tuple and `_MODE_GUARDS` and fails until the new class has its role (#540).
 MODES = (WORKER, DEBUGGER, TRIAGE, CONSULT)
 
 _MODE_GUARDS = {WORKER: WORKER_RE, DEBUGGER: DEBUGGER_RE, TRIAGE: TRIAGE_RE, CONSULT: CONSULT_RE}
