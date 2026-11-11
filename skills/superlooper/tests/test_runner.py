@@ -6573,7 +6573,10 @@ def test_want_set_independent_of_merged_history_no_starvation(rig):
     assert [m for m in mutations(rig) if m["kind"] == "close_issue" and m["num"] == "99"]
     # merged history consumed NO comment-read budget: the ONLY comment read was i99's.
     comment_reads = [c for c in gh_calls(rig) if "comments" in c and "--json" in c]
-    assert len(comment_reads) == 1 and "99" in comment_reads[0]
+    assert comment_reads and all("99" in c for c in comment_reads)
+    # ...at most two: the investigation's own read, and (#539) the one-time read of its approver
+    # stamp for a lane launched before the launch began recording it.
+    assert len(comment_reads) <= 2
     # the poll's whole fetch walk stayed well under the call budget despite 30 merged issues.
     assert len(gh_calls(rig)) < runner_mod.MAX_POLL_CALLS
 
@@ -8134,7 +8137,7 @@ def test_boot_creates_a_missing_runner_managed_label(rig):
     # a repo missing a runner-managed label has it CREATED at boot (issue #160), not #108's
     # fail-loud refusal — an already-installed migration step, applied idempotently (--force).
     _set_repo_labels(rig, ["agent-ready", "in-progress", "parked",        # needs-owner MISSING
-                           "awaiting-answer", "source:qa"])
+                           "awaiting-answer", "source:qa", "source:consult"])
     assert rig.r._apply_boot_migrations(now=NOW) is True
     created = [m for m in mutations(rig) if m["kind"] == "create_label"]
     assert [m["name"] for m in created] == ["needs-owner"]
@@ -8150,7 +8153,8 @@ def test_boot_heals_a_repo_adopted_before_awaiting_answer_was_registered(rig):
     # refusing the #163 question hand-back until somebody re-runs adopt, and the failure mode is a
     # SILENT retry loop, so nobody would know to. Boot creates it, with the registered spec, and
     # then boots normally.
-    _set_repo_labels(rig, ["agent-ready", "in-progress", "needs-owner", "parked", "source:qa"])
+    _set_repo_labels(rig, ["agent-ready", "in-progress", "needs-owner", "parked", "source:qa",
+                           "source:consult"])
     assert rig.r._apply_boot_migrations(now=NOW) is True
     created = [m for m in mutations(rig) if m["kind"] == "create_label"]
     assert [m["name"] for m in created] == ["awaiting-answer"]
@@ -8158,6 +8162,18 @@ def test_boot_heals_a_repo_adopted_before_awaiting_answer_was_registered(rig):
     assert "(runner-managed)" in created[0]["description"]
     assert "{operator}" not in created[0]["description"]       # signed, never a raw placeholder
     assert _alert(rig) is None
+
+
+def test_boot_heals_a_repo_adopted_before_539_registered_source_consult(rig):
+    """Issue #539: the runner files a consult's FOLLOW_UP carrying `source:consult`, and gh refuses
+    the whole create when a named label is missing — so a repo adopted before #539 gets it at boot,
+    exactly as #400's `source:qa` did, with no re-adopt."""
+    _set_repo_labels(rig, ["agent-ready", "in-progress", "needs-owner", "parked",
+                           "awaiting-answer", "source:qa"])
+    assert rig.r._apply_boot_migrations(now=NOW) is True
+    created = [m for m in mutations(rig) if m["kind"] == "create_label"]
+    assert [m["name"] for m in created] == ["source:consult"]
+    assert "(runner-managed)" in created[0]["description"] and _alert(rig) is None
 
 
 def test_boot_heals_a_repo_adopted_before_the_source_family_was_registered(rig):
@@ -8171,7 +8187,7 @@ def test_boot_heals_a_repo_adopted_before_the_source_family_was_registered(rig):
     so the boot write stays exactly one.
     """
     _set_repo_labels(rig, ["agent-ready", "in-progress", "needs-owner", "parked",
-                           "awaiting-answer"])
+                           "awaiting-answer", "source:consult"])
     assert rig.r._apply_boot_migrations(now=NOW) is True
     created = [m for m in mutations(rig) if m["kind"] == "create_label"]
     assert [m["name"] for m in created] == ["source:qa"]
@@ -8188,7 +8204,8 @@ def test_boot_holds_when_the_awaiting_answer_heal_cannot_apply(rig):
     # systemic ALERT naming the migration. That is the intended behaviour (a repo whose vocabulary
     # cannot be repaired would otherwise storm), and it is worth pinning for THIS label because it
     # is the first new runner-managed label since the contract was written.
-    _set_repo_labels(rig, ["agent-ready", "in-progress", "needs-owner", "parked", "source:qa"])
+    _set_repo_labels(rig, ["agent-ready", "in-progress", "needs-owner", "parked", "source:qa",
+                           "source:consult"])
     _fail_gh(rig, "label create")
     assert rig.r._apply_boot_migrations(now=NOW) is False       # boot HELD, not stormed
     alert = _alert(rig)
@@ -9014,15 +9031,20 @@ def test_fallback_the_fork_writes_no_outcome_within_the_bound(rig):
 
 def test_the_cap_holds_whoever_answered(rig):
     """Two questions answered — one by the approving session, one by the owner — and the third
-    parks, never a third consult."""
+    parks, never a third QUESTION consult or round-trip. Since #539 that park, like any park, is a
+    handback its approving session sees first: the cap's park is what it is shown, never the
+    question as a question to answer."""
     _blocked_worker(rig, questions_asked=2,
                     qa_log=[{"question": "q1", "answer": "a1", "by": "consult"},
                             {"question": "q2", "answer": "a2"}])
     _stamp_comment(rig, 5)
     _consultable(rig)
     rig.r.tick(NOW)
-    assert not [x for x in rig.calls if "--consult" in x["args"]]
-    assert issue_state(rig, "i5")["status"] in ("needs_william", "parked")
+    acts = [r.get("act") for r in journal.read(str(rig.home))]
+    assert "consult_start" not in acts and "post_question" not in acts
+    (hb,) = [r for r in journal.read(str(rig.home)) if r.get("act") == "handback_consult"]
+    assert hb["kind"] == "park" and hb["handback"]["cause"] == "question_cap"
+    assert issue_state(rig, "i5")["questions_asked"] == 2, "the cap still holds"
 
 
 def test_the_packet_carries_the_issues_earlier_handbacks_and_how_each_was_resolved(rig):

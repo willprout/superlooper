@@ -60,6 +60,9 @@ ALL_LABELS = ["agent-ready", "in-progress", "needs-owner", "parked",
               # test_labels.py).
               "source:orchestration", "source:build", "source:investigation", "source:debugger",
               "source:qa", "source:dashboard-flag",
+              # (#539) the consult's FOLLOW_UP provenance — runner-applied and boot-healed like
+              # source:qa, because the ENGINE files with it.
+              "source:consult",
               # the marker on the repo's ONE pinned limitations ledger issue (#450). adopt creates
               # the label and THEN creates the issue that carries it — `gh issue create` is
               # all-or-nothing on labels, so an unseeded marker means no ledger at all.
@@ -1535,15 +1538,17 @@ def test_runner_managed_labels_is_the_tagged_subset():
     # descriptions, so the LABELS list stays the single source of truth.
     sl = _cli_module()
     assert set(sl.runner_managed_labels()) == {"in-progress", "needs-owner", "parked",
-                                               "awaiting-answer", "source:qa"}
+                                               "awaiting-answer", "source:qa", "source:consult"}
 
 
 def test_missing_runner_labels_pure():
     sl = _cli_module()
-    _MANAGED = {"in-progress", "needs-owner", "parked", "awaiting-answer", "source:qa"}
+    _MANAGED = {"in-progress", "needs-owner", "parked", "awaiting-answer", "source:qa",
+                "source:consult"}
     assert sl.missing_runner_labels(set(ALL_LABELS)) == []
     assert sl.missing_runner_labels(
-        {"agent-ready", "in-progress", "parked", "awaiting-answer", "source:qa"}) == ["needs-owner"]
+        {"agent-ready", "in-progress", "parked", "awaiting-answer", "source:qa",
+         "source:consult"}) == ["needs-owner"]
     assert set(sl.missing_runner_labels(set())) == _MANAGED
     assert set(sl.missing_runner_labels([])) == _MANAGED                       # list ok
     assert set(sl.missing_runner_labels("garbage")) == _MANAGED

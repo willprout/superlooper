@@ -104,6 +104,12 @@ LABELS = [
      "provenance: auto-filed by the restore-green QA filer (runner-managed)"),
     ("source:dashboard-flag", "5a32a3",
      "provenance: filed by the command center's Flag button"),
+    # The second one the ENGINE applies (#539): a consult of an issue's approving session may pick
+    # FOLLOW_UP for a handback, and the runner files that follow-up — unapproved, `needs-owner` —
+    # stamped with this. Runner-managed for source:qa's reason exactly: `gh issue create` refuses
+    # outright for a label the repo lacks, so the #160 boot migration must be able to create it.
+    ("source:consult", "5a32a3",
+     "provenance: filed for a consult of an issue's approving session (runner-managed)"),
     # The repo's ONE pinned limitations ledger issue (issue #450). `adopt` creates this label and
     # then creates-or-finds the issue that carries it; the marker is a LABEL rather than a number
     # recorded in `.superlooper/config.json` because that file is the referee's own rulebook (no

@@ -188,7 +188,7 @@ def test_standing_alerts_reads_the_marker_tri_state():
 
 COVERED = {
     "decide:alert", "decide:alert_cleared", "decide:park", "decide:bounce", "decide:question",
-    "decide:freeze",
+    "decide:freeze", "decide:handback",
     "watchdog:runner_back", "watchdog:resurrect_disabled", "watchdog:resurrect_capped",
     "watchdog:episode_cleared", "watchdog:episode", "watchdog:debugger_launch_failed",
     "watchdog:resurrected", "watchdog:resurrect_failed",
@@ -231,6 +231,12 @@ def test_every_decide_text_arrives_whole():
         decide(dsk=disk(blocked={"i7": HUGE},
                         issues_state={"version": 1,
                                       "issues": {"i7": ist("blocked", questions_asked=2)}})),
+        # (#539) a frozen lane its approving session's consult escalated, with reasoning to spare
+        decide(dsk=disk(issues_state={"version": 1, "issues": {"i99999": ist(
+            "frozen", handback={"key": "frozen:1", "kind": "frozen", "state": "running",
+                                "id": "c99999", "started_at": NOW - 60, "session": "s"})}},
+                        consult_outcomes={"i99999": "MOVE: ESCALATE\nREASONING:\n" + HUGE
+                                          + "\nEND\n"})),
         # a freeze on a check whose name alone would fill a text
         decide(config=cfg(required_checks=[LONG_CHECK],
                           dev_branch="a-very-long-development-branch-name"),

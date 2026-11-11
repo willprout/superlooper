@@ -170,7 +170,8 @@ SPAWNER_OPERATOR = "operator"
 # verified consult is a session this machine demonstrably started, and a consult refused for a dead
 # credential is the same machine evidence a worker's refusal is. Its record names the WORKER's lane
 # id, which is the issue the consult was about.
-RUNNER_LAUNCH_ACTS = ("launch", "resolve_conflict", "consult_start")
+# `handback_consult` (#539) is the same fork, launched for a park, a bounce or a stuck lane.
+RUNNER_LAUNCH_ACTS = ("launch", "resolve_conflict", "consult_start", "handback_consult")
 RUNNER_RELAUNCH_ACT = "recover"
 RUNNER_RELAUNCH_TIERS = ("exited",)
 RUNNER_DELIVERY_OK = "ok"
@@ -827,6 +828,9 @@ class Runner:
         # (the agent-boundary rule), so the runner asks it rather than knowing the path.
         self._hostname = socket.gethostname
         self._transcript_exists = lambda sid: delivery.transcript_exists(sid, agent=self.agent)
+        # (#539) The handback check asks for the approver's transcript every tick an issue is in
+        # flight, so the answer is remembered briefly per session id: {sid: (exists, read_at)}.
+        self._transcript_seen = {}
         self.stop = False
         self._owns_lock = False
         # True once this process ADOPTED the singleton across a Restart re-exec (issue #116) — the
@@ -2151,6 +2155,10 @@ class Runner:
             "consult_checks": self._consult_checks(st),
             "consult_outcomes": self._consult_files(".md", "reports"),
             "consult_exited": self._consult_files("", "state", "exited"),
+            # The handback consult (#539): can a handback on each in-flight issue go to its
+            # approving session first? Read from the approver stamp its launch recorded — no
+            # GitHub read per tick — plus this machine and the transcript.
+            "handback_checks": self._handback_checks(st, now),
             "frozen": frozen,
             "alert": alert,
             # This process's engine generation (#405) — joins each standing hold's journaling dedup
@@ -2246,6 +2254,89 @@ class Runner:
                     "detail": "session %s" % stamp.session}
         return {"state": "eligible", "session": stamp.session, "host": stamp.host,
                 "cwd": stamp.cwd}
+
+    # The statuses a handback can derive from (#539): a lane in flight or at the gate, and a queued
+    # issue whose launch was attempted (its launch-failure park). A finished, parked or answered
+    # issue has nothing for a consult to act on.
+    HANDBACK_CHECK_STATUSES = ("running", "frozen", "exited", "gating", "holding", "ready")
+    TRANSCRIPT_SEEN_SECONDS = 300
+
+    def _handback_checks(self, st, now):
+        """{i<N>: check} — can a handback on this issue go to its approving session first? (#539)
+
+        The stamp is the one the issue's LAUNCH read from the comments it already fetched for the
+        brief (`approver`), so a tick costs no GitHub read. An in-flight lane launched before #539
+        recorded none: it is backfilled with ONE stamp read, at most one lane per tick, and a
+        refused read records nothing (never NO_STAMP — the #21 refused-is-not-empty rule), so the
+        next tick tries again. An issue with no record is ABSENT — today's handback exactly."""
+        out = {}
+        issues = st.get("issues") if isinstance(st, dict) else None
+        if not isinstance(issues, dict):
+            return out
+        budget = 1
+        for iid in sorted(issues):
+            ist = issues.get(iid)
+            num = actions._iid_num(iid)
+            if num is None or not isinstance(ist, dict) \
+                    or ist.get("status") not in self.HANDBACK_CHECK_STATUSES:
+                continue
+            appr = ist.get("approver")
+            if not isinstance(appr, dict):
+                if budget <= 0 or ist.get("status") == "ready":
+                    continue
+                budget -= 1
+                try:
+                    appr = self._read_approver(iid, num, now)
+                except Exception as e:                 # a check that cannot be made is no check
+                    self._log(f"approver read for {iid} skipped: {_short_repr(e)}")
+                    appr = None
+                if appr is None:
+                    continue
+            try:
+                out[iid] = self._approver_check(appr, now)
+            except Exception as e:
+                self._log(f"handback check for {iid} skipped: {_short_repr(e)}")
+        return out
+
+    def _approver_record(self, read):
+        """The durable record of one approver read: the stamp it found, or that it found none."""
+        stamp = read.stamp
+        if stamp is None:
+            return {"ok": True, "session": None, "host": None, "cwd": None}
+        return {"ok": True, "session": stamp.session, "host": stamp.host, "cwd": stamp.cwd}
+
+    def _read_approver(self, iid, num, now, thread=None):
+        """Read and RECORD issue `num`'s approver stamp (#537's reader). `thread` is a comment read
+        the caller already made (the launch's), so recording costs nothing extra. None on a refused
+        read, which records nothing."""
+        reader = (lambda n: thread) if thread is not None else None
+        read = approval.read(num, self.config, comments_reader=reader)
+        if not read.ok:
+            return None
+        rec = self._approver_record(read)
+        self._update_issue(iid, {"approver": rec})
+        return rec
+
+    def _approver_check(self, appr, now):
+        if not appr.get("ok"):
+            return {"state": "fallback", "reason": consult_mod.STAMP_UNREAD,
+                    "detail": "GitHub refused the comment read"}
+        session = appr.get("session")
+        if not (isinstance(session, str) and session):
+            return {"state": "fallback", "reason": consult_mod.NO_STAMP, "detail": ""}
+        if not consult_mod.same_machine(appr.get("host"), self._hostname()):
+            return {"state": "fallback", "reason": consult_mod.OTHER_MACHINE,
+                    "detail": "stamped on %s" % appr.get("host")}
+        seen = self._transcript_seen.get(session)
+        if not (isinstance(seen, tuple) and isinstance(seen[1], (int, float))
+                and 0 <= now - seen[1] < self.TRANSCRIPT_SEEN_SECONDS):
+            seen = (bool(self._transcript_exists(session)), now)
+            self._transcript_seen[session] = seen
+        if not seen[0]:
+            return {"state": "fallback", "reason": consult_mod.NO_TRANSCRIPT,
+                    "detail": "session %s" % session}
+        return {"state": "eligible", "session": session, "host": appr.get("host"),
+                "cwd": appr.get("cwd")}
 
     def _exit_receipts(self):
         """{issue id: newest mail-consumption ts} from state/mail/<id>.consumed.<ts>[.n] — the
@@ -3722,6 +3813,10 @@ class Runner:
                                  "queue_invalid_since": None, "relaunch_held": False,
                                  "launch_hold_generation": None, "wildcard_hold_generation": None,
                                  "queue_invalid_generation": None})
+        if self._issue_field(iid, "consult_resume"):
+            # (#539) A consult chose to RESUME the interrupted session: re-enter its conversation
+            # through the existing verb, lane-bound like any launch (phase E admitted it).
+            return self._exec_consult_resume(iid, num, now)
         # NB: the per-issue model/effort override is stamped into durable state by _worker_env below
         # (it refreshes on EVERY worker launch so the stamp tracks William's current labels) — see
         # its docstring. Kept in one place so recover/resolve_conflict relaunches stamp identically.
@@ -3738,15 +3833,25 @@ class Runner:
         # fresh. brief.build applies the owner-only trust rule and skips the runner's own markers.
         # A refused read (ok=False) carries comments=[] — the same fail-closed "no amendments" the
         # old contract gave, so brief-building never blocks on a supplementary channel (issue #21).
-        comments = gh.issue_comments(num).comments
+        thread = gh.issue_comments(num)
+        comments = thread.comments
+        # (#539) The approver stamp rides the read the brief already made: recorded here, the
+        # handback check never needs a GitHub read of its own for this lane.
+        try:
+            self._read_approver(iid, num, now, thread=thread)
+        except Exception as e:
+            self._log(f"approver not recorded for {iid}: {_short_repr(e)}")
         # The answered-question trail (#163): a relaunch after an owner's answer embeds the full Q&A
         # so the fresh session inherits every settled decision. Empty/absent qa_log -> no Q&A block,
         # a brief byte-identical to a first launch. Reused across recover/regenerate/answer_relaunch
         # (all route through here), so a WIP that had to be conflict-rebuilt still carries the Q&A.
         qa = self._issue_field(iid, "qa_log")
         qa = qa if isinstance(qa, list) else None
+        # (#539) ...and the approving session's clarifications, from a consult that relaunched it.
+        notes = self._issue_field(iid, "consult_notes")
+        notes = notes if isinstance(notes, list) else None
         try:
-            text = brief.build(pb, self.config, comments=comments, qa=qa)
+            text = brief.build(pb, self.config, comments=comments, qa=qa, notes=notes)
         except ValueError as e:
             return f"brief failed: {e}"
         with open(os.path.join(self.home, "briefs", f"{iid}.md"), "w") as f:
@@ -4144,11 +4249,324 @@ class Runner:
             self._end_consult(cid)
         return "ok"
 
+    # --- the handback consult (#539) ---
+    #
+    # Everything the command center puts in front of the owner about ONE issue — a park, a bounce, a
+    # frozen lane, a lane at a dialog, a lane the host reports blocked — goes first to a fork of the
+    # session that approved it (#538's launch, packet, outcome file and fallbacks). Its outcome
+    # picks ONE move, and each executor below carries it out with a verb the engine already has:
+    # the launcher through phase E (relaunch), `superlooper resume` (resume), the one ordered
+    # teardown (end a stuck session), a journaled hold (wait), `gh issue create` (a follow-up), and
+    # today's own park / bounce / alert (escalate). Never a merge, a push, a label of approval, a
+    # publish, a config edit, or a keystroke into a pane: none of those has an executor here.
+
+    def _handback_packet(self, iid, num, cid, kind, hb, stamp, number, cap):
+        template = _read(os.path.join(_TEMPLATES, "handback-consult-brief.md"))
+        if not template:
+            raise ValueError("the handback-consult-brief.md template is missing from the engine")
+        raw = self._raw_by_id.get(iid) or {}
+        title = raw.get("title") or (self._parsed_by_id.get(iid) or {}).get("title") or ""
+        body = raw.get("body")
+        if not isinstance(body, str):
+            view = gh.issue(num) or {}
+            body = view.get("body") if isinstance(view.get("body"), str) else ""
+            title = title or view.get("title") or ""
+        operator = self._operator()
+        thread = gh.issue_comments(num)
+        return consult_mod.render_handback_packet(
+            template, cid=cid, num=num, title=title, body=body, kind=kind,
+            what=hb.get("memo") if isinstance(hb, dict) else "",
+            comments=thread.comments, comments_ok=bool(getattr(thread, "ok", False)),
+            owner=brief.owner_login(self.config), operator=operator,
+            repo_slug=self.config.get("repo"),
+            dev_branch=str(self.config.get("dev_branch") or "main"),
+            branch_state=self._consult_branch_state(iid),
+            history=consult_mod.history_lines(journal.read_all(self.home), num),
+            qa=consult_mod.qa_lines(self._issue_field(iid, "qa_log"), operator),
+            outcome_path=os.path.join(self.home, "reports", f"{cid}.md"),
+            home=str(stamp.get("cwd") or ""), approver_session=str(stamp.get("session") or ""),
+            bright_line=bool(hb.get("bright_line")) if isinstance(hb, dict) else False,
+            handback_number=number if type(number) is int else 1,
+            cap=cap if type(cap) is int else consult_mod.HANDBACK_CAP_DEFAULT)
+
+    def _exec_handback_consult(self, a, now):
+        """Launch a FORK of the issue's approving session (`c<N>`) on a handback, in that session's
+        own directory, with the packet as its brief. Nothing else moves: no comment, no label, and
+        the issue's status and the worker's window are left exactly as they are — the lane holds
+        until the fork decides. Whatever happens the record settles in this one call, `running` or
+        `fallback` (the launch failed), so the handback is never asked twice."""
+        iid, num = a["id"], a.get("num")
+        stamp = a.get("stamp") if isinstance(a.get("stamp"), dict) else {}
+        hb = a.get("handback") if isinstance(a.get("handback"), dict) else {}
+        cid = consult_mod.consult_id(num)
+        if cid is None:
+            return "skipped: no issue number to name a consult by"
+        self._end_consult(cid)                         # a fork of this id that outlived its consult
+        rec = {"key": a.get("key"), "kind": a.get("kind"), "id": cid,
+               "session": stamp.get("session"), "host": stamp.get("host"), "cwd": stamp.get("cwd"),
+               "handback": hb, "started_at": now, "number": a.get("number")}
+        result, failure = "ok", None
+        try:
+            text = self._handback_packet(iid, num, cid, a.get("kind"), hb, stamp, a.get("number"),
+                                         a.get("cap"))
+            os.makedirs(os.path.join(self.home, "briefs"), exist_ok=True)
+            with open(os.path.join(self.home, "briefs", f"{cid}.md"), "w") as f:
+                f.write(text)
+        except Exception as e:                         # any packet failure is a launch that failed
+            failure = "the consult's brief could not be written: %s" % _short_repr(e)
+            result = f"consult not launched — {failure}"
+        else:
+            rc = self._run_script([self._script(LAUNCHER), "--consult", cid],
+                                  env=self._consult_env(stamp), timeout=LAUNCH_TIMEOUT)
+            if rc != 0:
+                ev = self._evidence("launch", rc)
+                failure = f"launch rc={rc} ({ev['reason']})"
+                result = self._failed("launch", rc, f"consult launch rc={rc} — the handback goes "
+                                                     f"to {self._operator()}", ev=ev)
+                self._teardown_session(cid, remove_worktree=False)
+        if failure is None:
+            rec["state"] = "running"
+        else:
+            rec.update(state="fallback", reason=consult_mod.LAUNCH_FAILED, detail=failure)
+
+        def settle(st, i):
+            i["handback"] = rec
+            i["handback_move_posted"] = False          # this consult's move is announced afresh
+            prev = i.get("handback_consults")
+            i["handback_consults"] = (prev if type(prev) is int and prev >= 0 else 0) + 1
+        self._update_issue(iid, fn=settle)
+        return result
+
+    def _journal_handback(self, iid, num, kind, outcome_kind, fields, now):
+        """The one `consult_outcome` record of how a handback consult ended (#539) — the morning
+        report and the next consult's history read it, as they read a question's (#538)."""
+        rec = {"act": "consult_outcome", "id": iid, "num": num, "outcome": "ok",
+               "outcome_kind": outcome_kind, "handback": kind}
+        for k in ("move", "reason", "detail", "reasoning", "recommendation", "session", "forced",
+                  "proposed"):
+            v = fields.get(k)
+            if isinstance(v, str) and v:
+                rec[k] = v[:600]
+        for k in ("minutes", "follow_up", "consults", "cap"):
+            if type(fields.get(k)) is int:
+                rec[k] = fields[k]
+        if outcome_kind == "fell_back":
+            rec["sentence"] = consult_mod.fallback_sentence(fields.get("reason"), fields.get("detail"))
+        try:
+            journal.append(self.home, rec, now)
+        except (OSError, ValueError) as e:
+            self._log(f"handback consult outcome not journaled for {iid}: {_short_repr(e)}")
+
+    def _end_handback_consult(self, rec):
+        if isinstance(rec, dict) and consult_mod.is_consult_id(rec.get("id")):
+            self._end_consult(rec["id"])
+
+    def _exec_handback_move(self, a, now):
+        """Carry out the ONE move the approving session chose. Only the five the runner acts on
+        reach a verb here; ESCALATE is today's own handback (decide emits it), and anything else
+        is refused before it touches anything — defence in depth under decide's own refusal."""
+        iid, num, move = a["id"], a.get("num"), a.get("move")
+        if move not in consult_mod.MOVES or move == consult_mod.ESCALATE:
+            return f"refused: {move!r} is not a move the runner carries out"
+        rec = self._issue_field(iid, "handback")
+        if not (isinstance(rec, dict) and rec.get("state") == "running"):
+            return "skipped: no handback consult is pending on this issue"
+        kind = rec.get("kind")
+        reasoning = a.get("reasoning") if isinstance(a.get("reasoning"), str) else ""
+        clar = a.get("clarification") if isinstance(a.get("clarification"), str) else ""
+        if move == consult_mod.FOLLOW_UP:
+            return self._handback_follow_up(iid, num, rec, a, now)
+        if move == consult_mod.WAIT:
+            minutes = a.get("minutes")
+            minutes = min(minutes, consult_mod.WAIT_MAX_MINUTES) \
+                if type(minutes) is int and minutes > 0 else consult_mod.WAIT_MAX_MINUTES
+
+            def hold(st, i):
+                i["handback"] = dict(rec, state="waiting", move=move, until=now + minutes * 60,
+                                     reason=reasoning)
+            self._update_issue(iid, fn=hold)
+            self._journal_handback(iid, num, kind, "moved",
+                                   {"move": move, "minutes": minutes, "reasoning": reasoning,
+                                    "session": rec.get("session")}, now)
+            self._end_handback_consult(rec)
+            return "ok"
+        # RELAUNCH / END_AND_RELAUNCH / RESUME: the issue goes back through phase E — lane-bound,
+        # usage-bound, on the runner's own `in-progress` stamp (#538's answered-consult path), so
+        # nobody applies `agent-ready`. The decision is posted ONCE, marked as the approving
+        # session's, before anything moves; a failed post retries next tick with nothing changed.
+        if not self._issue_field(iid, "handback_move_posted"):
+            outcome = consult_mod.HandbackOutcome(move, clar, reasoning, "", None, "", "", "")
+            hb = rec.get("handback") if isinstance(rec.get("handback"), dict) else {}
+            if not gh.comment(num, consult_mod.move_comment(kind, hb.get("memo"), outcome,
+                                                            rec.get("session") or "unknown",
+                                                            self._operator())):
+                return "move comment failed (will retry next tick)"
+            self._update_issue(iid, {"handback_move_posted": True})
+        # Never two agents on one lane: whatever session the issue still has — a frozen one, one at
+        # a dialog, a finished one idling at its prompt — is ended first, keeping its worktree (the
+        # relaunch reuses the pushed WIP; a resume re-enters it).
+        self._teardown_session(iid, remove_worktree=False)
+        for sub in ("blocked", "exited", "awaiting", "mail", "ack", "phase"):
+            _rm(os.path.join(self.state, sub, iid))
+        _rm(os.path.join(self.home, "reports", f"{iid}.md"))
+
+        def settle(st, i):
+            i["status"] = "ready"
+            i["requeue_front"] = True
+            i["consult_relaunch"] = True
+            i["consult_resume"] = move == consult_mod.RESUME
+            i["consult_resume_note"] = clar or None if move == consult_mod.RESUME else None
+            i["launch_failures"] = 0                   # a relaunch gets real launch attempts
+            if clar and move != consult_mod.RESUME:
+                notes = i.get("consult_notes") if isinstance(i.get("consult_notes"), list) else []
+                notes.append({"note": clar, "kind": kind, "move": move,
+                              "session": rec.get("session"),
+                              "handback": (rec.get("handback") or {}).get("memo")})
+                i["consult_notes"] = notes
+            for k in ("sensed_state", "sensed_since", "sensed_at", "sensed_auth",
+                      "last_recover_at"):
+                i[k] = None                            # the ended session's readings end with it
+            # ...and so do the GATE's episode clocks, exactly as a fresh approval clears them: a
+            # relaunched session reaching the gate again must be judged on its own wait, never
+            # re-parked the moment it arrives on the bound the handback already spent (a
+            # checks-pending or refused-read clock, a spent nudge, a merge refusal count).
+            i.update({"recheck_failed": False, "update_result": None, "update_head_oid": None,
+                      "nudged": [], "nudged_at": {}, "read_waited": False,
+                      "checks_pending_since": None, "pr_read_pending_since": None,
+                      "comments_read_pending_since": None, "merge_refusals": 0,
+                      "merge_refusal_reason": None})
+            i["handback_move_posted"] = False
+            i["handback"] = dict(rec, state="moved", move=move)
+        self._update_issue(iid, fn=settle)
+        self._journal_handback(iid, num, kind, "moved",
+                               {"move": move, "reasoning": reasoning,
+                                "session": rec.get("session")}, now)
+        self._end_handback_consult(rec)                # LAST: the outcome file is acted on
+        return "ok"
+
+    def _handback_follow_up(self, iid, num, rec, a, now):
+        """FOLLOW_UP: file the follow-up issue — unapproved, `needs-owner` — and hand the handback
+        itself to the owner as today, naming it. Filed ONCE per consult (`follow_up` on the record);
+        a create GitHub refuses is not retried into a storm: the handback still reaches the owner,
+        carrying the fork's proposed title and body so nothing it wrote is lost."""
+        title = " ".join((a.get("title") or "").split())[:200]
+        body = a.get("body") if isinstance(a.get("body"), str) else ""
+        touches = self._issue_field(iid, "declared_touches")
+        fu = rec.get("follow_up")
+        if type(fu) is not int and not rec.get("follow_up_attempted"):
+            # Stamped BEFORE the create (fresh review): a crash between gh's create and the settle
+            # below must never file the follow-up twice. An attempt whose result was lost goes to
+            # the owner carrying the proposal, which he can see against the issue list.
+            rec = dict(rec, follow_up_attempted=True)
+            self._update_issue(iid, fn=lambda st, i: i.__setitem__("handback", rec))
+            fu = gh.create_issue(title, consult_mod.follow_up_body(body, num, rec.get("session"),
+                                                                   touches),
+                                 consult_mod.follow_up_labels(a.get("issue_type")))
+        via = {"outcome": "escalated", "move": consult_mod.FOLLOW_UP,
+               "follow_up": fu if type(fu) is int else None,
+               "reasoning": a.get("reasoning") or "", "session": rec.get("session")}
+        if type(fu) is not int:
+            via.update(title=title, body=body)
+
+        def settle(st, i):
+            i["handback"] = dict(rec, state="escalated", via=via, follow_up=via["follow_up"])
+        self._update_issue(iid, fn=settle)
+        self._end_handback_consult(rec)
+        return "ok" if type(fu) is int else "follow-up create refused; the handback goes to the owner"
+
+    def _deliver_handback(self, iid, num, via, now):
+        """The handback is reaching the owner (a park, a bounce, a lane escalation): post the
+        consult's note when there is one, journal how the consult ended, record the episode as
+        the owner's (`delivered`) and end the fork. A handback no consult touched — no stamp, no
+        transcript, a launch hold — reaches him with NOTHING added: today's, byte for byte, its
+        reason riding the act's own journal record. Idempotent per episode."""
+        if not isinstance(via, dict):
+            return
+        rec = self._issue_field(iid, "handback")
+        rec = rec if isinstance(rec, dict) else None
+        key = via.get("key")
+        consulted = (rec is not None and rec.get("key") == key
+                     and rec.get("state") in actions.HANDBACK_PENDING_STATES)
+        if not consulted and not consult_mod.note_posts(via):
+            return
+        if rec is not None and rec.get("key") == key and rec.get("state") == "delivered":
+            if rec.get("note_posted") is not False:
+                return
+        note_posted = None
+        if consult_mod.note_posts(via):
+            history = (consult_mod.history_lines(journal.read_all(self.home), num)
+                       if via.get("reason") == consult_mod.HANDBACK_CAP else None)
+            note_posted = bool(gh.comment(num, consult_mod.handback_note(via, self._operator(),
+                                                                         history=history)))
+        if rec is not None and rec.get("key") == key and rec.get("state") == "delivered":
+            if note_posted:                            # a retried note landed: nothing else owed
+                self._update_issue(iid, fn=lambda st, i: i["handback"].update(note_posted=True))
+            return
+        base = rec if consulted else {"key": key, "kind": via.get("kind")}
+
+        def settle(st, i):
+            i["handback"] = dict(base, state="delivered", via=via, note_posted=note_posted)
+        self._update_issue(iid, fn=settle)
+        kind_out = "escalated" if via.get("outcome") == "escalated" else "fell_back"
+        self._journal_handback(iid, num, via.get("kind"), kind_out, via, now)
+        if consulted:
+            self._end_handback_consult(rec)
+
+    def _exec_handback_escalate(self, a, now):
+        """Deliver a LANE handback (frozen / at a dialog / host-blocked) to the owner. Today's
+        handling of the lane carries on from here — the board shows it, the nudge or the bounded
+        ALERT fires — with the consult's note on the issue when the fork escalated it."""
+        self._deliver_handback(a["id"], a.get("num"), a.get("consult"), now)
+        return "ok"
+
+    def _exec_consult_resume(self, iid, num, now):
+        """RESUME (#539), at the moment phase E admits the issue: re-enter the interrupted
+        session's own conversation through `superlooper resume` — the existing verb, with its
+        re-orientation preamble, its singleton refusals and its delivery verification — instead of
+        a cold launch. `--unattended`: nobody is at that pane, and the revived session must be told
+        so, exactly as a runner-launched worker is. A conversation that cannot be re-entered (no
+        recorded session, no worktree) relaunches COLD next tick, carrying the clarification."""
+        self._close_stale_session(iid)
+        argv = [self._script("superlooper"), "resume", "--repo", self.repo, iid, "--json",
+                "--unattended", "--source", "consult",
+                "--operator", "a consult of the issue's approving session"]
+        note = self._issue_field(iid, "consult_resume_note")
+        if isinstance(note, str) and note.strip():
+            # The verb renders --note as a new instruction; say whose it is, so the revived
+            # session never reads the approving session's judgment as the owner's own word.
+            argv += ["--note", "(From a consult of this issue's approving session — its "
+                               "judgment of what the owner wants, not the owner's own word.) "
+                     + note.strip()]
+        rc = self._run_script(argv, env=self._script_env("", ""), timeout=LAUNCH_TIMEOUT)
+        if rc == 0:
+            gh.set_labels(num, add=["in-progress"], remove=["agent-ready"])
+            self._update_issue(iid, {"status": "running", "launch_error": None,
+                                     "launch_evidence": None, "consult_relaunch": False,
+                                     "consult_resume": False, "consult_resume_note": None},
+                               fn=lambda st, i: self._reset_progress_clock(i))
+            self._delivery_cleared()
+            return "ok"
+
+        def cold(st, i):
+            i["consult_resume"] = False
+            if isinstance(note, str) and note.strip():
+                notes = i.get("consult_notes") if isinstance(i.get("consult_notes"), list) else []
+                notes.append({"note": note, "move": consult_mod.RESUME,
+                              "session": (i.get("handback") or {}).get("session")})
+                i["consult_notes"] = notes
+            i["consult_resume_note"] = None
+        self._update_issue(iid, fn=cold)
+        return self._failed("launch", rc, f"resume rc={rc} — the conversation could not be "
+                                          "re-entered; relaunching cold next tick")
+
     # --- bounce / park / labels ---
 
     def _exec_bounce(self, a, now):
         iid, num = a["id"], a.get("num")
         cause = a.get("cause") or "bounce"
+        # (#539) When the approving session was consulted first, its note (marked, its own comment)
+        # goes up BEFORE the bounce's: today's bounce comment is unchanged byte for byte.
+        self._deliver_handback(iid, num, a.get("consult"), now)
         # Notify-once marker (issue #108, mirroring #61's _exec_park): stamp the durable hand-back
         # marker BEFORE the label move, so when the label write fails in the dead zone that NEEDS the
         # bounce (the 2026-07-13 missing `needs-owner` label — #58 renamed it in adopt, nobody re-ran
@@ -4204,7 +4622,18 @@ class Runner:
         rec = self._issue_field(iid, "consult")
         if isinstance(rec, dict) and consult_mod.is_consult_id(rec.get("id")):
             self._end_consult(rec["id"])
+        hb = self._issue_field(iid, "handback")         # ...and a handback consult (#539)
+        if isinstance(hb, dict) and consult_mod.is_consult_id(hb.get("id")) \
+                and hb.get("state") in actions.HANDBACK_PENDING_STATES:
+            self._end_consult(hb["id"])
         def settle(st, i):
+            # (#539, fresh review P1) The consult is DROPPED with the issue — never left pending,
+            # where its bound would one day run out and hand a park back on a closed issue — and a
+            # WAIT it chose ends with it.
+            rec = i.get("handback")
+            if isinstance(rec, dict) and (rec.get("state") in actions.HANDBACK_PENDING_STATES
+                                          or rec.get("state") == "waiting"):
+                i["handback"] = dict(rec, state="dropped")
             i.update({"status": "merged", "park_notify_cause": None, "park_notify_at": None,
                       "park_landed_cause": None,       # the pair (#169)
                       "park_comment_posted": False})
@@ -4228,6 +4657,9 @@ class Runner:
 
     def _exec_park(self, a, now):
         iid, num = a["id"], a.get("num")
+        # (#539) When the approving session was consulted first, its note (marked, its own comment)
+        # goes up BEFORE the park memo: today's memo comment is unchanged byte for byte.
+        self._deliver_handback(iid, num, a.get("consult"), now)
         label = "needs-owner" if a.get("needs_william") else "parked"
         cause = a.get("cause")
         cause = cause if isinstance(cause, str) and cause else a.get("memo", "")
@@ -4298,7 +4730,8 @@ class Runner:
     # here — this tuple is int counters only, zeroed with `i[k] = 0`.)
     _REAPPROVE_COUNTERS = ("launches", "retries", "conflicts", "launch_failures", "merge_refusals",
                            "questions_asked",   # a fresh approval resets the 2-question cap too (#163)
-                           "exit_asks")         # ...and the exit-interview ask ladder (#215)
+                           "exit_asks",         # ...and the exit-interview ask ladder (#215)
+                           "handback_consults")  # ...and the handback-consult cap (#539)
     # (`teardown_deferrals` is deliberately NOT here: the #169 ladder is retired by the teardown
     # that clears the lock — _teardown_session — which this executor has already run by the time it
     # resets anything. Listing it too would zero a counter that is provably 0 and imply this reset
@@ -4409,7 +4842,11 @@ class Runner:
                       "question_posted_at": None,      # post-once stamp (#163)
                       "exit_asked_at": None, "exit_asked_key": None,   # a fresh episode gets a
                       "exit_nonce": None, "exit_verify": None,         # fresh exit interview,
-                      "exit_ack_relayed": None})       # paired with exit_asks=0 above (#215)
+                      "exit_ack_relayed": None,        # paired with exit_asks=0 above (#215)
+                      # (#539) a fresh approval is a fresh handback episode: the consult record,
+                      # its clarifications and any resume it asked for are the old episode's.
+                      "handback": None, "consult_notes": [], "consult_resume": False,
+                      "consult_resume_note": None})
             if new_branch:
                 rotated.update(old=old_branch, new=new_branch)
                 i["branch"] = new_branch
@@ -4566,7 +5003,12 @@ class Runner:
                       # `nudged_at` stamp would make the gate park INSTANTLY at the first gate hiccup,
                       # zero grace (defect b). An owner re-approval is a fresh chance, so clear both;
                       # the gate nudges anew and the worker gets its full compliance window.
-                      "nudged": [], "nudged_at": {}})
+                      "nudged": [], "nudged_at": {},
+                      # (#539) The owner's re-approval ends the handback episode: the consult
+                      # record is that episode's, and the handback cap bounds how often the loop
+                      # consults WITHOUT him — he has just acted, so it counts from zero. Not an
+                      # attempt counter, so the continuation rule above does not keep it.
+                      "handback": None, "handback_consults": 0})
         self._update_issue(iid, fn=resume)
         journal.append(self.home, {"act": "resume_at_gate", "id": iid}, now)
         # Re-claim the lane: in-progress (the loop is driving it to merge) replaces the owner's
@@ -4649,6 +5091,10 @@ class Runner:
             stamp = self._status_clocks().get(iid)
 
             def _anchor_frozen_baseline(st, i):
+                # (#539) When THIS freeze began: the handback consult keys one freeze as one
+                # episode, however many nudges it draws. Stamped on the transition only.
+                if i.get("status") != "frozen" or not actions._real(i.get("frozen_since")):
+                    i["frozen_since"] = now
                 i["status"] = "frozen"
                 i["last_recover_at"] = now
                 if i.get("progress_sig") is None:

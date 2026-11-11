@@ -1527,3 +1527,32 @@ def test_a_fallback_alone_is_listed_but_is_not_consult_news():
     assert report.morning_news(records, view, config=_cfg()) == ["owner_question"]
     assert "consult" not in report.morning_headline(records, view, config=_cfg())
     assert "fell back" in report.morning(records, view, ledger={}, config=_cfg())
+
+
+# --------------------------- #539: every handback consult, with a link ---------------------------
+
+def test_every_handback_consult_is_in_the_morning_report_with_a_link():
+    records = [_LAST_REPORT,
+               _rec(_OVERNIGHT, "consult_outcome", id="i21", num=21, outcome="ok",
+                    outcome_kind="moved", handback="frozen", move="resume",
+                    reasoning="it was mid-review"),
+               _rec(_OVERNIGHT + 1, "consult_outcome", id="i22", num=22, outcome="ok",
+                    outcome_kind="moved", handback="park", move="wait", minutes=30,
+                    reasoning="CI is slow"),
+               _rec(_OVERNIGHT + 2, "consult_outcome", id="i23", num=23, outcome="ok",
+                    outcome_kind="escalated", handback="bounce", follow_up=612,
+                    reasoning="separate"),
+               _rec(_OVERNIGHT + 3, "consult_outcome", id="i24", num=24, outcome="ok",
+                    outcome_kind="fell_back", handback="at_dialog", reason="timeout",
+                    sentence="the consult fork wrote no outcome within 20 minutes")]
+    view = _view(now=_NEWS_NOW, queue=[], usage=None)
+    out = report.morning(records, view, ledger={}, config=_cfg())
+    section = out.split("## Approver consults")[1].split("\n## ")[0]
+    assert "#21" in section and "frozen" in section and "resume" in section
+    assert "#22" in section and "30 minutes" in section
+    assert "#23" in section and "#612" in section and "escalated" in section
+    assert "#24" in section and "dialog" in section and "20 minutes" in section
+    for n in (21, 22, 23, 24):
+        assert "https://github.com/%s/issues/%d" % (REPO, n) in section
+    assert "3 approver consult(s)" in out.splitlines()[2], "a move decided for the owner is news"
+    assert "consult" in report.morning_news(records, view, config=_cfg())
