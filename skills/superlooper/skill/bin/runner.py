@@ -4365,9 +4365,11 @@ class Runner:
         """The owner has acted on the issue — closed it, or re-approved it — so a handback consult
         still PENDING on it is over: end the fork its record names, BEFORE the caller drops or
         clears that record, or nothing ever will (#549). The overlay never acts on a terminal
-        issue, and a crash window can leave a pending record on one. Only a pending record names a
-        fork to end: a settled one's fork was ended when it settled, and `c<N>` is the issue's one
-        consult id, which a question consult (#538) may be using since."""
+        issue, and a crash window can leave a pending record on one. Only a PENDING record is taken
+        to name a live fork: a settled one's fork is ended right after its settle is written, and
+        `c<N>` is the issue's one consult id, which a question consult (#538) may be using since —
+        so ending it on a settled record could kill the wrong session. (A crash between a settle
+        and its end leaves that fork until the next consult on the id ends it, a known limit.)"""
         rec = self._issue_field(iid, "handback")
         if isinstance(rec, dict) and rec.get("state") in actions.HANDBACK_PENDING_STATES:
             self._end_handback_consult(rec)

@@ -642,3 +642,41 @@ def test_a_standing_lane_alert_stays_standing_under_another_consult(make, reason
     assert all(reason in a["reasons"] for a in only(out, "alert"))
     assert not [n for n in only(out, "notify") if n.get("tier") == "recovered"]
     assert only(out, "handback_consult") == []
+
+
+def _stale_wait():
+    """A WAIT that WORKED: the hold ran out an hour ago and its handback never re-derived (the
+    lane woke), so the record simply stays `waiting`."""
+    return _waiting_on(consult_mod.FROZEN, consult_mod.handback_key(consult_mod.FROZEN, NOW - 9999),
+                       NOW - 3600)
+
+
+@pytest.mark.parametrize("status", ["running", "gating"])
+def test_a_close_after_a_wait_that_worked_is_not_the_owners_drop(status):
+    """#549 review P2: a `waiting` record outlives a WAIT that worked. A later close of the plain
+    running build is not a handback episode — absorbing it would end a live worker and prune its
+    worktree. Only the handback the WAIT held, re-deriving, is absorbed at the door."""
+    dsk = _dsk(status, handback=_stale_wait(), handback_consults=1)
+    out = decide(parsed_issues=[parsed(5, labels=_IN_FLIGHT)], dsk=dsk,
+                 gh_view=ghv(closed_nums={5}))
+    assert _mine(out, "absorb_close") == [] and only(out, "handback_consult") == []
+
+
+def test_an_out_of_band_merge_after_a_wait_that_worked_still_lands():
+    """...and a PR merged by hand on that lane is still settled as LANDED (absorb_merged), never as
+    the owner's drop."""
+    dsk = _dsk("running", handback=_stale_wait(), handback_consults=1, pr=555,
+               branch="sl/i5-issue-5")
+    out = decide(parsed_issues=[parsed(5, labels=_IN_FLIGHT)], dsk=dsk,
+                 gh_view=ghv(closed_nums={5}, prs={"i5": pr_view(state="MERGED")}))
+    assert len(_mine(out, "absorb_merged")) == 1 and _mine(out, "absorb_close") == []
+
+
+def test_a_door_absorb_is_one_act_and_the_issue_does_nothing_else_this_tick():
+    """The door absorbs once per tick, and the absorbed issue takes no other act — no launch, no
+    recover, no second absorb from Section D."""
+    kw = _at_dialog(handback=_waiting_on(consult_mod.AT_DIALOG, consult_mod.handback_key(
+        consult_mod.AT_DIALOG, NOW - actions.AT_DIALOG_ALERT_SECONDS - 1), NOW - 1))
+    kw["dsk"]["blocked"] = {}
+    out = decide(gh_view=ghv(closed_nums={5}), **kw)
+    assert [a["act"] for a in out if a.get("id") == "i5"] == ["absorb_close"]
