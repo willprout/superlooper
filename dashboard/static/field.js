@@ -174,7 +174,8 @@
     var flights = onField.map(function (f) {
       return { num: f.num, label: f.label, stage: f.stage, circuitStage: f.circuit_stage,
                runway: f.display.runway || 0, contrail: f.contrail || 'none',
-               spinning: !!f.spinning, trouble: !!f.display.trouble, tail: tail };
+               spinning: !!f.spinning, trouble: !!f.display.trouble, tail: tail,
+               consultPhase: f.consult_phase || null };   // the server's #545 reading, carried
     });
 
     // Approved-but-not-launched flights (the departures queue) wait as planes at the west gates —

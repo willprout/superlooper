@@ -1059,6 +1059,8 @@ def _flight_note(flight, memo):
         return "holding — number 2 for landing"
     if stage == flights.CONSULTING:
         # #545: never the question itself — that reads as something to answer, and it isn't his yet.
+        if flight.get("consult_phase") == flights.CONSULT_HANDING_OVER:
+            return "question on its way to you — it reaches your Questions once posted"
         return "consulting the approving session — nothing needed from you yet"
     if stage == flights.STRANDED:
         return "stranded at the gate — report filed, runner hasn't landed it"
@@ -1714,6 +1716,10 @@ def _assemble_repo(repo, config, now, gh_mod, diff_reader, last_seen=None, concl
             # #163: the durable owner-decision question this flight is waiting on (loopstate), so the
             # Questions surface can show it and offer the Answer action.
             "pending_question": st.get("pending_question"),
+            # #538's consult record and the post-once stamp, read exactly as the engine writes them,
+            # so a consulting flight can tell "being considered" from "on its way to you" (#545).
+            "question_posted": st.get("question_posted"),
+            "consult": st.get("consult"),
         }
         f = flights.build_flight(issue, flight_repo)
         f["display"] = _project_display(f, name, jslice, issue["activity_mtime"], now)

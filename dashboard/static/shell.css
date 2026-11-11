@@ -450,10 +450,11 @@ html, body {
 /* the stranded gate — a FINISHED flight the runner never landed. Gold, solid, "look at the gate":
    deliberately NOT the muted grey of the .frozen (dead session) tag, so the eye separates them. */
 .fld-tag.stranded { border-color: #D8A63A; color: #F2D488; }
-/* a question the APPROVING session is considering (issue #545) — calm sky-cyan, the colour of its
-   radio waves: neither the amber of a decision waiting on the owner nor the grey of a dead session. */
+/* a question the APPROVING session is considering (issue #545) — calm periwinkle, the colour of its
+   radio waves: neither the amber of a decision waiting on the owner nor the grey of a dead session,
+   and kept clear of the survey's slate-cyan above (the loop's own aircraft is in no tag's family). */
 .fld-tag.consult {
-  border-color: #3A8DB5; color: #A9DDF2; font-size: 9.5px; padding: 1px 6px;
+  border-color: #6C86E0; color: #C8D3FF; font-size: 9.5px; padding: 1px 6px;
 }
 .fld-lm {
   position: absolute; transform: translate(-50%, -50%);
@@ -1214,10 +1215,10 @@ html, body {
 .drawer-offpath.state-stranded {
   background: #FBF3DE; border-color: #EBD9A6; border-left-color: #C79A2E; color: #6E5410;
 }
-/* consulting (issue #545) — the approving session is considering a question. Calm sky-blue, never
+/* consulting (issue #545) — the approving session is considering a question. Calm periwinkle, never
    the amber default above: amber means "your decision", and nothing is asked of the owner yet. */
 .drawer-offpath.state-consulting {
-  background: #EAF4FA; border-color: #C6E0EE; border-left-color: #3A8DB5; color: #1F4E66;
+  background: #EEF1FC; border-color: #CDD6F4; border-left-color: #5872D6; color: #2B3A78;
 }
 /* the question being considered, quoted under the note — whole and read-only, no verb beside it */
 .drawer-offpath-q {

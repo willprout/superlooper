@@ -22,6 +22,7 @@ import os
 
 import pytest
 
+import actions
 import flights
 import server
 
@@ -208,3 +209,35 @@ def test_the_same_question_is_his_once_the_consult_escalates(tmp_path):
     snap = server.assemble_snapshot(_config(home), now=NOW)
     assert snap["flights"][0]["stage"] == flights.AWAITING
     assert [c["kind"] for c in snap["needs_you"]] == ["question"]
+
+
+@pytest.mark.parametrize("over", [{"question_posted": True},
+                                  {"consult": dict(_CONSULT, state="fallback",
+                                                   reason="launch_failed")}])
+def test_a_consult_being_handed_to_the_owner_says_so_and_still_asks_nothing(tmp_path, over):
+    """The engine's two hand-over tails (fresh-agent review): the question already posted with only
+    its label move retrying, or the fork never launched. Status is still `consulting`, so it is still
+    no Questions card and offers no verb — but the board stops claiming a fork is considering it."""
+    home = _consulting(tmp_path)
+    state = home / "state" / "issues.json"
+    doc = json.loads(state.read_text(encoding="utf-8"))
+    doc["issues"]["i9"].update(over)
+    state.write_text(json.dumps(doc), encoding="utf-8")
+    snap = server.assemble_snapshot(_config(home), now=NOW)
+    flight = snap["flights"][0]
+    assert flight["stage"] == flights.CONSULTING
+    assert flight["consult_phase"] == flights.CONSULT_HANDING_OVER
+    assert snap["needs_you"] == []
+    assert flight["drawer"]["decision"] is None
+    assert "considering" not in flight["drawer"]["off_path"]["plain"].lower()
+    assert "considering" not in flight["display"]["note"].lower()
+    assert "you" in flight["display"]["note"]
+
+
+
+def test_every_off_path_state_has_a_discuss_briefing_phrase():
+    # The Discuss briefing reads the stage through actions._STAGE_PHRASE; a missing entry printed the
+    # bare id ("Status: consulting.") — the fresh-agent review of #545 ran it and saw exactly that.
+    for stage in flights.OFF_PATH_STATES:
+        assert actions._STAGE_PHRASE.get(stage), stage
+    assert "approving session" in actions._STAGE_PHRASE[flights.CONSULTING]

@@ -208,6 +208,20 @@ def test_drawer_consulting_says_who_is_considering_and_that_nothing_is_needed_ye
     assert cur["stage"] == flights.DOWNWIND
 
 
+def test_drawer_consulting_hand_over_stops_claiming_a_fork_is_considering_it():
+    # Fresh-agent review of #545: once the question is posted (or the fork never launched) nobody is
+    # considering it — the note must say it is on its way to the owner, still with no verb.
+    f = _flight(stage=flights.CONSULTING, circuit_stage=flights.DOWNWIND, question="Q?",
+                consult_phase=flights.CONSULT_HANDING_OVER, memo=None)
+    d = cards.flight_drawer(f, [], "r", "Air")
+    plain = d["off_path"]["plain"].lower()
+    assert "considering" not in plain
+    assert "you" in plain and "questions" in plain
+    assert d["off_path"]["state"] == flights.CONSULTING
+    assert d["off_path"]["question"] == "Q?"
+    assert d["decision"] is None
+
+
 def test_drawer_off_path_note_carries_no_question_for_other_states():
     # The quoted question belongs to the consulting note only; an amber decision shows its question
     # on the Questions card, and a parked note never grows a stray empty quote.

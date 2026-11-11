@@ -384,9 +384,60 @@ def test_consulting_is_its_own_off_path_state():
 def test_consulting_is_never_an_owner_decision_nor_any_other_off_path_state():
     # §5: states that demand different responses never share a value. Consulting asks NOTHING of
     # William, so above all it is never the amber AWAITING that puts a card in front of him.
-    others = [s for s in flights.OFF_PATH_STATES if s != flights.CONSULTING]
-    assert flights.CONSULTING not in others
+    for other in (flights.PARKED, flights.AWAITING, flights.HOLDING, flights.SESSION_FROZEN,
+                  flights.STRANDED, flights.MERGES_FREEZE):
+        assert flights.CONSULTING != other
+    assert flights.OFF_PATH_STATES.count(flights.CONSULTING) == 1
     assert flights.flight_stage("consulting") != flights.AWAITING
+
+
+# The engine's consulting branch has two short-lived tails in which the status is still `consulting`
+# but no fork is considering anything (fresh-agent review of #545): the question comment already
+# LANDED and only its label move is retrying (`question_posted`), or the fork never launched
+# (`consult.state == "fallback"`). The board must not keep saying "a fork is considering it" there —
+# a label retry once ran silently for ~9h (i310) — yet it is not a Questions card either: the
+# engine trusts no answer until the post settles, so an Answer typed in that window would be lost.
+
+def test_consult_phase_is_considering_while_the_fork_runs():
+    assert flights.consult_phase("consulting", False, {"state": "running"}) == \
+        flights.CONSULT_CONSIDERING == "considering"
+
+
+def test_consult_phase_is_handing_over_once_the_question_is_posted():
+    assert flights.consult_phase("consulting", True, {"state": "running"}) == \
+        flights.CONSULT_HANDING_OVER == "handing-over"
+
+
+def test_consult_phase_is_handing_over_when_the_fork_never_launched():
+    assert flights.consult_phase("consulting", False,
+                                 {"state": "fallback", "reason": "launch_failed"}) == \
+        flights.CONSULT_HANDING_OVER
+
+
+def test_consult_phase_reads_only_the_engines_own_values():
+    # Only the engine's boolean and its exact state word may claim a hand-over; a hand-edited or
+    # half-written record reads as the status says — considering — and never raises.
+    for posted, rec in ((None, None), ("true", {}), (1, []), (False, "fallback"),
+                        (False, {"state": "FALLBACK"}), (False, {"state": ["fallback"]})):
+        assert flights.consult_phase("consulting", posted, rec) == flights.CONSULT_CONSIDERING
+
+
+def test_consult_phase_is_none_off_the_consulting_status():
+    for status in ("running", "awaiting_answer", "ready", None, ["consulting"]):
+        assert flights.consult_phase(status, True, {"state": "fallback"}) is None
+
+
+def test_build_flight_carries_the_consult_phase():
+    base = {"id": "i9", "num": 9, "status": "consulting", "journal": []}
+    repo = {"now": 1000, "idle_seconds": 480, "freeze_seconds": 2700}
+    assert flights.build_flight(dict(base, consult={"state": "running"}), repo)["consult_phase"] \
+        == flights.CONSULT_CONSIDERING
+    handing = flights.build_flight(dict(base, question_posted=True,
+                                        consult={"state": "running"}), repo)
+    assert handing["consult_phase"] == flights.CONSULT_HANDING_OVER
+    assert handing["stage"] == flights.CONSULTING      # still not his question: no Questions card
+    assert handing["awaiting_reason"] is None
+    assert flights.build_flight(dict(base, status="running"), repo)["consult_phase"] is None
 
 
 def test_consulting_holds_whatever_leg_its_markers_suggest():

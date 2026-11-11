@@ -68,6 +68,10 @@ CONSULTING = "consulting"          # a question the APPROVING session is conside
                                    # NOT in the air.
 OFF_PATH_STATES = (PARKED, AWAITING, HOLDING, SESSION_FROZEN, STRANDED, MERGES_FREEZE, CONSULTING)
 
+# A consulting flight's two honest readings (see ``consult_phase``).
+CONSULT_CONSIDERING = "considering"    # a fork of the approving session is weighing the question
+CONSULT_HANDING_OVER = "handing-over"  # nobody is: the question is on its way to the owner
+
 # Liveness tiers (design record §5) — the contrail, tied to the runner's real activity-age tiers.
 FRESH = "fresh"    # activity file younger than the repo's idle threshold — bold, bright contrail
 IDLE = "idle"      # past idle, short of frozen — sputtering contrail, the tower peeks
@@ -345,6 +349,31 @@ def flight_stage(status, liveness=None, bounced=False, long_wait=False,
             return STRANDED
         return SESSION_FROZEN
     return stage
+
+
+def consult_phase(status, question_posted, consult):
+    """Which of a consulting flight's two readings is true (issue #545), or ``None`` off ``consulting``.
+
+    The engine's consulting branch (#538) keeps the status at ``consulting`` through two short tails
+    in which NO fork is considering anything — and saying one is would be the board's lie:
+
+      * ``question_posted is True`` — the question comment already LANDED on the issue and the
+        consult was ended before the label move, which is all that is retrying. (A label retry once
+        ran silently for ~9h — the i310 incident — so "short" is not guaranteed.)
+      * the consult record's ``state == "fallback"`` — the fork never launched; the engine hands the
+        question to the owner on its next tick.
+
+    Both are :data:`CONSULT_HANDING_OVER`. Neither is a Questions card: the status is still not
+    ``awaiting_answer``, and the engine trusts no answer posted before the hand-over settles, so a
+    button offered here would take an answer that is then silently dropped. Everything else —
+    including a missing or hand-edited record — reads as the status says: :data:`CONSULT_CONSIDERING`.
+    Only the engine's own boolean and its exact state word may claim a hand-over. Total, never raises."""
+    if status != "consulting":
+        return None
+    state = consult.get("state") if isinstance(consult, dict) else None
+    if question_posted is True or state == "fallback":
+        return CONSULT_HANDING_OVER
+    return CONSULT_CONSIDERING
 
 
 # ============ the downwind sub-phase (issue #444, over the engine's #443 sense) ============
@@ -1483,6 +1512,9 @@ def build_flight(issue, repo):
         "branch": issue.get("branch"),
         "pr": issue.get("pr"),
         "awaiting_reason": awaiting_reason,
+        # Is a fork of the approving session considering the question, or is it on its way to the
+        # owner (issue #545)? ``None`` for every flight that is not consulting.
+        "consult_phase": consult_phase(status, issue.get("question_posted"), issue.get("consult")),
         # An investigation files a report but opens no PR, so re-approval REBUILDS it, never resumes at
         # a merge gate; the decision card's resume/rebuild verb reads this to stay honest (issue #161).
         "is_investigation": bool(issue.get("is_investigation")),

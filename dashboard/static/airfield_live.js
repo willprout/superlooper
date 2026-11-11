@@ -309,9 +309,14 @@
         // the hull, as the session-frozen tag does: on the leg, the strip just below the planes is
         // where the towed name cloths fly (#204) and the BUILD ISLAND sign stands — measured in the
         // browser, a tag hung there landed squarely on a neighbour's BUILDING cloth.
+        // The words name the SESSION, never just "approver" (the owner approved the issue, so that
+        // reads as "consulting you"). Once the question is on its way to the owner (the server's
+        // consultPhase), the tag stops claiming anyone is being asked.
         if (f.stage === 'consulting') {
           layoutTags.push({ kind: 'consult', x: anchor.x, y: anchor.y - box.h / 2 - 4,
-                            text: f.label + ' · CONSULTING APPROVER' });
+                            text: f.label + (f.consultPhase === 'handing-over'
+                                             ? ' · HANDING QUESTION TO YOU'
+                                             : ' · ASKING APPROVING SESSION') });
         }
         if (f.spinning) {
           layoutTags.push({ kind: 'spin', x: anchor.x, y: anchor.y + box.h / 2 + 16,
@@ -619,7 +624,7 @@
 
     // consulting (issue #545): the plane is on the RADIO to the session that cleared it — the
     // design record's own mapping for a worker's question (§3, "radio call"). Two pairs of pixel
-    // arcs either side of the hull pulse outward in turn, in a calm sky-cyan: alive and talking,
+    // arcs either side of the hull pulse outward in turn, in a calm periwinkle: alive and talking,
     // never the amber ring of a decision waiting on the owner. Reduced motion: both arcs, held still.
     function radioWaves(x, y, now) {
       var ph = reduced ? -1 : (now % 1500) / 750;               // 0..2 — inner arc, then outer
@@ -628,7 +633,7 @@
                : (ph >= k ? Math.max(0, 1 - 0.45 * (ph - k)) : 0);
         if (al <= 0.02) continue;
         var r = 22 + k * 6;
-        ctx.fillStyle = 'rgba(150,228,255,' + al.toFixed(2) + ')';
+        ctx.fillStyle = 'rgba(178,194,255,' + al.toFixed(2) + ')';
         for (var side = 0; side < 2; side++) {
           var base = side ? Math.PI : 0;
           for (var t = -0.55; t <= 0.551; t += 0.11) {
@@ -744,7 +749,7 @@
           ctx.fillRect(px + box.w - 3, py + box.h - 3, 1, 1);
         }
         if (f.stage === 'awaiting') amberRing(s.cur.x, s.cur.y, now);
-        if (f.stage === 'consulting') radioWaves(s.cur.x, s.cur.y, now);
+        if (f.stage === 'consulting' && f.consultPhase !== 'handing-over') radioWaves(s.cur.x, s.cur.y, now);
         // The spotlight list is the SERVER's (display.trouble = the repo's single worst
         // condition, §5) — a spinning flight that is not the worst keeps its warning tag but
         // never hijacks the wash (review fix 2026-07-07).

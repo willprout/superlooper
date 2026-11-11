@@ -89,6 +89,15 @@ OFF_PATH_PLAIN = {
 }
 
 
+# A consult's hand-over tail (#545, fresh-agent review): the status is still `consulting`, but the
+# question was already posted or the fork never launched — nobody is considering it. Still no verb:
+# the engine trusts no answer until the hand-over settles, and then it is a Questions card.
+CONSULT_HANDOVER_PLAIN = ("handing the question to you — no session is weighing it any more: the "
+                          "approving session's fork never started, or the loop is already posting the "
+                          "question on the issue. It reaches your Questions list once that hand-off "
+                          "completes.")
+
+
 # =============================== the card kind — the four decisions ===============================
 
 def card_kind(flight):
@@ -647,6 +656,8 @@ def flight_drawer(flight, journal_slice, slug, name, title=None, hhmm=None, oper
         # with it, because it is not the owner's question yet.
         if stage == flights.CONSULTING:
             off["question"] = flight.get("question")
+            if flight.get("consult_phase") == flights.CONSULT_HANDING_OVER:
+                off["plain"] = CONSULT_HANDOVER_PLAIN
 
     # The drawer's action verbs are the SERVER's, not the JS's (design record B.1): a bounced flight
     # must fire bounce-yes (its distinct audit trail), and the conflict-cap Discuss-default (§8) must

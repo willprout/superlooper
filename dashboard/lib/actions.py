@@ -305,6 +305,7 @@ _STAGE_PHRASE = {
     "session-frozen": "session frozen — a stalled session, no contrail",
     "stranded": "stranded at the gate — report filed, but the runner hasn't landed it",
     "merges-freeze": "landings paused — a repair flight is out",
+    "consulting": "consulting — the approving session is considering the worker's question",
 }
 
 
