@@ -1225,6 +1225,10 @@ def test_known_bad_merge_misses_are_intentional(tmp_path, command):
     # toward denying costs the session a rephrase; erring the other way costs a rewritten branch.
     "cat <<EOF\ngit push --force\nEOF",
     "cat <<EOF\ngh pr merge is what the gate does, not you\nEOF",
+    # #543: a wrapper option meaning "do not run it" is still stepped over as a flag. Nobody types
+    # these; pinned so the trade stays visible.
+    "command -v gh pr merge 42",
+    "sudo -l git push --force origin sl/x",
 ])
 def test_known_bad_merge_false_denies_are_intentional(tmp_path, command):
     _worktree(tmp_path)
@@ -1304,7 +1308,8 @@ def test_assignment_prefixes_and_condition_positions_do_not_hide_the_call(tmp_pa
 
 
 def test_a_word_before_the_binary_is_still_not_a_command_position(tmp_path):
-    # The walk-back must still END at something that is not a separator: these are TEXT, not calls.
+    # The reading must still land on the word that is RUN, and here that is `echo` / `grep`: the
+    # rest is TEXT, not a call.
     _worktree(tmp_path)
     for command in ("echo if git push --force origin main",
                     "echo env gh pr merge 42",
@@ -1379,7 +1384,9 @@ _PROCESS_WRAPPERS = [
 def test_a_wrapped_status_forgery_is_denied(tmp_path, wrapper):
     _worktree(tmp_path)
     command = wrapper + " gh api repos/o/r/statuses/abc -f state=success"
-    assert _bash(command, tmp_path), "a wrapper must not hide the status write: %r" % command
+    reason = _bash(command, tmp_path)
+    assert reason and "commit status" in reason, \
+        "a wrapper must not hide the status write: %r" % command
 
 
 @pytest.mark.parametrize("wrapper", _PROCESS_WRAPPERS)
@@ -1417,10 +1424,12 @@ def test_a_wrapped_gh_pr_merge_is_denied(tmp_path, wrapper):
 @pytest.mark.parametrize("wrapper", _PROCESS_WRAPPERS)
 def test_a_wrapped_force_push_is_denied(tmp_path, wrapper):
     _worktree(tmp_path)
-    for call in ("git push --force origin sl/i543-x", "git push origin +HEAD:sl/i543-x",
-                 "git push origin main"):
+    for call, needle in (("git push --force origin sl/i543-x", "Force-pushing"),
+                         ("git push origin +HEAD:sl/i543-x", "Force-pushing"),
+                         ("git push origin main", "dev mainline")):
         command = wrapper + " " + call
-        assert _bash(command, tmp_path), "a wrapper must not hide the push: %r" % command
+        reason = _bash(command, tmp_path)
+        assert reason and needle in reason, "a wrapper must not hide the push: %r" % command
 
 
 @pytest.mark.parametrize("command", [
@@ -1436,6 +1445,18 @@ def test_a_wrapped_force_push_is_denied(tmp_path, wrapper):
     "time -p gh pr merge 42",
     "exec -a x git push --force origin sl/x",
     "/usr/bin/env gh pr merge 42",
+    "sudo -R /chroot gh pr merge 42",
+    "gstdbuf -o L gh pr merge 42",
+    # a short bundle reads the getopt way (fresh-agent review of #543): a value-taking LAST letter
+    # takes the next token, and one with letters after it carries its value attached
+    "sudo -Eu root gh pr merge 42",
+    "sudo -uroot gh pr merge 42",
+    "xargs -0n 1 gh pr merge",
+    "timeout -vs KILL 60 gh pr merge 42",
+    "caffeinate -it 60 git push --force origin sl/x",
+    # an interpreter option that takes a setting
+    "python3 -X dev /x/bin/superlooper approve 5",
+    "python3 -O -W error /x/bin/superlooper approve 5",
 ])
 def test_the_known_wrappers_options_do_not_hide_the_call(tmp_path, command):
     _worktree(tmp_path)
@@ -1460,6 +1481,8 @@ def test_the_known_wrappers_options_do_not_hide_the_call(tmp_path, command):
     "caffeinate -i gh pr view 42 --json mergeable",
     "timeout 60 gh api repos/o/r/commits/abc/status",
     "timeout 60 superlooper approve --help",
+    # `-c` stays valueless on purpose: the command is the quoted code, and `superlooper` is its argv
+    "python3 -c 'import sys' superlooper approve 5",
 ])
 def test_wrapper_words_as_text_or_around_ordinary_calls_stay_allowed(tmp_path, command):
     _worktree(tmp_path)
@@ -1467,14 +1490,23 @@ def test_wrapper_words_as_text_or_around_ordinary_calls_stay_allowed(tmp_path, c
 
 
 @pytest.mark.parametrize("command", [
-    # ACCEPTED MISSES (#543), pinned beside the `sh -c` ones. A wrapper that hands its arguments to a
-    # shell to RE-PARSE (`watch`, `ssh`) is that same quote-hidden miss in another spelling, and the
-    # rarely-reached-for direct-exec wrappers (`arch`, `setsid`, `doas`, …) are left out of the table
-    # on purpose: each one is a grammar to get right, and these hosts do not reach for them.
+    # ACCEPTED MISSES (#543), pinned beside the `sh -c` ones — EVERY wrapper the module names as left
+    # out. One that hands its arguments to a shell to RE-PARSE (`watch`, `ssh`, `parallel`) is that
+    # same quote-hidden miss in another spelling, and the rarely-reached-for direct-exec wrappers are
+    # left out of the table on purpose: each one is a grammar to get right, and these hosts do not
+    # reach for them.
     "watch -n 5 gh pr merge 42",
     "ssh build-host gh pr merge 42",
+    "parallel gh pr merge ::: 41 42",
+    "script -q /dev/null gh pr merge 42",
+    "flock /tmp/ship.lock git push --force origin sl/x",
     "arch -arm64 gh pr merge 42",
     "setsid git push --force origin sl/x",
+    "doas gh pr merge 42",
+    "ionice -c 3 gh pr merge 42",
+    "chrt -i 0 gh pr merge 42",
+    "taskset 0x1 git push --force origin sl/x",
+    "unbuffer gh pr merge 42",
 ])
 def test_unlisted_wrappers_are_accepted_misses(tmp_path, command):
     _worktree(tmp_path)

@@ -554,6 +554,9 @@ def parse_issue_create(command):
 # newline reads as the separator it is, so a line of a HEREDOC BODY reads as a command position.
 # `cat <<EOF` … `gh pr merge is the gate's job` … `EOF` is refused. Erring toward denying costs the
 # session a rephrase; erring the other way costs a rewritten branch. Pinned in tests either way.
+# The shared command-position reading (#543) adds two of the same kind that nobody types: a wrapper
+# option that means "do not run it" is still stepped over as a flag, so `command -v gh pr merge 42`
+# and `sudo -l git push --force …` read as the calls they only name.
 #
 # ONE POSTURE DIFFERENCE FROM DUTY 3, on purpose. There, a deny was the DANGEROUS direction (refusing
 # a legitimate `gh issue create`), so two calls on one line stand the duty down. Here a deny is the
@@ -589,22 +592,25 @@ _KEYWORDS = frozenset(("then", "do", "else", "if", "elif", "while", "until", "!"
 # Process wrappers: a word that EXECS the command after it without changing what that command is.
 # Each maps to (its options that consume the NEXT token, the operands it takes before the command).
 # Only the value-taking options need naming, because every other `-x` / `--long[=v]` token after a
-# wrapper is stepped over as a valueless flag. Naming them is what keeps `nice -n 10 gh …` and
-# `sudo -u root gh …` from reading `10` or `root` as the command. `timeout`'s DURATION is the one
-# operand that sits between a wrapper and its command. A wrapper is matched by its basename, so
-# `/usr/bin/nice` is `nice`.
+# wrapper is stepped over as a valueless flag (and a short bundle is read the getopt way, see
+# `_takes_value`). Naming them is what keeps `nice -n 10 gh …` and `sudo -u root gh …` from reading
+# `10` or `root` as the command. `timeout`'s DURATION is the one operand that sits between a wrapper
+# and its command. A wrapper is matched by its basename, so `/usr/bin/nice` is `nice`.
 #
-# Deliberately LEFT OUT, each an accepted miss (pinned in test_pretooluse_hook.py): a wrapper that
-# hands its arguments to a shell to RE-PARSE (`watch`, `ssh`, `script`, `flock -c`, `parallel`).
-# That is the `sh -c '…'` quote-hidden miss in another spelling. Also left out are the direct-exec
-# wrappers a session on these hosts does not reach for (`arch`, `setsid`, `doas`, `ionice`, `chrt`,
-# `taskset`, `unbuffer`), because each one is another option grammar to get right.
+# Deliberately LEFT OUT, each an accepted miss pinned in test_pretooluse_hook.py:
+#   * a wrapper that hands its arguments to a shell to RE-PARSE (`watch`, `ssh`, `parallel`, and
+#     the `-c` forms of `script` and `flock`), which is the `sh -c '…'` quote-hidden miss in another
+#     spelling;
+#   * the direct-exec wrappers a session on these hosts does not reach for (`arch`, `setsid`,
+#     `doas`, `ionice`, `chrt`, `taskset`, `unbuffer`, and the plain forms of `script` and
+#     `flock`), because each one is another option grammar to get right.
 _TIMEOUT_VALUE_FLAGS = frozenset(("-s", "--signal", "-k", "--kill-after"))
+_STDBUF_VALUE_FLAGS = frozenset(("-i", "--input", "-o", "--output", "-e", "--error"))
 _PROCESS_WRAPPERS = {
     # the list duty 2 and these matchers already knew...
     "sudo": (frozenset(("-u", "--user", "-g", "--group", "-U", "--other-user", "-h", "--host",
                         "-p", "--prompt", "-C", "--close-from", "-D", "--chdir", "-r", "--role",
-                        "-t", "--type", "-T", "--command-timeout")), 0),
+                        "-t", "--type", "-T", "--command-timeout", "-R", "--chroot")), 0),
     "env": (frozenset(("-u", "--unset", "-C", "--chdir", "-S", "--split-string", "-P", "-L",
                        "-U")), 0),
     "nohup": (frozenset(), 0),
@@ -620,14 +626,18 @@ _PROCESS_WRAPPERS = {
     "gtimeout": (_TIMEOUT_VALUE_FLAGS, 1),        # Homebrew coreutils' name for it on a Mac
     "nice": (frozenset(("-n", "--adjustment")), 0),
     "caffeinate": (frozenset(("-t", "-w")), 0),
-    "stdbuf": (frozenset(("-i", "--input", "-o", "--output", "-e", "--error")), 0),
+    "stdbuf": (_STDBUF_VALUE_FLAGS, 0),
+    "gstdbuf": (_STDBUF_VALUE_FLAGS, 0),          # ...and its Homebrew name
 }
 
 # An interpreter running a script FILE runs the file named after its options, so that file is the
 # command: `python3 …/bin/superlooper approve` is how a source checkout runs the approval verb
-# (#537). Its options are all read as valueless, so `python3 -c '…' superlooper` lands on the quoted
-# code (the `sh -c` accepted miss) and `python3 -m superlooper` on the module.
-_INTERPRETER_RE = re.compile(r"(?:^|/)(?:python(?:\d+(?:\.\d+)?)?|bash|sh|zsh)$")
+# (#537). Only the options that take a SETTING are value-taking (`python3 -X dev`, `bash -o
+# pipefail`). `-c` and `-m` are read as valueless on purpose: `python3 -c '…' superlooper` lands on
+# the quoted code (the `sh -c` accepted miss), and `python3 -m superlooper` lands on the module.
+_INTERPRETER_RE = re.compile(r"(?:^|/)(?:(python(?:\d+(?:\.\d+)?)?)|bash|sh|zsh)$")
+_PYTHON_VALUE_FLAGS = frozenset(("-X", "-W"))
+_SHELL_VALUE_FLAGS = frozenset(("-o", "-O"))
 
 # `FOO=bar gh pr merge 42` — an env-assignment PREFIX is the ordinary way to run one command with
 # one variable set, and it left the binary looking like an argument to something else (same review).
@@ -717,6 +727,22 @@ _RUN_END = _SEPARATORS | _REDIRECTS
 _GH_GLOBAL_WITH_VALUE = frozenset(("--repo", "-R", "--hostname"))
 
 
+def _takes_value(flag, value_flags):
+    """Does this option token consume the NEXT token? A long option does only when it is named
+    exactly (its `--opt=v` form carries its own value). A short bundle reads the getopt way: its
+    letters are flags until the first one that takes a value. That letter takes the rest of the
+    token as its value (`-uroot`, `-n10`, `-oL`), or the next token when it is the bundle's last
+    letter (`-Eu root`, `-0n 1`, `-vs KILL`)."""
+    if flag in value_flags:
+        return True
+    if flag.startswith("--") or len(flag) < 3:
+        return False
+    for k, letter in enumerate(flag[1:], 1):
+        if "-" + letter in value_flags:
+            return k == len(flag) - 1
+    return False
+
+
 def _launched_command(tokens, i, end):
     """The index of the command that the simple command at tokens[i:end] actually RUNS, or None
     when the walk runs out first. That is `i` itself, or the first word past every assignment
@@ -729,15 +755,16 @@ def _launched_command(tokens, i, end):
             i += 1
             continue
         grammar = _PROCESS_WRAPPERS.get(tok.rsplit("/", 1)[-1])
-        if grammar is None and _INTERPRETER_RE.search(tok):
-            grammar = (frozenset(), 0)
+        interpreter = _INTERPRETER_RE.search(tok) if grammar is None else None
+        if interpreter:
+            grammar = (_PYTHON_VALUE_FLAGS if interpreter.group(1) else _SHELL_VALUE_FLAGS, 0)
         if grammar is None:
             return i
         value_flags, operands = grammar
         i += 1
         while i < end and tokens[i].startswith("-"):
             flag = tokens[i]
-            i += 2 if flag in value_flags else 1
+            i += 2 if _takes_value(flag, value_flags) else 1
             if flag == "--":
                 break                        # end of options: what follows is an operand or the command
         i += operands
