@@ -187,10 +187,16 @@ def records(run_root, iid, agent="claude", env=None, tail_bytes=TAIL_BYTES):
         window = min(window * 8, MAX_TAIL_BYTES)
 
 
-# How much of a transcript's HEAD `session_directory` reads. The answer is in the first records the
-# agent writes, which are small; a head this size never needs widening, and a session whose first
-# 64KB carries no `cwd` at all is one this answers None for rather than read megabytes to settle.
-HEAD_BYTES = 64 * 1024
+# The CEILING on how much of a transcript's head `session_directory` reads (issue #542). The read
+# stops at the first record carrying a `cwd`, and that record is the session's first user message,
+# which the agent writes with its `cwd` AFTER its `message` (measured on a live transcript). So
+# the read has to take the whole first message, whatever its size. A pasted screenshot is stored
+# inline: one makes a user record of about 0.7MB (the largest measured on the owner's machine was
+# 1.4MB), and a long kickoff runs to hundreds of KB. The 64KB head this replaced dropped every such
+# record as a fragment and stamped the shell's wandered directory instead. The ceiling is generous
+# because reaching it costs one read of that size, once per approval. A session whose first message
+# outgrows it gets None (the caller's fallback) rather than a read without bound.
+MAX_HEAD_BYTES = 32 * 1024 * 1024
 
 
 def transcript_exists(session_id, env=None, agent="claude"):
@@ -235,7 +241,7 @@ def own_projects_root(env=None):
     return os.path.join(home, CONFIG_DIR_DEFAULT, PROJECTS_DIRNAME)
 
 
-def session_directory(session_id, env=None, head_bytes=HEAD_BYTES):
+def session_directory(session_id, env=None, max_bytes=MAX_HEAD_BYTES):
     """The directory a live session was STARTED in, from its own transcript — or None (issue #537).
 
     Why not the caller's `os.getcwd()`: a session's shell wanders (`cd skills/x` to run a suite),
@@ -245,29 +251,38 @@ def session_directory(session_id, env=None, head_bytes=HEAD_BYTES):
     FIRST record carrying one is the start directory, and the file is found by id (`Transcript._path`,
     which globs rather than rebuilding the agent's project-slug encoding).
 
-    None for every failure — no id, no root, no file, no `cwd` in the head — and the caller falls
-    back to its own working directory, which is right whenever the shell has not wandered."""
+    The read goes forward ONE RECORD AT A TIME and stops at that first `cwd`, so an ordinary session
+    costs a few KB. It never takes more than `max_bytes` in all (issue #542): the record it is
+    looking for is the first user message, which can be megabytes (a pasted screenshot is stored
+    inline). A fixed-size head dropped that record as a fragment, so a size cap on the head was the
+    wrong shape for this bound.
+
+    None for every failure — no id, no root, no file, no `cwd` within the bound — and the caller
+    falls back to its own working directory, which is right whenever the shell has not wandered."""
     if not isinstance(session_id, str) or not session_id.strip():
         return None
     path = Transcript(root=own_projects_root(env), session_id=session_id.strip(), text="")._path()
     if not path:
         return None
+    budget = int(max_bytes)
     try:
         with open(path, "rb") as f:
-            raw = f.read(max(int(head_bytes), 1))
+            while budget > 0:
+                # Never more than what is left: a record longer than that comes back cut short,
+                # fails to parse below, and spends the rest of the budget, which ends the read.
+                line = f.readline(budget)
+                if not line:
+                    return None           # the end of the file, and no `cwd` on the way
+                budget -= len(line)
+                try:
+                    rec = json.loads(line.decode("utf-8", "replace"))
+                except ValueError:
+                    continue              # a fragment cut at the bound, or not a record at all
+                cwd = rec.get("cwd") if isinstance(rec, dict) else None
+                if isinstance(cwd, str) and cwd.strip():
+                    return cwd
     except OSError:
         return None
-    lines = raw.decode("utf-8", "replace").splitlines()
-    if len(raw) >= head_bytes and lines:
-        lines = lines[:-1]                # the read almost certainly stopped mid-line; drop it
-    for line in lines:
-        try:
-            rec = json.loads(line)
-        except ValueError:
-            continue
-        cwd = rec.get("cwd") if isinstance(rec, dict) else None
-        if isinstance(cwd, str) and cwd.strip():
-            return cwd
     return None
 
 

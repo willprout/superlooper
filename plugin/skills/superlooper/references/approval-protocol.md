@@ -3,8 +3,10 @@
 `agent-ready` is William's word. This is the single most important bright line in the whole system,
 and it is enforced by discipline here and by absence everywhere else (no code path applies
 `agent-ready` on its own judgment). A session applies it with `superlooper approve`, and only when
-it is relaying his say-so. Both the verb and the loop's tool-call hook refuse it in every session
-the runner launched.
+it is relaying his say-so. The verb itself refuses it in every session the runner launched,
+whichever agent runs that session. In a Claude session the loop's tool-call hook also denies the
+command before it runs. Codex has no tool-call hook, so a Codex session relies on the verb's own
+refusal.
 
 ## Approval-by-conversation (spec §2, verbatim intent)
 
@@ -72,8 +74,9 @@ newest stamp, and an unstamped approval never clears an earlier stamp.
   without a stamp, and says so on stderr. The dashboard's Approve button posts no stamp either. An
   unstamped approval falls back to William (owner ruling).
 - **Refused in a launched session.** Inside any session the runner launched (a build worker, a
-  repair session, a triage flight, a consult) the verb refuses and writes nothing, and the loop's
-  tool-call hook denies the command before it runs.
+  repair session, a triage flight, a consult) the verb refuses and writes nothing, whichever agent
+  runs that session. In a Claude session the loop's tool-call hook also denies the command before
+  it runs. A Codex session has no tool-call hook, so there the verb's own refusal is the only one.
 
 Approval is one touch: his word, your one command.
 
