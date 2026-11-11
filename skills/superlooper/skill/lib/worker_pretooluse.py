@@ -540,6 +540,9 @@ def parse_issue_create(command):
 #     line does not say which branch that is, and reading the checkout is a new I/O this hook does
 #     not do;
 #   * exotic refspecs (`HEAD:refs/for/main`) and a remote spelled as a URL;
+#   * a call behind a wrapper the shared command-position reading does not list (#543): one that
+#     re-parses its arguments through a shell (`watch`, `ssh`), or a rarely used direct-exec wrapper
+#     (`arch`, `setsid`, …). The list and its reasons sit with `_PROCESS_WRAPPERS`, below;
 #   * a seat with no PreToolUse layer at all — today that is `/superlooper:cross-review`'s non-Claude
 #     subprocess running inside the worker's own pane on the worker's credential (#232). See the
 #     module docstring's CLAUDE ONLY note.
@@ -564,12 +567,67 @@ def parse_issue_create(command):
 _GIT_GLOBAL_WITH_VALUE = frozenset(("-C", "-c", "--git-dir", "--work-tree", "--namespace",
                                     "--exec-path", "--super-prefix"))
 
-# Leading words that wrap a real command without changing what it is — duty 2's list, plus the
-# CONDITION keywords (fresh-agent review round 2, 2026-08-06). Duty 2 documents `if pkill …; then`
-# as an accepted miss because a deny there is the expensive direction; here it is the cheap one, so
-# `if git push origin main; then …` and `until gh pr merge 42; do …` are closed rather than accepted.
-_WRAPPERS = frozenset(("sudo", "env", "nohup", "time", "command", "builtin", "exec", "xargs",
-                       "then", "do", "else", "if", "elif", "while", "until", "!"))
+# THE COMMAND-POSITION READING every matcher below shares (issue #543). A binary counts as RUN,
+# rather than mentioned, when it is the first word of a simple command (the line start, or right
+# after a separator) once the words that only LAUNCH it are stepped over: env-assignment prefixes,
+# the condition keywords, an interpreter, and the process wrappers below, each with its own options
+# and operands. It is ONE reading on purpose. The fresh-agent review of #537 found `timeout 60`
+# hiding the call from every matcher at once, and `env -u` seen through by the approval-verb matcher
+# alone, because each matcher's reading knew a different list. A wrapper is now seen through by all
+# of them or by none.
+#
+# The reading walks FORWARD from each command start rather than back from the binary: a wrapper's
+# operand (`timeout`'s DURATION) and an option's value (`nice -n 10`) look like any other word from
+# behind, and only the wrapper in front says what they are.
+
+# The CONDITION keywords (fresh-agent review round 2, 2026-08-06). They take no options. Duty 2
+# documents `if pkill …; then` as an accepted miss because a deny there is the expensive direction;
+# here it is the cheap one, so `if git push origin main; then …` and `until gh pr merge 42; do …`
+# are closed rather than accepted.
+_KEYWORDS = frozenset(("then", "do", "else", "if", "elif", "while", "until", "!"))
+
+# Process wrappers: a word that EXECS the command after it without changing what that command is.
+# Each maps to (its options that consume the NEXT token, the operands it takes before the command).
+# Only the value-taking options need naming, because every other `-x` / `--long[=v]` token after a
+# wrapper is stepped over as a valueless flag. Naming them is what keeps `nice -n 10 gh …` and
+# `sudo -u root gh …` from reading `10` or `root` as the command. `timeout`'s DURATION is the one
+# operand that sits between a wrapper and its command. A wrapper is matched by its basename, so
+# `/usr/bin/nice` is `nice`.
+#
+# Deliberately LEFT OUT, each an accepted miss (pinned in test_pretooluse_hook.py): a wrapper that
+# hands its arguments to a shell to RE-PARSE (`watch`, `ssh`, `script`, `flock -c`, `parallel`).
+# That is the `sh -c '…'` quote-hidden miss in another spelling. Also left out are the direct-exec
+# wrappers a session on these hosts does not reach for (`arch`, `setsid`, `doas`, `ionice`, `chrt`,
+# `taskset`, `unbuffer`), because each one is another option grammar to get right.
+_TIMEOUT_VALUE_FLAGS = frozenset(("-s", "--signal", "-k", "--kill-after"))
+_PROCESS_WRAPPERS = {
+    # the list duty 2 and these matchers already knew...
+    "sudo": (frozenset(("-u", "--user", "-g", "--group", "-U", "--other-user", "-h", "--host",
+                        "-p", "--prompt", "-C", "--close-from", "-D", "--chdir", "-r", "--role",
+                        "-t", "--type", "-T", "--command-timeout")), 0),
+    "env": (frozenset(("-u", "--unset", "-C", "--chdir", "-S", "--split-string", "-P", "-L",
+                       "-U")), 0),
+    "nohup": (frozenset(), 0),
+    "time": (frozenset(("-o", "--output", "-f", "--format")), 0),
+    "command": (frozenset(), 0),
+    "builtin": (frozenset(), 0),
+    "exec": (frozenset(("-a",)), 0),
+    "xargs": (frozenset(("-n", "--max-args", "-L", "--max-lines", "-P", "--max-procs", "-s",
+                         "--max-chars", "-I", "-E", "-J", "-R", "-S", "-d", "--delimiter", "-a",
+                         "--arg-file")), 0),
+    # ...and the process wrappers #537's review measured getting past every matcher (#543)
+    "timeout": (_TIMEOUT_VALUE_FLAGS, 1),
+    "gtimeout": (_TIMEOUT_VALUE_FLAGS, 1),        # Homebrew coreutils' name for it on a Mac
+    "nice": (frozenset(("-n", "--adjustment")), 0),
+    "caffeinate": (frozenset(("-t", "-w")), 0),
+    "stdbuf": (frozenset(("-i", "--input", "-o", "--output", "-e", "--error")), 0),
+}
+
+# An interpreter running a script FILE runs the file named after its options, so that file is the
+# command: `python3 …/bin/superlooper approve` is how a source checkout runs the approval verb
+# (#537). Its options are all read as valueless, so `python3 -c '…' superlooper` lands on the quoted
+# code (the `sh -c` accepted miss) and `python3 -m superlooper` on the module.
+_INTERPRETER_RE = re.compile(r"(?:^|/)(?:python(?:\d+(?:\.\d+)?)?|bash|sh|zsh)$")
 
 # `FOO=bar gh pr merge 42` — an env-assignment PREFIX is the ordinary way to run one command with
 # one variable set, and it left the binary looking like an argument to something else (same review).
@@ -659,26 +717,57 @@ _RUN_END = _SEPARATORS | _REDIRECTS
 _GH_GLOBAL_WITH_VALUE = frozenset(("--repo", "-R", "--hostname"))
 
 
-def _at_command_position(tokens, i):
-    """Is `tokens[i]` a command being RUN, rather than an argument to something else? True at the
-    line start, right after a separator, or behind a chain of benign wrappers and env-assignment
-    prefixes. The walk-back must REACH a separator or the line start, so `echo if git push` — where
-    it lands on `echo` — is still text, not a call."""
-    j = i - 1
-    while j >= 0 and (tokens[j] in _WRAPPERS or _ASSIGNMENT_RE.match(tokens[j])):
-        j -= 1
-    return j < 0 or tokens[j] in _SEPARATORS
+def _launched_command(tokens, i, end):
+    """The index of the command that the simple command at tokens[i:end] actually RUNS, or None
+    when the walk runs out first. That is `i` itself, or the first word past every assignment
+    prefix, keyword, interpreter and process wrapper, with each wrapper's own options and operands.
+    The walk never crosses `end` (the next separator), and it stops at the first word that launches
+    nothing, so in `echo timeout 60 gh pr merge` the command is `echo` and the rest is text."""
+    while i < end:
+        tok = tokens[i]
+        if _ASSIGNMENT_RE.match(tok) or tok in _KEYWORDS:
+            i += 1
+            continue
+        grammar = _PROCESS_WRAPPERS.get(tok.rsplit("/", 1)[-1])
+        if grammar is None and _INTERPRETER_RE.search(tok):
+            grammar = (frozenset(), 0)
+        if grammar is None:
+            return i
+        value_flags, operands = grammar
+        i += 1
+        while i < end and tokens[i].startswith("-"):
+            flag = tokens[i]
+            i += 2 if flag in value_flags else 1
+            if flag == "--":
+                break                        # end of options: what follows is an operand or the command
+        i += operands
+    return None
+
+
+def _commands_run(tokens):
+    """The indices of every token this line RUNS as a command: one per simple command, found by
+    `_launched_command` from the line start and from just after each separator."""
+    run, start = set(), 0
+    for k in range(len(tokens) + 1):
+        if k == len(tokens) or tokens[k] in _SEPARATORS:
+            at = _launched_command(tokens, start, k)
+            if at is not None:
+                run.add(at)
+            start = k + 1
+    return run
 
 
 def _invocations(tokens, binary):
-    """[(start, end)] — the ARGUMENT run of every `binary` invoked at a command position. `start` is
-    the index of its first argument, `end` the index of the next separator or redirect (or the
-    line's end). An absolute or relative path to the binary is seen through."""
+    """[(start, end)] — the ARGUMENT run of every `binary` the line RUNS (see the command-position
+    reading above). `start` is the index of its first argument, `end` the index of the next
+    separator or redirect (or the line's end). An absolute or relative path to the binary is seen
+    through."""
     out = []
+    run = _commands_run(tokens)
     for i, tok in enumerate(tokens):
         if not (tok == binary or tok.endswith("/" + binary)):
             continue
-        if not _at_command_position(tokens, i):
+        if i not in run:
             continue
         end = len(tokens)
         for j in range(i + 1, len(tokens)):
@@ -858,17 +947,14 @@ def _approval_label_deny(tokens):
 # Without this matcher the verb would be an easier door to `agent-ready` than the one matcher B
 # closes (fresh-agent review on #537, P1).
 #
-# Matched at a command position as matcher B's calls are, and ALSO behind an interpreter
-# (`python3 …/bin/superlooper approve`, how a source checkout runs it) and behind `env`'s own
-# options (`env -u X superlooper approve`). Accepted misses, the same posture as the label matcher's:
-# a call behind a quote (`sh -c '…'`), and a script file that runs the verb for the session — the
-# hook sees the script's name, never its contents. `--help` writes nothing and is allowed.
+# Matched through the shared command-position reading, as matcher B's calls are. That reading sees
+# through an interpreter (`python3 …/bin/superlooper approve`, how a source checkout runs it),
+# `env`'s own options (`env -u X superlooper approve`) and the process wrappers (`timeout 60 env -u
+# X superlooper approve`, #543). Accepted misses, the same posture as the label matcher's: a call
+# behind a quote (`sh -c '…'`), and a script file that runs the verb for the session — the hook sees
+# the script's name, never its contents. `--help` writes nothing and is allowed.
 _SUPERLOOPER_BIN = "superlooper"
 _APPROVE_VERB = "approve"
-_INTERPRETER_RE = re.compile(r"(?:^|/)(?:python(?:\d+(?:\.\d+)?)?|bash|sh|zsh)$")
-# `env` options that consume the NEXT token, so `env -u SL_ISSUE_ID superlooper …` is read as the
-# `superlooper` call it is rather than as an argument to some unknown command.
-_ENV_VALUE_FLAGS = frozenset(("-u", "--unset", "-C", "--chdir", "-S", "--split-string"))
 
 _APPROVE_REASON = (
     "`superlooper approve` is forbidden in a superlooper loop session. It applies `agent-ready` — "
@@ -880,37 +966,10 @@ _APPROVE_REASON = (
 )
 
 
-def _runs_as_command(tokens, i):
-    """Like `_at_command_position`, but also seeing through an interpreter (`python3 -I …`) and
-    `env`'s value-taking options. A walk-back that ends anywhere but a separator or the line start
-    — `echo superlooper approve`, `grep -e superlooper approve` — is text, not a call."""
-    j = i - 1
-    while j >= 0:
-        tok = tokens[j]
-        if (tok in _WRAPPERS or _ASSIGNMENT_RE.match(tok) or _INTERPRETER_RE.search(tok)
-                or tok.startswith("-")):
-            j -= 1
-            continue
-        if j >= 1 and tokens[j - 1] in _ENV_VALUE_FLAGS:
-            j -= 2                       # `-u NAME`: the flag and the name it consumes
-            continue
-        break
-    return j < 0 or tokens[j] in _SEPARATORS
-
-
 def _approve_verb_deny(tokens):
-    for i, tok in enumerate(tokens):
-        if not (tok == _SUPERLOOPER_BIN or tok.endswith("/" + _SUPERLOOPER_BIN)):
-            continue
-        if not _runs_as_command(tokens, i):
-            continue
-        end = len(tokens)
-        for j in range(i + 1, len(tokens)):
-            if tokens[j] in _RUN_END:
-                end = j
-                break
-        verb = next((t for t in tokens[i + 1:end] if not t.startswith("-")), None)
-        if verb == _APPROVE_VERB and not _is_help(tokens, i + 1, end):
+    for start, end in _invocations(tokens, _SUPERLOOPER_BIN):
+        verb = next((t for t in tokens[start:end] if not t.startswith("-")), None)
+        if verb == _APPROVE_VERB and not _is_help(tokens, start, end):
             return _APPROVE_REASON
     return None
 
