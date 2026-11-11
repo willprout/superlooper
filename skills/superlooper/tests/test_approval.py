@@ -28,6 +28,7 @@ import pytest
 
 import approval
 import brief
+import delivery
 import gh
 import identity
 import labels as labels_lib
@@ -516,11 +517,34 @@ def test_blanking_the_launch_markers_on_the_command_line_is_still_refused(rig, t
     assert rig.calls() == []
 
 
-def _transcript(home, project_slug, session, cwds):
+def _record(cwd, session, message=None):
+    """One user record in the agent's REAL field order, measured on a live transcript (#542):
+    `message` comes BEFORE `cwd`. So everything up to a record's `cwd` is its message, and the
+    first record carrying a `cwd` is the session's first user message — however large that is."""
+    return json.dumps({"parentUuid": None, "isSidechain": False, "type": "user",
+                       "message": message or {"role": "user", "content": "go"},
+                       "uuid": "00000000-0000-4000-8000-000000000000",
+                       "timestamp": "2026-11-11T00:00:00.000Z", "userType": "external",
+                       "entrypoint": "cli", "cwd": cwd, "sessionId": session,
+                       "version": "2.1.0", "gitBranch": "main"})
+
+
+def _preamble(session):
+    """The records the agent writes before the first user message, none of which carries a `cwd`."""
+    return [json.dumps({"type": "custom-title", "customTitle": "t", "sessionId": session}),
+            json.dumps({"type": "permission-mode", "permissionMode": "default",
+                        "sessionId": session}),
+            json.dumps({"type": "file-history-snapshot", "messageId": "m", "snapshot": {},
+                        "isSnapshotUpdate": False})]
+
+
+def _transcript(home, project_slug, session, cwds, first_message=None):
     d = home / ".claude" / "projects" / project_slug
     d.mkdir(parents=True, exist_ok=True)
-    lines = [json.dumps({"type": "user", "cwd": c, "sessionId": session}) for c in cwds]
-    (d / ("%s.jsonl" % session)).write_text("\n".join(['{"type": "summary"}'] + lines) + "\n")
+    lines = [_record(c, session, first_message if i == 0 else None) for i, c in enumerate(cwds)]
+    path = d / ("%s.jsonl" % session)
+    path.write_text("\n".join(_preamble(session) + lines) + "\n")
+    return path
 
 
 def test_the_stamp_records_the_directory_the_session_started_in(rig, tmp_path):
@@ -553,6 +577,135 @@ def test_with_no_transcript_the_stamp_falls_back_to_the_working_directory(rig):
     assert rig.approve(5).returncode == 0
     stamp = approval.parse_stamp(rig.issue(5)["comments"][0]["body"])
     assert stamp.cwd == os.path.realpath(str(rig.cwd))
+
+
+def _screenshot_message(images):
+    """A first message with pasted screenshots, which the agent stores INLINE as base64. 1.4MB a
+    record is the largest single-image user record measured on the owner's machine (median 740KB)."""
+    blob = "iVBORw0KGgo" + "A" * (1400 * 1024)
+    return {"role": "user", "content": [{"type": "text", "text": "look at this"}] + [
+        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": blob}}
+        for _ in range(images)]}
+
+
+@pytest.mark.parametrize("first_message", [
+    _screenshot_message(1),
+    _screenshot_message(3),
+    {"role": "user", "content": "a long kickoff. " * 12000},          # ~190KB of typed brief
+], ids=["one pasted screenshot", "three pasted screenshots", "a long kickoff"])
+def test_a_large_first_message_still_yields_the_directory_the_session_started_in(
+        rig, tmp_path, first_message):
+    """Issue #542. The first record carrying a `cwd` is the session's first user message, and its
+    `cwd` comes AFTER its `message`. A 64KB head read dropped that record as a fragment whenever the
+    message was bigger than the head, and the stamp silently fell back to wherever the shell had
+    wandered — the wrong directory for a resume, the exact case the transcript read exists for."""
+    started = str(tmp_path / "the-project")
+    path = _transcript(tmp_path / "userhome", "-the-project", SESSION,
+                       [started, started + "/skills/superlooper"], first_message=first_message)
+    raw = path.read_bytes()
+    first = raw.split(b"\n")[len(_preamble(SESSION))]
+    assert first.index(b'"message"') < first.index(b'"cwd"'), "the fixture must keep the real order"
+    assert raw.index(b'"cwd"') > 64 * 1024, "the fixture must put the first cwd past the old head"
+    rig.github([_issue(5)])
+    r = rig.approve(5)
+    assert r.returncode == 0, r.stdout + r.stderr
+    stamp = approval.parse_stamp(rig.issue(5)["comments"][0]["body"])
+    assert stamp.cwd == started
+
+
+def test_a_pathologically_large_head_falls_back_rather_than_read_without_bound(rig, tmp_path):
+    """End to end at the DEFAULT bound, `delivery.MAX_HEAD_BYTES`: a transcript whose first
+    cwd-bearing record starts past it gets None, and the verb falls back to its working directory
+    rather than stamping the `cwd` waiting past the bound. The file is sparse, so its size costs the
+    test no disk. This pins where an answer may come from; that the read also TAKES no more than the
+    bound is the counting test's job below."""
+    d = tmp_path / "userhome" / ".claude" / "projects" / "-the-project"
+    d.mkdir(parents=True)
+    path = d / ("%s.jsonl" % SESSION)
+    with open(path, "wb") as f:
+        f.write(b'{"type": "user", "message": {"role": "user", "content": "')
+        f.seek(delivery.MAX_HEAD_BYTES + 4096)                    # a hole of NULs, no newline
+        f.write(b'"}}\n' + _record(str(tmp_path / "too-late"), SESSION).encode() + b"\n")
+    rig.github([_issue(5)])
+    r = rig.approve(5)
+    assert r.returncode == 0, r.stdout + r.stderr
+    stamp = approval.parse_stamp(rig.issue(5)["comments"][0]["body"])
+    assert stamp.cwd == os.path.realpath(str(rig.cwd))
+
+
+class _CountingFile:
+    """A file that counts every byte it hands back, however it is asked for them."""
+
+    def __init__(self, f):
+        self._f, self.handed = f, 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self._f.close()
+
+    def __iter__(self):
+        for line in self._f:
+            self.handed += len(line)
+            yield line
+
+    def __getattr__(self, name):
+        attr = getattr(self._f, name)
+        if not callable(attr):
+            return attr
+
+        def counted(*a, **kw):
+            out = attr(*a, **kw)
+            if isinstance(out, (bytes, bytearray)):
+                self.handed += len(out)
+            elif isinstance(out, list):
+                self.handed += sum(len(x) for x in out if isinstance(x, (bytes, bytearray)))
+            return out
+        return counted
+
+
+def test_the_start_directory_read_never_takes_more_than_its_bound(tmp_path, monkeypatch):
+    """The bound is a ceiling on bytes READ, not only on where an answer is accepted from: past it
+    the read stops, so a huge transcript costs at most the bound however large it is."""
+    home = tmp_path / "home"
+    started = str(tmp_path / "the-project")
+    path = _transcript(home, "-the-project", SESSION, [started],
+                       first_message={"role": "user", "content": "x" * 300000})
+    with open(path, "a") as f:                       # a long session's worth after the answer
+        f.write(_record(started + "/skills", SESSION,
+                        {"role": "user", "content": "y" * 2000000}) + "\n")
+    opened = []
+    real_open = open
+
+    def counting_open(*a, **kw):
+        opened.append(_CountingFile(real_open(*a, **kw)))
+        return opened[-1]
+    monkeypatch.setattr(delivery, "open", counting_open, raising=False)
+    env = {"HOME": str(home)}
+
+    assert delivery.session_directory(SESSION, env=env, max_bytes=100000) is None
+    assert opened and sum(f.handed for f in opened) <= 100000
+    # The same transcript under a bound it fits inside: the answer, read once, through to its first
+    # cwd and no further. The 2MB of records after it are never taken.
+    assert delivery.session_directory(SESSION, env=env, max_bytes=4000000) == started
+    assert sum(f.handed for f in opened[1:]) < 400000
+
+
+@pytest.mark.parametrize("bound", [0, -5])
+def test_a_degenerate_bound_answers_none_rather_than_reading_everything(tmp_path, bound):
+    home = tmp_path / "home"
+    _transcript(home, "-p", SESSION, [str(tmp_path / "p")])
+    assert delivery.session_directory(SESSION, env={"HOME": str(home)}, max_bytes=bound) is None
+
+
+def test_a_last_record_with_no_trailing_newline_still_counts(tmp_path):
+    """A transcript the agent is mid-way through writing may end without a newline; a complete
+    record there is still a record."""
+    home = tmp_path / "home"
+    path = _transcript(home, "-p", SESSION, [str(tmp_path / "p")])
+    path.write_bytes(path.read_bytes().rstrip(b"\n"))
+    assert delivery.session_directory(SESSION, env={"HOME": str(home)}) == str(tmp_path / "p")
 
 
 def test_an_unreadable_issue_is_not_approved_and_the_rest_still_are(rig):
@@ -608,3 +761,26 @@ def test_a_missing_config_is_a_clean_failure(rig, tmp_path):
 def test_the_approval_protocol_names_the_verb():
     text = _PROTOCOL.read_text()
     assert "`superlooper approve" in text
+
+
+def test_the_protocol_says_which_refusal_covers_which_agent(tmp_path):
+    """Issue #542. The loop's tool-call hook is Claude-only (`worker_pretooluse.run` returns early for
+    Codex), so the doc must not promise the hook in every launched session: a Codex session relies on
+    the verb's own refusal. Both halves are pinned against the hook itself, so the doc's sentences
+    get revisited if the hook stops denying the verb in a Claude session, or if `run` stops
+    returning early for Codex."""
+    import worker_pretooluse
+    wt = tmp_path / "worktrees" / "i7" / ".superlooper"
+    wt.mkdir(parents=True)
+    (wt / "config.json").write_text(json.dumps({"version": 1, "repo": "o/r"}))
+    payload = {"hook_event_name": "PreToolUse", "tool_name": "Bash",
+               "tool_input": {"command": "superlooper approve 5"}}
+    worker = {"SL_ISSUE_ID": "i7", "SL_RUN_ROOT": str(tmp_path)}
+    assert worker_pretooluse.run(payload, {**worker, "SL_AGENT": "claude"}), \
+        "the doc says the hook denies the verb in a Claude session"
+    assert worker_pretooluse.run(payload, {**worker, "SL_AGENT": "codex"}) is None
+    text = " ".join(_PROTOCOL.read_text().split())
+    assert "Both the verb and the loop's tool-call hook refuse" not in text
+    assert "The verb itself refuses it in every session the runner launched" in text
+    assert "In a Claude session the loop's tool-call hook also denies the command" in text
+    assert "a Codex session relies on the verb's own refusal" in text
