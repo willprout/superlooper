@@ -1570,13 +1570,18 @@ def test_review_round_2_consult_reads_stay_allowed(command):
 # principle, #215/#225) instead of leaving it to whoever remembers.
 #
 # The guard reads the launcher's OWN tables at call time: `launch.MODES` (what `_mode_of` admits)
-# and `launch._MODE_GUARDS` (the id shape `_launch` holds each mode to). `pane_environment` hands
-# the pane that same guarded id as SL_ISSUE_ID, and it is the id `_role` reads. A mode added there
-# is checked here with no edit to this file.
+# and `launch._MODE_GUARDS` (the id shape `_launch` holds each mode to). Every class `_launch` can
+# start is a key of the second, or its guard lookup raises, so the guard walks BOTH: a mode
+# `_mode_of` derives without listing it in MODES is still checked. `pane_environment` hands the pane
+# that same guarded id as SL_ISSUE_ID, and it is the id `_role` reads. A mode added there is checked
+# here with no edit to this file.
 
-# The ids tried against each mode's shape: a one- or two-letter prefix and a number. Wide on
-# purpose, but a shape none of them fits is NEVER a silent pass: the guard fails and names the
-# mode, and the fix is to widen this list, not to skip the mode.
+# The ids tried against each mode's shape: a one- or two-letter prefix and a number. That covers a
+# guard of the form `^<one letter>[0-9]+$` or `^<two lowercase letters>[0-9]+$` COMPLETELY, which
+# is every guard the launcher has. Any other shape is NEVER a silent pass, even one a few
+# candidates happen to fit (`^i[0-9]+r?$` is sampled as `i7` while its real `i7r` has no role): the
+# guard fails and names the mode, and the fix is to widen this sampler, not to skip the mode.
+_SAMPLED_SHAPE = re.compile(r"\^(?:[A-Za-z]|[a-z]{2})\[0-9\]\+\$")
 _ID_NUMBERS = ("0", "1", "7", "540", "99999")
 _ID_PREFIXES = (tuple(string.ascii_letters)
                 + tuple(a + b for a in string.ascii_lowercase for b in string.ascii_lowercase))
@@ -1588,6 +1593,12 @@ _CANDIDATE_IDS = tuple(p + n for p in _ID_PREFIXES for n in _ID_NUMBERS) + (
 
 _APPROVAL_LABEL_CALLS = ("gh issue edit 4 --add-label agent-ready",
                          "gh issue edit 4 --add-label pre-authorized:referee")
+
+
+def _launcher_modes():
+    """Every class the launcher can start: what `_mode_of` admits, and every key of the guard table
+    `_launch` looks the mode up in. Sorted, so a failure names the same mode run after run."""
+    return sorted(set(launch.MODES) | set(launch._MODE_GUARDS))
 
 
 def _accepts(mode, sid):
@@ -1605,17 +1616,17 @@ def _launcher_modes_without_a_role():
     """Every launcher mode whose sessions the PreToolUse deny module would leave unguarded, as one
     sentence each. Empty means in step."""
     problems = []
-    for mode in launch.MODES:
+    for mode in _launcher_modes():
         guard = launch._MODE_GUARDS.get(mode)
         if guard is None:
             problems.append("launcher mode %r is admitted by launch.MODES but has no id guard in "
                             "launch._MODE_GUARDS" % (mode,))
             continue
         ids = _launchable_ids(mode)
-        if not ids:
-            problems.append("launcher mode %r takes ids shaped %r and none of this guard's "
-                            "candidate ids fit it: widen _CANDIDATE_IDS, never skip the mode"
-                            % (mode, guard.pattern))
+        if not ids or not _SAMPLED_SHAPE.fullmatch(guard.pattern):
+            problems.append("launcher mode %r takes ids shaped %r, which this guard's candidate "
+                            "ids do not cover completely: widen _CANDIDATE_IDS and _SAMPLED_SHAPE, "
+                            "never skip the mode" % (mode, guard.pattern))
             continue
         unguarded = [sid for sid in ids if wp._role(sid) is None]
         if unguarded:
@@ -1637,6 +1648,7 @@ def test_every_session_mode_the_launcher_can_start_has_a_role():
 @pytest.mark.parametrize("shape", [
     r"^s[0-9]+$",        # a new letter: sampled, and `_role` knows nothing of it
     r"^se-[0-9]+$",      # a shape the sampler cannot fit: must fail closed, not pass vacuously
+    r"^i[0-9]+r?$",      # a shape it fits only in part (`i7` is a worker, `i7r` is nobody)
 ])
 def test_a_launcher_mode_added_without_its_role_trips_the_guard(monkeypatch, shape):
     # Simulated: no production mode is added. The new class goes into the launcher's own tables...
@@ -1644,7 +1656,7 @@ def test_a_launcher_mode_added_without_its_role_trips_the_guard(monkeypatch, sha
     monkeypatch.setitem(launch._MODE_GUARDS, "seance", re.compile(shape))
     # ...where the launcher's real mode reader now admits it: a class the launcher can start.
     assert launch._mode_of(types.SimpleNamespace(mode="seance", cwd=None)) == "seance"
-    # Counted on the seance alone, so a REAL drift elsewhere reports once, in the test above.
+    # Counted on the seance alone, so a REAL drift elsewhere does not also fail this simulation.
     assert len([p for p in _launcher_modes_without_a_role() if "'seance'" in p]) == 1
     with pytest.raises(AssertionError):
         test_every_session_mode_the_launcher_can_start_has_a_role()
@@ -1658,14 +1670,17 @@ def test_the_guard_clears_once_the_role_arrives_in_the_same_change(monkeypatch):
     known = wp._role
     monkeypatch.setattr(wp, "_role", lambda sid: (("seance", wp._worker_ask_reason)
                                                   if re.match(r"^s[0-9]+$", sid) else known(sid)))
-    assert _launcher_modes_without_a_role() == []
+    assert [p for p in _launcher_modes_without_a_role() if "'seance'" in p] == []
 
 
 def test_every_launcher_mode_is_denied_the_approval_labels(tmp_path):
     # The hazard #536 measured, put to the hook's decision core (`run`) for one id of every class
     # the launcher can start, whatever classes that comes to be.
-    for mode in launch.MODES:
-        sid = _launchable_ids(mode)[0]
+    for mode in _launcher_modes():
+        ids = _launchable_ids(mode)
+        if not ids:
+            continue                     # unsampleable: the guard above already names the mode
+        sid = ids[0]
         env = {"SL_ISSUE_ID": sid, "SL_RUN_ROOT": str(tmp_path)}
         for command in _APPROVAL_LABEL_CALLS:
             assert wp.run(_pre("Bash", {"command": command}), env), (mode, sid, command)
@@ -1676,7 +1691,7 @@ def test_an_id_shape_no_launcher_mode_produces_still_denies_nothing(tmp_path):
     # recognises no shape the launcher cannot start (the retired `a<N>` stays out), and such a
     # session is denied nothing, approval labels included.
     unlaunchable = [sid for sid in _CANDIDATE_IDS
-                    if not any(_accepts(mode, sid) for mode in launch.MODES)]
+                    if not any(_accepts(mode, sid) for mode in _launcher_modes())]
     assert "a5" in unlaunchable and "x9" in unlaunchable     # #462's own unknown ids
     assert [sid for sid in unlaunchable if wp._role(sid) is not None] == []
     for sid in unlaunchable:

@@ -284,8 +284,8 @@ def _triage_runs_dir(state_home):
 # every hazard this module exists to deny. Since #540 that is a test, not a memory:
 # tests/test_pretooluse_hook.py reads `launch.MODES` / `launch._MODE_GUARDS` and fails while any
 # mode the launcher can start resolves to no role here, and while this table knows a shape no mode
-# produces. ASCII digits only, deliberately: `str.isdigit()` would also accept unicode digits that
-# no launcher can produce.
+# produces (among the id shapes that test samples). ASCII digits only, deliberately: `str.isdigit()`
+# would also accept unicode digits that no launcher can produce.
 _ROLES = {"i": ("worker", _worker_ask_reason),
           "d": ("debugger", _debugger_ask_reason),
           "t": ("triage", _triage_ask_reason),
