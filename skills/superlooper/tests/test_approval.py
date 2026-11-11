@@ -614,10 +614,11 @@ def test_a_large_first_message_still_yields_the_directory_the_session_started_in
 
 
 def test_a_pathologically_large_head_falls_back_rather_than_read_without_bound(rig, tmp_path):
-    """The read is BOUNDED by `delivery.MAX_HEAD_BYTES`: a transcript whose first cwd-bearing record
-    starts past that bound answers None, and the verb falls back to its working directory. The
-    file is sparse, so its size costs the test no disk — and a read past the bound would find the
-    `cwd` waiting there and stamp it, which is what this refuses."""
+    """End to end at the DEFAULT bound, `delivery.MAX_HEAD_BYTES`: a transcript whose first
+    cwd-bearing record starts past it gets None, and the verb falls back to its working directory
+    rather than stamping the `cwd` waiting past the bound. The file is sparse, so its size costs the
+    test no disk. This pins where an answer may come from; that the read also TAKES no more than the
+    bound is the counting test's job below."""
     d = tmp_path / "userhome" / ".claude" / "projects" / "-the-project"
     d.mkdir(parents=True)
     path = d / ("%s.jsonl" % SESSION)
@@ -669,8 +670,11 @@ def test_the_start_directory_read_never_takes_more_than_its_bound(tmp_path, monk
     the read stops, so a huge transcript costs at most the bound however large it is."""
     home = tmp_path / "home"
     started = str(tmp_path / "the-project")
-    _transcript(home, "-the-project", SESSION, [started],
-                first_message={"role": "user", "content": "x" * 300000})
+    path = _transcript(home, "-the-project", SESSION, [started],
+                       first_message={"role": "user", "content": "x" * 300000})
+    with open(path, "a") as f:                       # a long session's worth after the answer
+        f.write(_record(started + "/skills", SESSION,
+                        {"role": "user", "content": "y" * 2000000}) + "\n")
     opened = []
     real_open = open
 
@@ -682,8 +686,9 @@ def test_the_start_directory_read_never_takes_more_than_its_bound(tmp_path, monk
 
     assert delivery.session_directory(SESSION, env=env, max_bytes=100000) is None
     assert opened and sum(f.handed for f in opened) <= 100000
-    # The same transcript under a bound it fits inside: the answer, read once, through to its cwd.
-    assert delivery.session_directory(SESSION, env=env, max_bytes=1000000) == started
+    # The same transcript under a bound it fits inside: the answer, read once, through to its first
+    # cwd and no further. The 2MB of records after it are never taken.
+    assert delivery.session_directory(SESSION, env=env, max_bytes=4000000) == started
     assert sum(f.handed for f in opened[1:]) < 400000
 
 
@@ -758,16 +763,22 @@ def test_the_approval_protocol_names_the_verb():
     assert "`superlooper approve" in text
 
 
-def test_the_protocol_says_which_refusal_covers_which_agent():
+def test_the_protocol_says_which_refusal_covers_which_agent(tmp_path):
     """Issue #542. The loop's tool-call hook is Claude-only (`worker_pretooluse.run` returns early for
     Codex), so the doc must not promise the hook in every launched session: a Codex session relies on
-    the verb's own refusal. This is pinned against the hook itself, so the day Codex gets a hook the
-    test fails and the sentence gets revisited."""
+    the verb's own refusal. Both halves are pinned against the hook itself, so the doc's sentences
+    get revisited if the hook stops denying the verb in a Claude session, or if `run` stops
+    returning early for Codex."""
     import worker_pretooluse
+    wt = tmp_path / "worktrees" / "i7" / ".superlooper"
+    wt.mkdir(parents=True)
+    (wt / "config.json").write_text(json.dumps({"version": 1, "repo": "o/r"}))
     payload = {"hook_event_name": "PreToolUse", "tool_name": "Bash",
                "tool_input": {"command": "superlooper approve 5"}}
-    worker = {"SL_ISSUE_ID": "i7", "SL_RUN_ROOT": "/runs/x", "SL_AGENT": "codex"}
-    assert worker_pretooluse.run(payload, worker) is None
+    worker = {"SL_ISSUE_ID": "i7", "SL_RUN_ROOT": str(tmp_path)}
+    assert worker_pretooluse.run(payload, {**worker, "SL_AGENT": "claude"}), \
+        "the doc says the hook denies the verb in a Claude session"
+    assert worker_pretooluse.run(payload, {**worker, "SL_AGENT": "codex"}) is None
     text = " ".join(_PROTOCOL.read_text().split())
     assert "Both the verb and the loop's tool-call hook refuse" not in text
     assert "The verb itself refuses it in every session the runner launched" in text

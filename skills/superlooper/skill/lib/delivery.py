@@ -188,14 +188,15 @@ def records(run_root, iid, agent="claude", env=None, tail_bytes=TAIL_BYTES):
 
 
 # The CEILING on how much of a transcript's head `session_directory` reads (issue #542). The read
-# stops at the first record carrying a `cwd`, and that record is the session's first user message,
-# which the agent writes with its `cwd` AFTER its `message` (measured on a live transcript). So
-# the read has to take the whole first message, whatever its size. A pasted screenshot is stored
-# inline: one makes a user record of about 0.7MB (the largest measured on the owner's machine was
-# 1.4MB), and a long kickoff runs to hundreds of KB. The 64KB head this replaced dropped every such
-# record as a fragment and stamped the shell's wandered directory instead. The ceiling is generous
-# because reaching it costs one read of that size, once per approval. A session whose first message
-# outgrows it gets None (the caller's fallback) rather than a read without bound.
+# stops at the first record carrying a `cwd`. That record is usually the session's first user
+# message (an attachment or a compaction record sometimes comes first), and the agent writes a user
+# record's `cwd` AFTER its `message` (measured on a live transcript). So the read has to be able to
+# take a whole first message, whatever its size. A pasted screenshot is stored inline: one makes a
+# user record of about 0.7MB (the largest measured on the owner's machine was 1.4MB), and a long
+# kickoff runs to hundreds of KB. The 64KB head this replaced dropped every such record as a
+# fragment and stamped the shell's wandered directory instead. The ceiling is generous because
+# reaching it costs one read of that size, once per approval. A session whose first message outgrows
+# it gets None (the caller's fallback) rather than a read without bound.
 MAX_HEAD_BYTES = 32 * 1024 * 1024
 
 
@@ -253,9 +254,9 @@ def session_directory(session_id, env=None, max_bytes=MAX_HEAD_BYTES):
 
     The read goes forward ONE RECORD AT A TIME and stops at that first `cwd`, so an ordinary session
     costs a few KB. It never takes more than `max_bytes` in all (issue #542): the record it is
-    looking for is the first user message, which can be megabytes (a pasted screenshot is stored
-    inline). A fixed-size head dropped that record as a fragment, so a size cap on the head was the
-    wrong shape for this bound.
+    looking for is usually the first user message, which can be megabytes (a pasted screenshot is
+    stored inline). A fixed-size head dropped that record as a fragment, so a size cap on the head
+    was the wrong shape for this bound.
 
     None for every failure — no id, no root, no file, no `cwd` within the bound — and the caller
     falls back to its own working directory, which is right whenever the shell has not wandered."""
