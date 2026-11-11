@@ -561,3 +561,84 @@ def test_a_park_record_that_cannot_be_read_escalates_rather_than_moves():
     assert only(out, "handback_move") == []
     (p,) = only(out, "park")
     assert p["consult"]["outcome"] == "escalated"
+
+
+# ============================ #549: the three edges #548's review left ============================
+
+def _waiting_on(kind, key, until):
+    return {"key": key, "kind": kind, "state": "waiting", "until": until, "id": "c5",
+            "session": _STAMP["session"], "move": consult_mod.WAIT}
+
+
+def _each_handback_kind():
+    """Every kind of handback, each standing, with the key a consult of it is recorded under."""
+    kw, memo = _bounced()
+    frozen_since = NOW - actions.RECOVER_RETRY_SECONDS - 5
+    return [
+        (_frozen_at_cap, consult_mod.PARK, consult_mod.handback_key(consult_mod.PARK, "frozen_cap")),
+        (lambda **o: _bounced(**o)[0], consult_mod.BOUNCE,
+         consult_mod.handback_key(consult_mod.BOUNCE, memo)),
+        (_frozen_lane, consult_mod.FROZEN, consult_mod.handback_key(consult_mod.FROZEN, frozen_since)),
+        (_at_dialog, consult_mod.AT_DIALOG,
+         consult_mod.handback_key(consult_mod.AT_DIALOG, NOW - actions.AT_DIALOG_ALERT_SECONDS - 1)),
+        (_host_blocked, consult_mod.HOST_BLOCKED,
+         consult_mod.handback_key(consult_mod.HOST_BLOCKED, NOW - actions.AT_DIALOG_ALERT_SECONDS)),
+    ]
+
+
+@pytest.mark.parametrize("until", [NOW + 600, NOW - 1, NOW - 86400],
+                         ids=["holding", "just_ran_out", "long_ran_out"])
+@pytest.mark.parametrize("make,kind,key", _each_handback_kind(),
+                         ids=["park", "bounce", "frozen", "at_dialog", "host_blocked"])
+def test_a_close_on_a_waiting_handback_is_absorbed_and_never_consulted(make, kind, key, until):
+    """#549 edge 1: the owner closes the issue just after the WAIT its approving session chose has
+    run out. The re-derived handback must not launch a consult on the closed issue (the fork would
+    live one tick, until the absorb ended it): the close is the owner dropping the issue, absorbed
+    this tick, whether or not the hold has expired."""
+    out = decide(gh_view=ghv(closed_nums={5}),
+                 **make(handback=_waiting_on(kind, key, until), handback_consults=1))
+    assert len(_mine(out, "absorb_close")) == 1
+    assert only(out, "handback_consult") == []
+    assert _mine(out, "park") == [] and _mine(out, "bounce") == []
+    assert only(out, "handback_escalate") == [] and not has_notify(out)
+    assert not [r for r in _alert_reasons(out) if r.endswith(":i5")]
+
+
+def test_a_handback_past_its_wait_on_an_open_issue_is_still_a_new_consult():
+    """...and the fix is the close's alone: on an OPEN issue a wait that ran out re-derives."""
+    for make, kind, key in _each_handback_kind():
+        out = decide(**make(handback=_waiting_on(kind, key, NOW - 1), handback_consults=1))
+        (c,) = only(out, "handback_consult")
+        assert c["kind"] == kind and _mine(out, "absorb_close") == [], kind
+
+
+def _standing(reason):
+    return {"reasons": [reason], "since": NOW - 100, "paged": [reason], "delivered": [reason]}
+
+
+def _park_consult(state):
+    rec = {"key": consult_mod.handback_key(consult_mod.PARK, "frozen_cap"),
+           "kind": consult_mod.PARK, "state": state, "id": "c5", "started_at": NOW - 60,
+           "session": _STAMP["session"],
+           "handback": {"memo": "frozen and already relaunched 2 times (cap 2) — parking",
+                        "needs_william": False, "cause": "frozen_cap", "bright_line": False}}
+    if state == "waiting":
+        rec.update(until=NOW + 600, move=consult_mod.WAIT)
+    return rec
+
+
+@pytest.mark.parametrize("state", ["running", "waiting"])
+@pytest.mark.parametrize("make,reason", [(_at_dialog, "session_at_dialog:i5"),
+                                         (_host_blocked, "session_host_blocked:i5")],
+                         ids=["at_dialog", "host_blocked"])
+def test_a_standing_lane_alert_stays_standing_under_another_consult(make, reason, state):
+    """#549 edge 2: a lane's dialog (or host-block) ALERT already paged the owner; then a consult of
+    ANOTHER kind — here a park — starts on the same issue, or holds it with a WAIT. The reason is
+    still the owner's: dropping it would page a false 🟢 recovery (and a second 🔴 later)."""
+    kw = make(handback=_park_consult(state), handback_consults=1)
+    kw["dsk"]["alert"] = _standing(reason)
+    out = decide(**kw)
+    assert only(out, "clear_alert") == []
+    assert all(reason in a["reasons"] for a in only(out, "alert"))
+    assert not [n for n in only(out, "notify") if n.get("tier") == "recovered"]
+    assert only(out, "handback_consult") == []
