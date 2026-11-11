@@ -56,6 +56,7 @@
     "base-turn": "#2D6BC4", "final": "#2F8A4C", "touchdown": "#8A93A0", "taxi-in": "#8A93A0",
     "parked": "#C77E1F", "awaiting": "#C77E1F", "holding": "#7A5CBF",
     "session-frozen": "#8A93A0", "stranded": "#C79A2E", "merges-freeze": "#2D8FA0",
+    "consulting": "#3A8DB5",
   };
 
   function repo() {

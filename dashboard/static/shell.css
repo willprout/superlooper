@@ -450,6 +450,11 @@ html, body {
 /* the stranded gate — a FINISHED flight the runner never landed. Gold, solid, "look at the gate":
    deliberately NOT the muted grey of the .frozen (dead session) tag, so the eye separates them. */
 .fld-tag.stranded { border-color: #D8A63A; color: #F2D488; }
+/* a question the APPROVING session is considering (issue #545) — calm sky-cyan, the colour of its
+   radio waves: neither the amber of a decision waiting on the owner nor the grey of a dead session. */
+.fld-tag.consult {
+  border-color: #3A8DB5; color: #A9DDF2; font-size: 9.5px; padding: 1px 6px;
+}
 .fld-lm {
   position: absolute; transform: translate(-50%, -50%);
   background: rgba(255, 255, 255, 0.85); border-radius: 3px;
@@ -1208,6 +1213,16 @@ html, body {
    blue-grey of the dead-session / paused-landings note above (issue #22 distinctness). */
 .drawer-offpath.state-stranded {
   background: #FBF3DE; border-color: #EBD9A6; border-left-color: #C79A2E; color: #6E5410;
+}
+/* consulting (issue #545) — the approving session is considering a question. Calm sky-blue, never
+   the amber default above: amber means "your decision", and nothing is asked of the owner yet. */
+.drawer-offpath.state-consulting {
+  background: #EAF4FA; border-color: #C6E0EE; border-left-color: #3A8DB5; color: #1F4E66;
+}
+/* the question being considered, quoted under the note — whole and read-only, no verb beside it */
+.drawer-offpath-q {
+  margin-top: 6px; padding: 6px 9px; border-radius: 4px; background: rgba(255, 255, 255, 0.7);
+  font: 500 11.5px/1.45 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere;
 }
 /* Clearance checklist — real check names, plain glosses (costume rule 2). */
 .drawer-clearance { display: flex; flex-direction: column; gap: 5px; }

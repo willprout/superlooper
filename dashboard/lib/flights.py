@@ -60,7 +60,13 @@ STRANDED = "stranded"              # a FINISHED session at the gate the GATE sto
                                    # issue #22) — the report is filed; the runner never landed it.
                                    # NOT a dead session: the work completed, so it never greys out.
 MERGES_FREEZE = "merges-freeze"    # the REPO's landings are calmly paused — repair flight dispatched
-OFF_PATH_STATES = (PARKED, AWAITING, HOLDING, SESSION_FROZEN, STRANDED, MERGES_FREEZE)
+CONSULTING = "consulting"          # a question the APPROVING session is considering (issue #545, over
+                                   # the engine's #538): the worker exited cleanly on a question and a
+                                   # fork of the session that approved the issue weighs it before the
+                                   # owner is asked. Nothing is asked of William yet, so NOT amber; the
+                                   # worker left on purpose, so NOT a dead session; no lane is held, so
+                                   # NOT in the air.
+OFF_PATH_STATES = (PARKED, AWAITING, HOLDING, SESSION_FROZEN, STRANDED, MERGES_FREEZE, CONSULTING)
 
 # Liveness tiers (design record §5) — the contrail, tied to the runner's real activity-age tiers.
 FRESH = "fresh"    # activity file younger than the repo's idle threshold — bold, bright contrail
@@ -296,7 +302,14 @@ def flight_stage(status, liveness=None, bounced=False, long_wait=False,
       1. ``PARKED`` — the machine gave up; dominates everything (chocks, "your call").
       2. ``AWAITING`` — an owner decision waits: status ``needs_william``/``bounced``, or a blocked
          session whose marker is a ``BOUNCED:`` memo. Amber, never confusable with a dead session.
-      3. ``HOLDING`` — sequenced behind an overlapping lane ("number 2 for landing").
+      3. ``CONSULTING`` — status ``consulting`` (issue #545 / engine #538): a fork of the session
+         that approved the issue is considering the worker's question. It holds no lane and no
+         worker window, and it asks nothing of William — only an escalation or a fallback makes it
+         his question, and the engine then settles it to ``awaiting_answer`` (rule 2). Ranked below
+         AWAITING so a bounce memo on disk still reaches him; above everything time-derived, because
+         the exited worker's activity file only ages while the fork thinks and must never read as a
+         dead session.
+      3a. ``HOLDING`` — sequenced behind an overlapping lane ("number 2 for landing").
       4. ``STRANDED`` — a FINISHED session at the gate (``FINAL`` + a filed report) whose activity
          has aged into the frozen tier. The session COMPLETED its work — a finished session's
          activity file naturally goes stale — so this is the GATE failing to advance, NOT a dead
@@ -315,6 +328,8 @@ def flight_stage(status, liveness=None, bounced=False, long_wait=False,
     # a needs-owner park or a bounce, and the Questions list is where William answers it.
     if status in ("needs_william", "bounced", "awaiting_answer") or bounced:
         return AWAITING
+    if status == "consulting":
+        return CONSULTING
     if status == "holding":
         return HOLDING
     if status == "frozen":
@@ -404,7 +419,7 @@ _PHASE_LANDMARK = {
 # the grey hull and the stranded plane render in place, never teleported to a magic fix). A mirror
 # of ``placementOf`` in static/airfield_live.js, which is what actually parks the sprite; the string
 # guard in tests/test_static_field_landmarks.py fails if the two lists ever drift apart.
-_PLACED_AT_CIRCUIT = (AWAITING, SESSION_FROZEN, STRANDED)
+_PLACED_AT_CIRCUIT = (AWAITING, SESSION_FROZEN, STRANDED, CONSULTING)
 
 
 def leg_phase(stage, raw):
@@ -1274,8 +1289,10 @@ def cargo_from_pr(pr_facts):
     return {"present": True, "files": files, "added": added, "removed": removed}
 _DEFAULT_PROGRESS_WINDOW = 900   # seconds of journal history the progress heuristic looks back over
 # Statuses that mean the session already left the stand (so a flight with no launch event journaled
-# is still known to have launched).
-_LAUNCHED_STATUSES = {"running", "blocked", "frozen", "exited", "gating", "holding", "merged"}
+# is still known to have launched). `consulting` (#538) is one: a consult only starts after a worker
+# flew, asked, and exited — so its plane is held where it was, never sent back to the stand.
+_LAUNCHED_STATUSES = {"running", "blocked", "frozen", "exited", "gating", "holding", "merged",
+                      "consulting"}
 
 # A wrong-typed status folds to a sentinel that belongs to no status set — the engine's own guard,
 # mirrored (``actions._status_of`` / ``_CORRUPT_STATUS``, engine issue #95). ``build_flight`` runs a
@@ -1389,13 +1406,18 @@ def build_flight(issue, repo):
                                      session_started=session_started, launched=launched,
                                      cleared=gate["cleared"], closed=bool(issue.get("closed")))
     # Grey/no-contrail is reserved for liveness failure (§5): a frozen SESSION never trails, even
-    # if its activity file is paradoxically fresh.
-    contrail = "none" if stage == SESSION_FROZEN else contrail_kind(
+    # if its activity file is paradoxically fresh. A CONSULTING flight (#545) trails nothing either,
+    # for the opposite reason: its worker exited on purpose, so the activity file it leaves is a
+    # record of a session that is over — still fresh for its first minutes, and read as-is it would
+    # puff a crisp contrail behind a plane that is not flying. Its hull stays solid (not dead).
+    contrail = "none" if stage in (SESSION_FROZEN, CONSULTING) else contrail_kind(
         activity_mtime, now, repo.get("idle_seconds", 480), repo.get("freeze_seconds", 2700))
 
     window = _windowed(journal, now, repo.get("progress_window_seconds", _DEFAULT_PROGRESS_WINDOW))
     prog = progress(window, issue.get("diff_delta"))
-    spinning = is_spinning(live, prog)
+    # "Spinning?" is a warning about a RUNNING worker. While its question is considered there is no
+    # worker to spin, so a consulting flight never wears the tag or raises the pill (#545).
+    spinning = is_spinning(live, prog) and stage != CONSULTING
 
     wander = merged_wandered(journal)
     merged = status == "merged" or stage in (TOUCHDOWN, TAXI_IN)

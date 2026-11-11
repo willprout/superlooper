@@ -18,6 +18,7 @@ a snapshot from it, and the HTTP route must answer 200 with it. The unit-level g
 class recurring — exactly one marked yes-verb per decision kind — lives in ``test_cards``.
 """
 import json
+import os
 
 import pytest
 
@@ -101,7 +102,7 @@ def test_a_question_in_one_repo_never_blacks_out_the_others(tmp_path):
 
 @pytest.mark.parametrize("status", ["queued", "launched", "running", "blocked", "final", "merged",
                                     "parked", "needs_william", "bounced", "awaiting_answer",
-                                    "frozen", "holding", "launch_hold", "closed"])
+                                    "consulting", "frozen", "holding", "launch_hold", "closed"])
 def test_no_engine_status_can_500_the_snapshot(tmp_path, status):
     """The sweep that found it, kept as the ratchet.
 
@@ -113,3 +114,97 @@ def test_no_engine_status_can_500_the_snapshot(tmp_path, status):
     cfg = _config(_home(tmp_path, status))
     snap = server.assemble_snapshot(cfg, now=NOW)
     assert snap["generated_at"] == NOW
+
+
+# =============================== consulting (issue #545, over the engine's #538) ===============================
+# #538 added a loopstate status between "a worker asked" and "William is asked": `consulting`. The
+# worker exited cleanly on its question, and a fork of the session that APPROVED the issue is
+# considering it first. Like `awaiting_answer` it holds no lane and no worker window, and it is moved
+# only by the fork's outcome. The board used to have no word for it, so it flew the issue as an
+# ordinary in-air flight at whatever leg its markers suggested — and once the exited worker's
+# activity file aged, as a DEAD session. Neither is true, and neither tells William the one thing
+# that is: his approving session is considering a question about this issue, and nothing is needed
+# from him yet. Only an escalation or a fallback makes it his question (owner ruling on #538).
+
+# The consult record exactly as `runner._exec_consult_start` settles it.
+_CONSULT = {"id": "c9", "state": "running", "session": "1c1e6ffb-0d84-4f0d-b3e0-ae10c5fa781c",
+            "host": "Williams-Mini", "cwd": "/Users/someone/Projects/repo",
+            "question": QUESTION, "started_at": NOW - 120}
+
+
+def _consulting(tmp_path, activity_age=None):
+    """A real state home holding one issue in `consulting`, as #538 writes it. ``activity_age`` (s)
+    leaves the exited worker's activity file behind at that age — the teardown keeps the worktree,
+    so the file a dead-session read keys on is still there and only gets older."""
+    home = _home(tmp_path, "consulting", pending_question=QUESTION, consult=dict(_CONSULT),
+                 lane=None, consult_held=None, consult_answer_posted=False)
+    if activity_age is not None:
+        act = home / "state" / "activity" / "i9"
+        act.parent.mkdir(parents=True, exist_ok=True)
+        act.write_text("", encoding="utf-8")
+        os.utime(act, (NOW - activity_age, NOW - activity_age))
+    return home
+
+
+def test_a_consulting_issue_renders_as_consulting_not_as_a_flight_in_the_air(tmp_path):
+    snap = server.assemble_snapshot(_config(_consulting(tmp_path, activity_age=60)), now=NOW)
+    flight = snap["flights"][0]
+
+    assert flight["stage"] == flights.CONSULTING == "consulting"
+    assert flight["stage"] not in flights.CIRCUIT_STAGES           # not queued, not on a leg
+    assert flight["on_circuit"] is False
+    assert flight["display"]["in_air"] is False                    # not in the "N in the air" tally
+    assert flight["awaiting_reason"] is None                       # not an owner decision
+    # Its own words, in every place the board names a flight's state: the drawer's off-path note…
+    off = flight["drawer"]["off_path"]
+    assert off["state"] == flights.CONSULTING
+    plain = off["plain"].lower()
+    assert "approv" in plain and "considering" in plain
+    assert "nothing" in plain and "you" in plain                    # …and that it needs nothing from him
+    # …which carries the question being considered (it is posted nowhere until the consult decides)…
+    assert off["question"] == QUESTION
+    # …and the boring table's note.
+    assert "approving session" in flight["display"]["note"]
+    # No towed BUILDING cloth: nothing is building.
+    assert all(b["num"] != 9 for b in snap["repos"][0]["field_banners"])
+
+
+def test_a_consulting_issue_whose_worker_activity_went_stale_is_not_a_dead_session(tmp_path):
+    """The exited worker's activity file keeps ageing while the fork thinks. Read as a running
+    flight, that is a frozen session — grey, dimmed, a pill condition, "a session has frozen on the
+    field" — for a lane the loop released on purpose."""
+    snap = server.assemble_snapshot(_config(_consulting(tmp_path, activity_age=4000)), now=NOW)
+    flight = snap["flights"][0]
+    assert flight["stage"] == flights.CONSULTING
+    assert flight["contrail"] == "none"           # the worker is gone; nothing trails
+    assert snap["repos"][0]["state"]["state"] == "ok"
+    assert snap["pill"]["level"] == "ok"
+
+
+def test_a_consulting_issue_is_never_in_the_questions_list(tmp_path):
+    """Only an escalation or a fallback is William's question (owner ruling on #538). While his
+    approving session considers it, the Questions list stays empty and the drawer offers no verb."""
+    snap = server.assemble_snapshot(_config(_consulting(tmp_path)), now=NOW)
+    assert snap["needs_you"] == []
+    flight = snap["flights"][0]
+    assert flight["drawer"]["decision"] is None   # no Answer / Approve / Drop buttons on it
+
+
+def test_the_snapshot_route_answers_200_for_a_consulting_issue(tmp_path):
+    cfg = _config(_consulting(tmp_path))
+    resp = server.route("GET", "/api/snapshot", lambda: server.assemble_snapshot(cfg, now=NOW),
+                        str(tmp_path))
+    assert resp.status == 200, resp.body
+    body = json.loads(resp.body)
+    assert body["flights"][0]["stage"] == "consulting"
+    assert body["needs_you"] == []
+
+
+def test_the_same_question_is_his_once_the_consult_escalates(tmp_path):
+    """The other side of the ruling, pinned so the two can't drift: when the consult escalates or
+    falls back, the engine settles the issue to `awaiting_answer` — and THAT is the Questions card."""
+    home = _home(tmp_path, "awaiting_answer", pending_question=QUESTION,
+                 consult=dict(_CONSULT, state="escalated"))
+    snap = server.assemble_snapshot(_config(home), now=NOW)
+    assert snap["flights"][0]["stage"] == flights.AWAITING
+    assert [c["kind"] for c in snap["needs_you"]] == ["question"]

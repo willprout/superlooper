@@ -79,6 +79,13 @@ OFF_PATH_PLAIN = {
     flights.STRANDED: ("stranded at the gate — the session finished and filed its report, but the "
                        "gate never landed it; the problem is at the runner/gate, not the session"),
     flights.MERGES_FREEZE: "landings paused — a repair flight is out; builds keep flying",
+    # Issue #545 (engine #538). Says WHO is considering it and that nothing is asked of the owner
+    # yet: only an escalation or a fallback makes it his question, and then it arrives as a Questions
+    # card in its own right.
+    flights.CONSULTING: ("consulting the approving session — the worker stopped on a question, and "
+                         "a fork of the session that approved this issue is considering it. Nothing "
+                         "is needed from you yet: if it answers, the worker resumes; if it can't, "
+                         "the question comes to you."),
 }
 
 
@@ -634,7 +641,12 @@ def flight_drawer(flight, journal_slice, slug, name, title=None, hhmm=None, oper
 
     off = None
     if stage in OFF_PATH_PLAIN:
-        off = {"state": stage, "plain": OFF_PATH_PLAIN[stage]}
+        off = {"state": stage, "plain": OFF_PATH_PLAIN[stage], "question": None}
+        # A consult's question is posted NOWHERE until the consult decides (#538), so the drawer is
+        # the one place it can be read meanwhile. Quoted under the note, read-only: no verb rides
+        # with it, because it is not the owner's question yet.
+        if stage == flights.CONSULTING:
+            off["question"] = flight.get("question")
 
     # The drawer's action verbs are the SERVER's, not the JS's (design record B.1): a bounced flight
     # must fire bounce-yes (its distinct audit trail), and the conflict-cap Discuss-default (§8) must

@@ -961,8 +961,9 @@ _LIVE_AIR = (flights.TAXI_OUT, flights.TAKEOFF, flights.DOWNWIND, flights.BASE_T
 # by circuit position; off-path states grouped after). Server-side so the JS sorts by a supplied
 # number and never encodes the circuit order itself (design record B.1). Unknown ⇒ 99 (sorts last).
 _STAGE_RANK = {s: i for i, s in enumerate(flights.CIRCUIT_STAGES)}
-for _i, _s in enumerate((flights.HOLDING, flights.STRANDED, flights.SESSION_FROZEN,
-                         flights.MERGES_FREEZE, flights.PARKED, flights.AWAITING),
+for _i, _s in enumerate((flights.HOLDING, flights.CONSULTING, flights.STRANDED,
+                         flights.SESSION_FROZEN, flights.MERGES_FREEZE, flights.PARKED,
+                         flights.AWAITING),
                         start=len(flights.CIRCUIT_STAGES)):
     _STAGE_RANK[_s] = _i
 
@@ -1056,6 +1057,9 @@ def _flight_note(flight, memo):
         return (memo or "awaiting your decision").strip().replace("\n", " ")[:90]
     if stage == flights.HOLDING:
         return "holding — number 2 for landing"
+    if stage == flights.CONSULTING:
+        # #545: never the question itself — that reads as something to answer, and it isn't his yet.
+        return "consulting the approving session — nothing needed from you yet"
     if stage == flights.STRANDED:
         return "stranded at the gate — report filed, runner hasn't landed it"
     if flight.get("merged"):
