@@ -4361,6 +4361,19 @@ class Runner:
         if isinstance(rec, dict) and consult_mod.is_consult_id(rec.get("id")):
             self._end_consult(rec["id"])
 
+    def _end_pending_handback_consult(self, iid):
+        """The owner has acted on the issue — closed it, or re-approved it — so a handback consult
+        still PENDING on it is over: end the fork its record names, BEFORE the caller drops or
+        clears that record, or nothing ever will (#549). The overlay never acts on a terminal
+        issue, and a crash window can leave a pending record on one. Only a PENDING record is taken
+        to name a live fork: a settled one's fork is ended right after its settle is written, and
+        `c<N>` is the issue's one consult id, which a question consult (#538) may be using since —
+        so ending it on a settled record could kill the wrong session. (A crash between a settle
+        and its end leaves that fork until the next consult on the id ends it, a known limit.)"""
+        rec = self._issue_field(iid, "handback")
+        if isinstance(rec, dict) and rec.get("state") in actions.HANDBACK_PENDING_STATES:
+            self._end_handback_consult(rec)
+
     def _exec_handback_move(self, a, now):
         """Carry out the ONE move the approving session chose. Only the five the runner acts on
         reach a verb here; ESCALATE is today's own handback (decide emits it), and anything else
@@ -4622,10 +4635,7 @@ class Runner:
         rec = self._issue_field(iid, "consult")
         if isinstance(rec, dict) and consult_mod.is_consult_id(rec.get("id")):
             self._end_consult(rec["id"])
-        hb = self._issue_field(iid, "handback")         # ...and a handback consult (#539)
-        if isinstance(hb, dict) and consult_mod.is_consult_id(hb.get("id")) \
-                and hb.get("state") in actions.HANDBACK_PENDING_STATES:
-            self._end_consult(hb["id"])
+        self._end_pending_handback_consult(iid)          # ...and a handback consult (#539)
         def settle(st, i):
             # (#539, fresh review P1) The consult is DROPPED with the issue — never left pending,
             # where its bound would one day run out and hand a park back on a closed issue — and a
@@ -4781,6 +4791,9 @@ class Runner:
             n, pid = self._charge_teardown_deferral(iid)
             return (f"worker still live in the worktree (pid {pid}) — deferring the fresh start "
                     f"(deferral {n} of {actions.TEARDOWN_DEFERRAL_CAP}; retries next tick)")
+        # (#549) The reset below clears the handback record; a fork a PENDING one still names is
+        # ended first, since nothing could reach it once the record is gone.
+        self._end_pending_handback_consult(iid)
         _rm(os.path.join(self.home, "reports", f"{iid}.md"))
         # `mail` and `ack` join this list for the #215 exit interview (fresh review P1): a park
         # can leave the interview MAIL armed, and mail carries no episode fence — a reapproved
@@ -5009,6 +5022,8 @@ class Runner:
                       # consults WITHOUT him — he has just acted, so it counts from zero. Not an
                       # attempt counter, so the continuation rule above does not keep it.
                       "handback": None, "handback_consults": 0})
+        # (#549) ...and a fork a PENDING record still names is ended before that record is cleared.
+        self._end_pending_handback_consult(iid)
         self._update_issue(iid, fn=resume)
         journal.append(self.home, {"act": "resume_at_gate", "id": iid}, now)
         # Re-claim the lane: in-progress (the loop is driving it to merge) replaces the owner's

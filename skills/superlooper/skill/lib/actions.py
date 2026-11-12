@@ -1142,6 +1142,11 @@ def _in_owner_handback_episode(ist, blocked_text, now=None):
         return True
     # ...and one its approving session chose to WAIT on, while the wait holds (fresh review): a
     # close during the hold is the owner dropping it, never a handback re-derived on a closed issue.
+    # A wait that has RUN OUT is deliberately not an episode here (#549 review P2): the record stays
+    # `waiting` after a wait that worked — the lane woke, the dialog cleared — so counting it would
+    # take every later close of a plain running build as the owner's Drop, killing a live worker. A
+    # close after the hold is absorbed at the handback door instead, on the tick the handback it held
+    # actually re-derives (decide's `handback_route`).
     if now is not None and _handback_waiting(ist, now):
         return True
     if isinstance(blocked_text, str) and blocked_text.lstrip().startswith("BOUNCED:"):
@@ -2163,6 +2168,28 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
 
     hb_started = set()          # issues a handback consult was started for THIS tick (#539)
 
+    absorbed_now = set()        # issues the handback door absorbed THIS tick (#549)
+
+    def closed_now(iid):
+        """The owner has closed this issue: a FRESH view whose closed set names it (#48: never act
+        on a stale read). A corrupt status is never acted on (#95), so it is never closed here."""
+        return (not gh_stale and _iid_num(iid) in closed_nums
+                and _status_of(ist_of(iid)) is not _CORRUPT_STATUS)
+
+    def absorbing(iid):
+        """Does Section D's absorb_close take this issue this tick (#108)? Closed while the loop was
+        handing it back. The one predicate both that absorb and the handback door read, so the issue
+        the absorb takes is never consulted first (#549)."""
+        return closed_now(iid) and _in_owner_handback_episode(ist_of(iid), blocked.get(iid), now)
+
+    def absorb_at_door(iid):
+        """(#549) The handback a WAIT held has re-derived after the hold ran out, on an issue the
+        owner closed meanwhile: the close is his Drop, absorbed now — never a consult launched on it
+        that the next tick's absorb would only have to end. Once per tick."""
+        if iid not in absorbed_now:
+            absorbed_now.add(iid)
+            out.append({"act": "absorb_close", "id": iid, "num": _iid_num(iid)})
+
     def handback_route(iid, num, kind, key, handback):
         """THE door every issue-level handback passes (#539): a park whatever its cause, a bounce, a
         frozen lane, a lane at a dialog, a lane the host reports blocked. Owner ruling 2026-11-04:
@@ -2180,11 +2207,20 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
         ceiling, a launch hold) is not waited for: a handback is already a safe state the owner can
         act on, so it reaches him as today, saying why."""
         ist = ist_of(iid)
+        if iid in absorbed_now or absorbing(iid):
+            # (#549) The owner closed it and absorb_close takes it this tick (Section D). A lane
+            # handback is routed in Section A, before that absorb is reached: nothing is handed back
+            # and no consult is launched on an issue the owner has already dropped.
+            return _HB_TAKEN
+        rec = _handback_rec(ist)
+        if (closed_now(iid) and _status_of(ist) != "merged"
+                and rec is not None and rec.get("state") == "waiting"):
+            absorb_at_door(iid)               # a WAIT ran out and its handback stands: see above
+            return _HB_TAKEN
         if _status_of(ist) == "consulting":
             return (None, False)
         if iid in hb_started:
             return _HB_TAKEN                  # one consult per issue per tick (fresh review P2)
-        rec = _handback_rec(ist)
         if rec is not None and rec.get("state") in HANDBACK_PENDING_STATES:
             return _HB_TAKEN
         if rec is not None and rec.get("key") == key:
@@ -2267,9 +2303,11 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
         A reason ALREADY standing on the durable ALERT is the owner's (fresh review P2): it paged
         when a consult could not start, or before #539 shipped. Pulling it back into a consult now
         would drop the reason and page a recovery that never happened, then a second 🔴 on the
-        escalation — so it stays his, exactly as today."""
-        if (reason in prev_alert_reasons and not _handback_pending(ist_of(iid))
-                and not _handback_waiting(ist_of(iid), now)):
+        escalation — so it stays his, exactly as today. WHATEVER other consult is pending on the
+        issue (#549): a park consult, or a WAIT holding one, owns the issue's next move, never the
+        page the owner already has. (A consult of this very handback never meets a standing reason:
+        while the reason stands, this door returns before any consult of it can start.)"""
+        if reason in prev_alert_reasons:
             return True
         num_ = _iid_num(iid)
         route = handback_route(iid, num_, kind, consult_mod.handback_key(kind, since),
@@ -3095,8 +3133,9 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
         # terminal) or a plain running build is never mistaken for the owner's Drop. Checked before
         # the terminal-status block AND the bounce/park re-derivations below, so it wins over every
         # retry the stuck label would otherwise keep firing.
-        if (not gh_stale and _iid_num(iid) in closed_nums
-                and _in_owner_handback_episode(ist, blocked.get(iid), now)):
+        if iid in absorbed_now:
+            continue                                   # the handback door absorbed it (#549)
+        if absorbing(iid):
             out.append({"act": "absorb_close", "id": iid, "num": _iid_num(iid)})
             continue
         # ---- a handback consult pending (#539): the approving session is considering a park, a
@@ -4249,6 +4288,7 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                     # holding with a WAIT — is the consult's, never a fresh launch.
                     or _handback_pending(ist) or _handback_waiting(ist, now)
                     or iid in hb_started
+                    or iid in absorbed_now     # (#549) the owner's close was absorbed this tick
                     or _status_of(ist) not in RELAUNCHABLE_STATUSES   # wrong-typed status: never launch (#95)
                     or (at_cap and not ignore_launch_cap)):
                 continue

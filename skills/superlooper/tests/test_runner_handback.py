@@ -141,10 +141,10 @@ def test_a_handback_consult_that_fails_to_launch_falls_back_with_the_reason(rig)
 
 # ======================================== carrying out the moves ========================================
 
-def _pending(rig, status="frozen", kind=consult_mod.PARK, key=_KEY, **fields):
+def _pending(rig, status="frozen", kind=consult_mod.PARK, key=_KEY, rec_state="running", **fields):
     seed_issue(rig, "i5", status=status, branch="sl/i5-x", retries=2, launch_failures=3,
                sensed_state="at_dialog", sensed_since=NOW - 4000, sensed_at=NOW - 10,
-               handback={"key": key, "kind": kind, "state": "running", "id": "c5",
+               handback={"key": key, "kind": kind, "state": rec_state, "id": "c5",
                          "session": _SESSION, "started_at": NOW - 60, "handback": dict(_HB)},
                handback_consults=1, **fields)
     (rig.home / "reports").mkdir(exist_ok=True)
@@ -492,3 +492,36 @@ def test_a_new_consult_announces_its_own_move(rig):
     seed_issue(rig, "i5", status="running", handback_move_posted=True)
     _start(rig)
     assert issue_state(rig, "i5")["handback_move_posted"] is False
+
+
+# ============================ #549: a fork left on a terminal issue ============================
+
+@pytest.mark.parametrize("act", ["reapprove", "resume_at_gate"])
+@pytest.mark.parametrize("state", ["running", "fallback", "escalated"])
+def test_a_re_approval_ends_the_fork_a_pending_record_names_before_clearing_it(rig, act, state):
+    """#549 edge 3: a crash window can leave a PENDING handback record on a terminal issue, and the
+    overlay never acts on a terminal issue. The owner's re-approval clears the record, so it must
+    end the fork the record names first — otherwise nothing ever will."""
+    _pending(rig, status="parked", rec_state=state)
+    ended = []
+    real_end = rig.r._end_consult
+    rig.r._end_consult = lambda cid: (ended.append((cid, issue_state(rig, "i5")["handback"])),
+                                      real_end(cid))
+    rig.r._execute({"act": act, "id": "i5", "num": 5}, NOW)
+    assert issue_state(rig, "i5")["handback"] is None
+    assert [cid for cid, _ in ended] == ["c5"]
+    assert ended[0][1] is not None and ended[0][1]["state"] == state, \
+        "the fork is ended BEFORE its record is cleared"
+    assert _consult_ended(rig)
+
+
+@pytest.mark.parametrize("act", ["reapprove", "resume_at_gate"])
+@pytest.mark.parametrize("state", ["delivered", "waiting", "moved", "dropped"])
+def test_a_re_approval_leaves_a_settled_records_consult_id_alone(rig, act, state):
+    """A settled record's fork was ended when it settled, and `c<N>` is the issue's one consult id —
+    a question consult (#538) uses it too — so only a PENDING record's names a fork to end."""
+    _pending(rig, status="parked", rec_state=state)
+    ended = []
+    rig.r._end_consult = ended.append
+    rig.r._execute({"act": act, "id": "i5", "num": 5}, NOW)
+    assert ended == [] and issue_state(rig, "i5")["handback"] is None
